@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import requests
+import interaction
 from platform_support import private_fd
 
 ROOT = Path(__file__).resolve().parent
@@ -43,7 +44,12 @@ def get_payment_qr(payment_url=None):
             if (parsed.scheme != "https" or parsed.username or parsed.password or
                     parsed.port not in (None, 443) or not (parsed.hostname or "").endswith(".alipay.com")):
                 raise ValueError("收银台返回非预期跳转，支付链接可能已失效，请在浏览器核对。")
-            response = session.get(url, timeout=(5, 15), allow_redirects=False)
+            if (getattr(interaction.handler, 'automatic_checkout', False) is True
+                    or getattr(interaction.handler, 'retry_enabled', False) is True):
+                from checkout_retry import request
+                response = request(session, 'GET', url, read_only=True, stage='读取支付宝二维码', allow_redirects=False)
+            else:
+                response = session.get(url, timeout=(5, 15), allow_redirects=False)
             log.info("[支付宝二维码] HTTP %s %s%s", response.status_code, parsed.hostname, parsed.path)
             if response.is_redirect:
                 url = urljoin(url, response.headers["Location"])

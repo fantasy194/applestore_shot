@@ -15,6 +15,7 @@ export type Action =
   | "purchase"
   | "checkout"
   | "orders"
+  | "cancel_order"
   | "catalog"
   | "address_read"
   | "address_save"
@@ -57,7 +58,7 @@ export const localDefaults: Account = {
   id: LOCAL_ID,
   name: "通用预设",
   email: "",
-  preset_sku: "MK2U4CH",
+  preset_sku: "MK2M4CH",
   preset_quantity: 2,
 };
 export const active = (task: Task) =>
@@ -71,6 +72,7 @@ export const actionNames: Record<Action, string> = {
   purchase: "购买商品",
   checkout: "结算购物袋",
   orders: "查询订单",
+  cancel_order: "取消订单",
   catalog: "查询商品",
   address_read: "读取地址预设",
   address_save: "保存地址预设",

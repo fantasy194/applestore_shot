@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 import requests
@@ -28,6 +29,20 @@ class Service:
         self.authentication_failed = False
         self.action = None
         self.submitted = False
+        self.automatic_checkout = False
+        self.test_order = False
+        self.preparing = False
+        self.retry_enabled = False
+        self.order_details = None
+        self.task_created_at = None
+        try:
+            created = json.loads((task_dir / 'task.json').read_text(encoding='utf-8')).get('created_at')
+            if type(created) in (int, float) and 0 < created <= time.time():
+                self.task_created_at = created
+        except (OSError, ValueError, TypeError):
+            pass
+        policy_path = self.root / 'automation.json'
+        self.order_policy = json.loads(policy_path.read_text(encoding='utf-8')) if policy_path.exists() else {}
         self.auth = self.root / 'auth.json'
         self.checkout = self.root / 'checkout.json'
         duo_killer.ROOT, duo_killer.AUTH_PATH, duo_killer.LOG_PATH = self.root, self.auth, self.task_dir / 'requests.log'
@@ -79,6 +94,8 @@ class Service:
 
     def text(self, label, default=''):
         kind = 'code' if '验证码' in label else 'text'
+        if self.automatic_checkout and kind != 'code':
+            raise ValueError('自动结账缺少必要信息：' + label + '。请先完善本地地址和联系方式。')
         label = label.replace('👉 ', '')
         fields = {}
         if kind == 'code':
@@ -96,10 +113,69 @@ class Service:
         return value
 
     def choose(self, label, options, default=None):
+        if self.automatic_checkout:
+            values = [key for key, _ in options]
+            if label == '收货方式':
+                selected = 'HOME'
+            elif label == '配送服务':
+                selected = default if default in values else values[0] if values else None
+            else:
+                raise ValueError(label + '无法自动确定，请先完善本地配置；未提交订单。')
+            if selected not in values:
+                raise ValueError(label + '没有可用的自动选项；未提交订单。')
+            self.stage('自动选择：' + label)
+            return selected
         return self.channel.prompt('select', label, options=[{'value': k, 'label': v} for k, v in options], default=default)
 
     def confirm(self, details):
+        self.order_details = details
+        if self.automatic_checkout:
+            from decimal import Decimal
+            items = details.get('items', [])
+            policy = self.order_policy
+            expected_sku = 'MLH74FE' if self.test_order else policy['sku']
+            # Authorize only the exact item/quantity approved by the user.
+            if (len(items) != 1 or duo_killer.normalize_sku(items[0].get('sku', '')) != duo_killer.normalize_sku(expected_sku)
+                    or type(items[0].get('quantity')) is not int or items[0]['quantity'] != policy['quantity']):
+                raise ValueError('购物袋含额外商品或型号/数量不符合自动锁单预设；未提交订单。')
+            match = re.fullmatch(r'(?:RMB|CNY|CN¥|¥|￥)?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元|RMB|CNY)?', str(details.get('total', '')))
+            if not match:
+                raise ValueError('无法确认人民币订单总额；未提交订单。')
+            total = Decimal(match[1].replace(',', ''))
+            if total <= Decimal('0'):
+                raise ValueError('订单总额无效；未提交订单。')
+            if not self.test_order and total > Decimal(policy['max_total']):
+                raise ValueError('订单总额超过自动锁单上限 ' + policy['max_total'] + ' 元；未提交订单。')
+            if details.get('store') or not details.get('address'):
+                raise ValueError('订单复核未确认送货地址；未提交订单。')
+            config = checkout_options.read_config(self.checkout)
+            street = config.get('address', {}).get('street')
+            if checkout_options.local_address_ready(config) and ''.join(str(street).split()) not in ''.join(str(details['address']).split()):
+                raise ValueError('官网复核地址与本地地址不一致；未提交订单。')
+            self.stage('准备完成，已核对商品、数量、地址和金额；未创建订单' if self.preparing
+                       else '抛光布、数量、地址和金额已核对，自动创建订单' if self.test_order
+                       else '商品、数量、地址和金额上限已核对，自动创建订单')
+            return True
         return self.channel.prompt('confirm', '确认商品与金额，创建订单', details=details, account=self.account)
+
+    def submission_path(self):
+        # A polishing-cloth test must not consume the Duo submission guard.
+        return self.root / ('test_order_submission.json' if self.test_order else 'order_submission.json')
+
+    def payment_ready(self, result):
+        if self.submitted and result.get('status') == 'pending_payment' and result.get('order_number'):
+            if self.task_created_at is not None:
+                # Desktop timestamps have one-second resolution. Includes queue
+                # and worker startup, stops before payment QR requests.
+                elapsed = max(0, int(time.time()) - int(self.task_created_at))
+                result['order_confirmed_elapsed_seconds'] = elapsed
+                duo_killer.log.info('订单确认总耗时：约 %s 秒（含排队和启动，不含二维码）。', elapsed)
+            duo_killer.write_private_json(self.submission_path(), {
+                'state': 'pending_payment', 'task_id': self.channel.task_id,
+                'order_number': result['order_number'],
+            })
+            self.channel.emit('progress_result', result={**result, 'qr_loading': True})
+            self.stage('订单已创建，正在加载支付宝付款二维码')
 
     def stage(self, stage, **fields):
         self.authentication_failed = self.authentication_failed or fields.get('authentication_failed', False)
@@ -108,6 +184,20 @@ class Service:
             self.channel.checkpoint()
             return
         self.channel.checkpoint()
+        if fields.get('order_submitted'):
+            if self.test_order and self.submission_path().exists():
+                previous = json.loads(self.submission_path().read_text(encoding='utf-8'))
+                if previous.get('state') == 'pending_payment':
+                    history_path = self.root / 'test_order_history.json'
+                    history = json.loads(history_path.read_text(encoding='utf-8')) if history_path.exists() else []
+                    history.append(previous)
+                    duo_killer.write_private_json(history_path, history)
+            # Persist before sending placeOrder. A timeout must not allow a
+            # subsequent task to create an additional order blindly.
+            duo_killer.write_private_json(self.submission_path(), {
+                'state': 'submission_unknown', 'task_id': self.channel.task_id,
+                'details': self.order_details,
+            })
         self.submitted = self.submitted or fields.get('order_submitted', False)
         self.channel.emit('stage', message=stage, **fields)
 
@@ -119,18 +209,8 @@ class Service:
                 self.stage('操作成功，但系统未保存密码；下次登录需重新输入')
 
     def cleanup_credentials(self, error=None):
-        if self.should_remove_account(error):
-            try:
-                self.vault.delete(self.channel.account_id)
-            finally:
-                self.auth.unlink(missing_ok=True)
-                self.password = None
-            return
-        if error and '-20101' in str(error):
-            try:
-                self.vault.delete(self.channel.account_id)
-            except Exception:
-                pass
+        # A rejected authentication is not permission to delete an existing
+        # account, its vault password, or its trust/address/order configuration.
         if self.auth.exists():
             data = json.loads(self.auth.read_text(encoding='utf-8'))
             data.pop('password', None)
@@ -140,14 +220,28 @@ class Service:
         self.password = None
 
     def should_remove_account(self, error):
-        from apple_login import LoginError
-        cause = getattr(error, '__cause__', None)
-        if (isinstance(error, requests.RequestException) or
-                isinstance(cause, LoginError) and cause.status is not None
-                and (cause.status == 429 or cause.status >= 500 and cause.status != 541)):
-            return False
-        return (self.action != 'enroll' and self.authentication_failed
-                and isinstance(error, ValueError) and not self.submitted)
+        # Removal requires an explicit user action; task errors must retain it.
+        return False
+
+    def warm_start_context(self):
+        """Refresh browser validation before generating a fresh sign-in entry."""
+        from apple_login import AppleStoreLogin
+        with requests.Session() as session:
+            duo_killer.load_auth(session, json.loads(self.auth.read_text(encoding='utf-8')))
+            def sent_names():
+                request = session.prepare_request(requests.Request('GET', duo_killer.BASE_URL + '/shop/bag'))
+                return {part.strip().partition('=')[0] for part in request.headers.get('Cookie', '').split(';')}
+            if 'shld_bt_ck' in sent_names():
+                return False
+            client = AppleStoreLogin(auth_path=self.auth, session=session)
+            if (client.browser_profile / '.authx-541').exists():
+                raise ValueError('浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。')
+            self.stage('预热浏览器校验，保留账号与本机设备信任，不加购、不下单')
+            client.initialize_browser_context()
+            if 'shld_bt_ck' not in sent_names():
+                raise ValueError('预热未取得有效浏览器校验，未加购、未下单；账号未重置。')
+            duo_killer.save_auth(session)
+            return True
 
     def check_account(self, *, enrolling=False):
         if enrolling:
@@ -194,6 +288,23 @@ class Service:
 
     def run(self, action, params):
         self.action = action
+        self.preparing = params.get('prepare_only') is True
+        self.test_order = action == 'purchase' and duo_killer.normalize_sku(params.get('sku', '')) == 'MLH74FE/A'
+        self.automatic_checkout = action in ('purchase', 'checkout') and self.order_policy.get('enabled') is True
+        self.retry_enabled = self.order_policy.get('enabled') is True and action in ('purchase', 'checkout', 'qr', 'orders', 'bag', 'catalog')
+        if self.automatic_checkout:
+            if (self.order_policy.get('sku') != 'MK2M4CH' or self.order_policy.get('quantity') != 1
+                    or self.order_policy.get('max_total') != '15999.00'):
+                raise ValueError('自动锁单配置与本次授权不一致，请先确认配置。')
+            marker = self.submission_path()
+            if marker.exists():
+                previous = json.loads(marker.read_text(encoding='utf-8'))
+                if (previous.get('state') == 'submission_unknown'
+                        or previous.get('state') == 'pending_payment' and not self.test_order):
+                    raise ValueError('已有提交结果未确认或待付款订单，请先核对官网订单；已阻止重复锁单。')
+            expected_sku = 'MLH74FE/A' if self.test_order else 'MK2M4CH/A'
+            if action == 'purchase' and (duo_killer.normalize_sku(params.get('sku', '')) != expected_sku or quantity(params) != 1):
+                raise ValueError('支持白色 256GB 自动锁单或抛光布测试，数量须为 1；未开始购买。')
         self.channel.checkpoint()
         if action == 'address_read':
             return {'success': True, 'config': checkout_options.read_config(self.checkout)}
@@ -216,13 +327,61 @@ class Service:
         if action in ('enroll', 'me'):
             result = self.check_account(enrolling=action == 'enroll')
         elif action == 'login':
-            result = duo_killer.login(sms=params.get('sms') is True)
+            if params.get('warm_only') is True:
+                self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')
+                refreshed = self.warm_start_context()
+                result = self.check_account(enrolling=False)
+                empty_bag_ready = duo_killer.warm_empty_bag()
+                result.update(warm_login=True, browser_context_refreshed=refreshed,
+                    empty_bag_ready=empty_bag_ready,
+                    message=('登录预热完成，空购物袋已检查；两分钟内首次加购可省去重复检查。'
+                             if empty_bag_ready else '登录预热完成，购物袋非空或暂不满足快速加购条件。')
+                            + '未加购、未下单；结算仍可能要求认证。')
+            else:
+                if params.get('renew_device_trust') is True:
+                    self.stage('重新验证设备信任，保留账号、密码和地址；不加购、不下单')
+                    result = duo_killer.login(sms=params.get('sms') is True, renew_device_trust=True)
+                else:
+                    result = duo_killer.login(sms=params.get('sms') is True)
         elif action == 'purchase':
-            result = duo_killer.purchase_sku(params.get('sku', 'MK2U4CH'), quantity=quantity(params))
+            if params.get('prepare_only') is True:
+                if not self.automatic_checkout:
+                    raise ValueError('提前准备需要已启用自动结算配置。')
+                result = duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params), prepare_only=True)
+            else:
+                result = duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params))
         elif action == 'add':
             result = duo_killer.add_to_bag(params.get('sku', ''), quantity=quantity(params), set_total=True)
         elif action == 'checkout':
             result = duo_killer.pay_bag()
+        elif action == 'cancel_order':
+            from order_cancel import cancel_order
+            number = params.get('order_number')
+            if not isinstance(number, str) or not re.fullmatch(r'W\d{6,20}', number):
+                raise ValueError('订单编号无效。')
+            history_path = self.root / 'order_cancellations.json'
+            history = json.loads(history_path.read_text(encoding='utf-8')) if history_path.exists() else {}
+            def before_submit():
+                history[number] = 'cancellation_unknown'
+                duo_killer.write_private_json(history_path, history)
+                self.stage('正在取消订单；结果不明时不会重复发送取消')
+            with requests.Session() as session:
+                duo_killer.load_auth(session, json.loads(self.auth.read_text(encoding='utf-8')))
+                try:
+                    result = cancel_order(session, number, self.channel, before_submit,
+                                          allow_submit=history.get(number) != 'cancellation_unknown')
+                finally:
+                    duo_killer.save_auth(session)
+            if result.get('status') == 'order_cancelled':
+                history[number] = 'order_cancelled'
+                duo_killer.write_private_json(history_path, history)
+                for name in ('order_submission.json', 'test_order_submission.json'):
+                    path = self.root / name
+                    if path.exists():
+                        marker = json.loads(path.read_text(encoding='utf-8'))
+                        if marker.get('order_number') == number:
+                            marker['state'] = 'cancelled'
+                            duo_killer.write_private_json(path, marker)
         elif action == 'qr':
             source_id = str(params.get('source_task', ''))
             import uuid
@@ -253,6 +412,11 @@ class Service:
                     duo_killer.save_auth(session)
         else:
             raise ValueError('不支持的操作。')
+        if self.submitted and result.get('status') == 'pending_payment':
+            duo_killer.write_private_json(self.submission_path(), {
+                'state': 'pending_payment', 'task_id': self.channel.task_id,
+                'order_number': result.get('order_number'),
+            })
         self.persist_password()
         if action in ('enroll', 'login', 'me') and result.get('logged_in') is True:
             from apple_login import stored_device_trust

@@ -65,22 +65,22 @@ class AccountCheckTests(unittest.TestCase):
         self.login.assert_not_called()
         self.service.vault.save.assert_not_called()
 
-    def test_failed_relogin_marks_account_for_removal_and_clears_credentials(self):
+    def test_failed_relogin_retains_account_and_credentials(self):
         self.info.return_value = {'logged_in': False}
         self.login.side_effect = ValueError('认证失败')
         with self.assertRaises(ValueError) as caught:
             self.service.run('me', {})
-        self.assertTrue(self.service.should_remove_account(caught.exception))
+        self.assertFalse(self.service.should_remove_account(caught.exception))
         self.service.cleanup_credentials(caught.exception)
-        self.assertFalse(self.service.auth.exists())
-        self.service.vault.delete.assert_called_once_with('a')
+        self.assertTrue(self.service.auth.exists())
+        self.service.vault.delete.assert_not_called()
         self.login.assert_called_once()
 
-    def test_identity_still_missing_after_relogin_marks_account_invalid(self):
+    def test_identity_still_missing_after_relogin_retains_account(self):
         self.info.return_value = {'success': True, 'logged_in': False}
         with self.assertRaises(ValueError) as caught:
             self.service.run('me', {})
-        self.assertTrue(self.service.should_remove_account(caught.exception))
+        self.assertFalse(self.service.should_remove_account(caught.exception))
         self.assertEqual(self.info.call_count, 2)
         self.login.assert_called_once()
 
@@ -107,7 +107,7 @@ class AccountCheckTests(unittest.TestCase):
         self.service.submitted = True
         self.assertFalse(self.service.should_remove_account(ValueError('会话失效')))
 
-    def test_checkout_and_orders_still_requiring_login_mark_account_invalid(self):
+    def test_checkout_and_orders_still_requiring_login_keep_account(self):
         for action in ('checkout', 'orders'):
             with self.subTest(action=action):
                 self.service.action = action
@@ -124,7 +124,7 @@ class AccountCheckTests(unittest.TestCase):
                         else:
                             duo_killer.reauthenticate_checkout(flow)
                     login.assert_called_once()
-                    self.assertTrue(self.service.should_remove_account(caught.exception))
+                    self.assertFalse(self.service.should_remove_account(caught.exception))
 
     def test_failed_fallback_does_not_restore_old_cookies(self):
         self.info.return_value = {'logged_in': False}

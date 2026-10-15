@@ -13,13 +13,13 @@ import sys
 import tempfile
 import unicodedata
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from http.cookiejar import Cookie
 from http.cookies import SimpleCookie
 from html import unescape
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter, sleep, time
 from threading import Event, Thread
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -115,7 +115,12 @@ def request_get(session, stage, url, method="GET", **kwargs):
     started = perf_counter()
     try:
         with waiting(stage):
-            response = session.request(method, url, timeout=TIMEOUT, **kwargs)
+            from checkout_retry import request as retry_request
+            path = urlsplit(url).path.rstrip('/')
+            read_only = (method.upper() == 'GET' and path in (
+                '/shop/bag', '/cn/shop/bag/flyout', '/shop/order/list', '/shop/checkout',
+            )) or (method.upper() == 'POST' and stage == 'checkStatus')
+            response = retry_request(session, method, url, read_only=read_only, stage=stage, **kwargs)
     except requests.RequestException as error:
         log.error("[%s] %.2fs 网络异常：%s", stage, perf_counter() - started, type(error).__name__)
         raise
@@ -145,7 +150,19 @@ def request_get(session, stage, url, method="GET", **kwargs):
                           else "其他页面" if title else "无 HTML 标题")
         log.info("[%s] HTTP %s %s", stage, reply.status_code, safe_url(request.url))
         log.debug("[%s] 请求详情：%s", stage, json.dumps(detail, ensure_ascii=False))
-    log.info("[%s] 完成，耗时 %.2fs，跳转 %s 次", stage, perf_counter() - started, len(response.history))
+    total_time = perf_counter() - started
+    replies = [*response.history, response]
+    if all(isinstance(getattr(reply, 'elapsed', None), timedelta) for reply in replies):
+        headers_time = sum(reply.elapsed.total_seconds() for reply in replies)
+        log.info("[%s] 耗时拆分：连接/发送/等待响应头 %.2fs；下载响应体及本地处理 %.2fs", stage,
+                 headers_time, max(0, total_time - headers_time))
+        if (method.upper() == 'POST' and headers_time >= 5 and stage in {
+                'continueFromShippingToBilling', 'continueFromBillingToReview',
+                '交换商城会话凭证', 'continueFromReviewToProcess'}):
+            log.warning('[%s] 慢响应：响应头阶段 %.2fs，响应体及本地处理 %.2fs；'
+                        '写请求仅发送一次，不因慢响应自动重发。',
+                        stage, headers_time, max(0, total_time - headers_time))
+    log.info("[%s] 完成，耗时 %.2fs，跳转 %s 次", stage, total_time, len(response.history))
     remove_imported_cookie_duplicates(session)
     return response
 
@@ -337,7 +354,7 @@ def authenticate(session, *, strong=False):
         raise ValueError(f"{AUTH_PATH} 尚无会话 Cookie，请填写 account 和 password 后先运行 python3 duo_killer.py -l。")
 
 
-def login(sms=False):
+def login(sms=False, *, renew_device_trust=False):
     ensure_auth_file()
     # 仅执行登录时加载 SRP；商城会话统一从当前认证 JSON 读取和保存。
     from apple_login import AppleStoreLogin, LoginError, load_credentials
@@ -346,6 +363,8 @@ def login(sms=False):
     try:
         account, password = load_credentials(AUTH_PATH)
         client = AppleStoreLogin(auth_path=AUTH_PATH)
+        client.renew_device_trust = renew_device_trust
+        client.trust_persistence_ready = not renew_device_trust
         config = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
         old_auth = {"as_ltn_cn", "as_cn", "as_disa", "as_rec", "myacinfo", "acn01"}
         if isinstance(config.get("cookies"), dict):
@@ -374,7 +393,8 @@ def login(sms=False):
                 save_auth(initialized)
         client.login(account, password, sms)
         save_auth(client.session)
-        return {"success": True, "logged_in": True, "scope": "store_menu", "auth_file": str(AUTH_PATH)}
+        return {"success": True, "logged_in": True, "scope": "store_menu", "auth_file": str(AUTH_PATH),
+                "device_trust_renewal_requested": renew_device_trust}
     except LoginError as error:
         raise ValueError(str(error)) from error
     except EOFError:
@@ -587,7 +607,7 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
             target = quantity if set_total else before + quantity
             if item is None:
                 # 商品尚未入袋时只加一件，随后读取真实 item ID、数量限制和更新 action。
-                add_error = _add_one_to_bag(session, part)
+                add_error = _add_one_to_bag(session, part, page=flow.page_response)
                 flow.page(BASE_URL + "/shop/bag", "首次加购后购物袋")
                 item_id, item = cart_item(flow, part)
                 if item is None or int(field(item, "itemQuantity.d.quantity", 0)) != 1:
@@ -618,15 +638,25 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
                 save_auth(session)
 
 
-def _add_one_to_bag(session, part):
+def _add_one_to_bag(session, part, *, page=None):
     product_url = BASE_URL + "/shop/product/" + part
     session.headers.update({"Accept": "*/*", "Referer": product_url})
-    product_page = request_get(session, "商品页", product_url)
-    product_page.raise_for_status()
+    candidate = urlsplit(getattr(page, 'url', '') or '')
+    if (page is not None and page.status_code == 200 and candidate.scheme == 'https'
+            and candidate.hostname == 'www.apple.com.cn' and candidate.path == '/shop/bag'):
+        product_page = page
+    else:
+        product_page = request_get(session, "商品页", product_url)
+        product_page.raise_for_status()
     key = re.search(r'<meta\b[^>]*\bname=["\']globalnav-store-key["\'][^>]*\bcontent=["\']([^"\']+)',
                     product_page.text, re.I)
     if not key:
+        if product_page is page:
+            return _add_one_to_bag(session, part)
         raise ValueError("商品页未提供加购 API key，可加 -log 查看详情。")
+    if product_page is page:
+        source = '预热读取' if getattr(page, 'duo_public_config_prewarmed', False) is True else '当前购物袋'
+        log.info('[加购配置] 复用%s的公开 API key，跳过重复商品页；仍读取新加购令牌并核对购物袋。', source)
     beacon = request_get(session, "加购令牌", BASE_URL + "/shop/beacon/atb")
     beacon.raise_for_status()
     cookie_header = session.prepare_request(requests.Request("GET", product_url)).headers.get("Cookie", "")
@@ -683,7 +713,7 @@ def write_private_json(path, data):
 
 
 class Checkout:
-    """按页面下发的 action 和 meta.h 驱动结账；不重试任何业务 POST。"""
+    """单次执行页面 action；准备步骤的状态核对与恢复由上层控制。"""
 
     def __init__(self, session):
         self.session = session
@@ -722,12 +752,14 @@ class Checkout:
         if meta.get("page", {}).get("htmlUrl"):
             self.url = self.apple_url(meta["page"]["htmlUrl"])
 
-    def page(self, url, stage):
+    def page(self, url, stage, *, fresh=False):
         # 显式处理跳转，商城令牌不会跟随跳转发送到支付平台。
         for _ in range(8):
             url = self.apple_url(url)
-            response = request_get(self.session, stage, url, allow_redirects=False,
-                                   headers={"Referer": self.url})
+            headers = {"Referer": self.url}
+            if fresh:
+                headers.update({'Cache-Control': 'no-cache', 'Pragma': 'no-cache'})
+            response = request_get(self.session, stage, url, allow_redirects=False, headers=headers)
             response.raise_for_status()
             if response.is_redirect:
                 url = urljoin(url, response.headers["Location"])
@@ -752,6 +784,7 @@ class Checkout:
             self.url = self.apple_url("/shop/checkout?_s=Fulfillment-init")
 
     def action(self, module, name, data=None):
+        from checkout_recovery import CheckoutActionError
         url = field(self.model, f"{module}.a.{name}.url")
         if not url or not self.headers.get("x-aos-stk"):
             raise ValueError(f"当前页面没有可执行的 {name}，可能需要更新 {AUTH_PATH}。")
@@ -761,19 +794,37 @@ class Checkout:
         response = request_get(self.session, name, self.apple_url(url), method="POST",
                                data=data or {}, headers=headers, allow_redirects=False)
         if response.status_code != 200:
-            raise ValueError(f"{name} 返回 HTTP {response.status_code}，已停止。")
+            retry_after = 0
+            hint = response.headers.get('Retry-After')
+            if hint:
+                try:
+                    retry_after = max(0, float(hint))
+                except ValueError:
+                    try:
+                        retry_after = max(0, parsedate_to_datetime(hint).timestamp() - time())
+                    except (ValueError, TypeError, OverflowError):
+                        retry_after = 30
+            raise CheckoutActionError(f"{name} 返回 HTTP {response.status_code}，已停止。",
+                recoverable=response.status_code in (408, 429, 500, 502, 503, 504), retry_after=retry_after)
         try:
             result = response.json()
             status = str(result["head"]["status"])
         except (ValueError, KeyError, TypeError) as error:
-            raise ValueError(f"{name} 未返回预期 JSON，已停止。") from error
+            raise CheckoutActionError(f"{name} 未返回预期 JSON，已停止。", recoverable=True) from error
         log.info("[%s] 业务状态=%s", name, status)
         if status == "302":
-            self.page(result["head"]["data"]["url"], name + " 跳转")
+            target = field(result, 'head.data.url')
+            if not isinstance(target, str) or not target:
+                raise CheckoutActionError(f"{name} 返回的跳转数据不完整。", recoverable=True)
+            self.page(target, name + " 跳转")
         elif status == "200":
-            self.update(result.get("body", {}))
+            body = result.get('body', {})
+            if not isinstance(body, dict):
+                raise CheckoutActionError(f"{name} 返回的页面数据格式异常。", recoverable=True)
+            self.update(body)
         else:
-            raise ValueError(f"{name} 返回业务状态 {status}，已停止。")
+            raise CheckoutActionError(f"{name} 返回业务状态 {status}，已停止。",
+                recoverable=status in ('408', '429', '500', '502', '503', '504'))
 
     def require(self, path):
         node = field(self.model, path)
@@ -788,6 +839,11 @@ def reauthenticate_checkout(flow):
     from apple_login import AppleStoreLogin, LoginError, load_credentials
 
     log.info("[结账认证] 当前结账要求重新认证，保留 Session 和原登录入口继续。")
+    prepared = flow.session.prepare_request(requests.Request('GET', flow.url))
+    cookie_header = prepared.headers.get('Cookie', '')
+    sent = {part.strip().partition('=')[0] for part in cookie_header.split(';')} if isinstance(cookie_header, str) else set()
+    log.info('[结账认证] 登录入口可发送凭证：商城=%s，Apple账号=%s；由官网跳转触发认证。',
+             '有' if 'as_ltn_cn' in sent else '无', '有' if 'myacinfo' in sent else '无')
     client = AppleStoreLogin(auth_path=AUTH_PATH, session=flow.session)
     client.store_request = request_get
     client.store_referrer = flow.url
@@ -801,9 +857,13 @@ def reauthenticate_checkout(flow):
     flow.read_page(response, "结账重新认证")
     if urlsplit(flow.url).path.startswith("/shop/signIn"):
         interaction.report_stage("结账重新认证后仍要求登录", authentication_failed=True)
-    if not field(flow.model, "checkout.fulfillment"):
+    if not any(isinstance(field(flow.model, 'checkout.' + step), dict)
+               for step in ('fulfillment', 'shipping', 'billing', 'review')):
         raise ValueError("结账重新认证后仍未进入配送页面，已停止；未重复提交 checkout。")
-    log.info("[结账认证] 已恢复到配送页面。")
+    # Persist renewed cookies before the long shipping/payment stages. A task
+    # interruption must not lose a successful authentication.
+    save_auth(flow.session)
+    log.info("[结账认证] 已恢复到有效结算步骤。")
     return True
 
 
@@ -870,7 +930,9 @@ def confirm_order(model):
     store = field(details, "fulfillmentCompanionBar.pickupSummary.d.store_name")
     if store:
         print("自提门店：" + order_text(store))
-    delivery = field(details, "shippingCompanionBar.address.d.street")
+    address = field(review, "shippingReview.address.d", {})
+    delivery = " ".join(order_text(address.get(key)) for key in ("state", "city", "district", "street", "street2")
+                        if address.get(key)) if address.get("street") else field(details, "shippingCompanionBar.address.d.street")
     if delivery:
         print("送货地址：" + order_text(delivery))
     print(f"\n总支付：{total}")
@@ -906,6 +968,7 @@ def payment_result(flow):
 
 
 def payment_qr(result):
+    result['qr_loading'] = True
     try:
         result.update(get_payment_qr(result["payment_url"]))
     except (OSError, ValueError, requests.RequestException) as error:
@@ -914,6 +977,8 @@ def payment_qr(result):
         log.warning("支付链接已取得；付款二维码未取得：%s", message)
         result["qr_image"] = None
         result["qr_error"] = message + " 可用 -purl 重试获取二维码。"
+    finally:
+        result['qr_loading'] = False
 
 
 def finish_payment(flow):
@@ -923,12 +988,26 @@ def finish_payment(flow):
         if not field(flow.model, "spinner.a.checkStatus.url"):
             raise ValueError("未取得订单处理状态，请运行 -o 查询订单。")
         if attempt:
-            sleep(2)
+            # Check sooner during the first seconds after submission, then
+            # keep the existing cadence. Only polls the already submitted order.
+            sleep(.5 if attempt == 1 else 1 if attempt == 2 else 2)
         flow.action("spinner", "checkStatus")
     raise ValueError("订单仍在处理中，请稍后运行 -o 查询订单。")
 
 
-def pay_bag(*, flow=None):
+def checkout_review(flow):
+    # Billing 的成功响应可能仍带旧步骤模型；重新读取页面同步状态，不能重放 POST。
+    for attempt in range(3):
+        review = field(flow.model, "checkout.review")
+        if isinstance(review, dict):
+            return review
+        if field(flow.model, "checkout.d.page") != "Billing" or attempt == 2:
+            break
+        flow.page(flow.apple_url("/shop/checkout"), "同步订单确认页")
+    raise ValueError("付款方式步骤未进入订单确认页；尚未提交订单。请检查官网当前结算页的提示。")
+
+
+def pay_bag(*, flow=None, prepare_only=False):
     standalone = flow is None
     with (requests.Session() if standalone else nullcontext(flow.session)) as session:
         if standalone:
@@ -959,37 +1038,140 @@ def pay_bag(*, flow=None):
                     data[prefix + address + "." + name] = field(item, address[1:] + ".d." + name, "CN" if name == "countryCode" else "")
             flow.action("shoppingCart.actions", "checkout", data)
             reauthenticate_checkout(flow)
-            checkout_delivery(flow)
-            checkout_shipping(flow)
-            billing = "checkout.billing.billingOptions"
-            options = flow.require(billing)["d"].get("options", [])
-            if not any(o.get("value") == "ALIPAY" for o in options):
-                raise ValueError("当前订单不支持支付宝。")
-            data = {billing + ".selectBillingOption": "ALIPAY", billing + ".bankLookUp.selectBank": ""}
-            flow.action(billing, "selectBillingOptionAction", {**data, "checkout.locationConsent.locationConsent": "false"})
-            flow.action("checkout.billing", "continueFromBillingToReview", data)
-            review = flow.require("checkout.review")
-            if (field(review, "placeOrder.d.enableContinue") is not True or
-                    field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY" or
-                    model_items(review.get("fulfillmentReview", {})) != expected):
-                raise ValueError("订单复核未通过：商品、数量、支付方式或下单状态不符合预期。")
-            confirm_order(flow.model)
-            save_auth(session)
-            interaction.report_stage("正在提交订单", order_submitted=True)
-            flow.action("checkout.review.placeOrder", "continueFromReviewToProcess")
-            result = finish_payment(flow)
-            if PAYMENT_ROOT is not None:
-                # Keep the issued payment link even if fetching its QR image is interrupted.
-                write_private_json(PAYMENT_ROOT / "payment.json", result)
-            payment_qr(result)
-            write_private_json((PAYMENT_ROOT or ROOT) / "payment.json", result)
-            return result
+            return continue_checkout(flow, expected, prepare_only=prepare_only)
         finally:
             if standalone:
                 save_auth(session)
 
 
-def purchase_sku(part, sms=False, quantity=1):
+
+def continue_checkout(flow, expected, *, prepare_only=False):
+    from checkout_recovery import recover_step
+    if isinstance(field(flow.model, 'checkout.review'), dict):
+        return pay_review(flow, expected, prepare_only=prepare_only)
+    page = field(flow.model, 'checkout.d.page')
+    if page not in ('Shipping', 'Billing', 'Review'):
+        recover_step(flow, '送货', lambda: checkout_delivery(flow))
+    if field(flow.model, 'checkout.d.page') not in ('Billing', 'Review'):
+        recover_step(flow, '地址', lambda: checkout_shipping(flow))
+    if not isinstance(field(flow.model, 'checkout.review'), dict):
+        recover_step(flow, '支付方式', lambda: checkout_billing(flow))
+    return pay_review(flow, expected, prepare_only=prepare_only)
+
+
+def checkout_billing(flow):
+    billing = "checkout.billing.billingOptions"
+    options = flow.require(billing)["d"].get("options", [])
+    if not any(o.get("value") == "ALIPAY" and not o.get('disabled') for o in options):
+        raise ValueError("当前订单不支持支付宝。")
+    # Continue accepts the selection. Final review still confirms ALIPAY.
+    data = {billing + ".selectBillingOption": "ALIPAY", billing + ".bankLookUp.selectBank": "",
+            "checkout.locationConsent.locationConsent": "false"}
+    log.info("[付款方式] 随继续操作提交支付宝选项，省去独立选择请求；最终复核服务端支付方式。")
+    flow.action("checkout.billing", "continueFromBillingToReview", data)
+
+
+def pay_review(flow, expected, *, prepare_only=False):
+    review = checkout_review(flow)
+    if (field(review, "placeOrder.d.enableContinue") is not True or
+            field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY" or
+            model_items(review.get("fulfillmentReview", {})) != expected):
+        raise ValueError("订单复核未通过：商品、数量、支付方式或下单状态不符合预期。")
+    if len(expected) == 1 and getattr(interaction.handler, 'automatic_checkout', False):
+        config = ROOT / "checkout.json"
+        write_private_json(ROOT / "prepared_checkout.json", {'sku': expected[0][0], 'quantity': expected[0][1],
+            'config_hash': hashlib.sha256(config.read_bytes() if config.exists() else b'').hexdigest(), 'created_at': time()})
+    confirm_order(flow.model)
+    if prepare_only:
+        return {"success": True, "status": "prepared", "message": "准备完成，未创建订单。点击立即下单时重新读取官网确认页，核对后提交；会话或库存变化可能需要重新准备。"}
+    order_details = getattr(interaction.handler, 'order_details', None)
+    save_auth(flow.session)
+    interaction.report_stage("正在提交订单", order_submitted=True)
+    flow.action("checkout.review.placeOrder", "continueFromReviewToProcess")
+    result = finish_payment(flow)
+    save_auth(flow.session)  # QR retrieval must not delay persisting issued session cookies.
+    (ROOT / "prepared_checkout.json").unlink(missing_ok=True)
+    if order_details:
+        result.update(items=order_details['items'], delivery_address=order_details['address'], order_total=order_details['total'])
+    if PAYMENT_ROOT is not None:
+        # Keep the issued payment link even if fetching its QR image is interrupted.
+        write_private_json(PAYMENT_ROOT / "payment.json", result)
+    ready = getattr(interaction.handler, 'payment_ready', None)
+    if callable(ready):
+        ready(result)
+    payment_qr(result)
+    write_private_json((PAYMENT_ROOT or ROOT) / "payment.json", result)
+    return result
+
+
+def warm_cart_fingerprint(session):
+    header = session.prepare_request(requests.Request('GET', BASE_URL + '/shop/bag')).headers.get('Cookie', '')
+    relevant = sorted(part.strip() for part in header.split(';')
+                      if part.strip().partition('=')[0] in {'as_ltn_cn', 'shld_bt_ck', 'dssid2', 'as_cn'})
+    if not {'as_ltn_cn', 'shld_bt_ck'} <= {part.partition('=')[0] for part in relevant}:
+        return None
+    return hashlib.sha256('\n'.join(relevant).encode()).hexdigest()
+
+
+def warm_empty_bag():
+    """Read only: cache public configuration, never a checkout token or SKU."""
+    with requests.Session() as session:
+        load_auth(session, json.loads(AUTH_PATH.read_text(encoding='utf-8')))
+        flow = Checkout(session)
+        flow.page(BASE_URL + '/shop/bag', '预热购物袋（不加购）')
+        cart = flow.require('shoppingCart')
+        # Empty bags still carry items.d/b/p/view metadata. Require Apple's
+        # explicit flag as well as absence of physical item nodes.
+        empty = (field(cart, 'd.hasItems') is False and isinstance(cart.get('items'), dict)
+                 and not any(key.startswith('item-') for key in cart['items'])
+                 and not model_items(cart['items']))
+        key = re.search(r'<meta\b[^>]*\bname=["\']globalnav-store-key["\'][^>]*\bcontent=["\']([^"\']+)',
+                        flow.page_response.text, re.I)
+        cache = ROOT / 'warm_empty_bag.json'
+        cache.unlink(missing_ok=True)
+        fingerprint = warm_cart_fingerprint(session)
+        if empty and fingerprint and key and re.fullmatch(r'[A-Za-z0-9._:-]{1,512}', key[1]):
+            write_private_json(cache, {'created_at': time(), 'fingerprint': fingerprint,
+                                      'public_key': key[1], 'empty': True})
+        save_auth(session)
+        return empty and cache.exists()
+
+
+def try_warm_first_add(flow, part, quantity):
+    cache = ROOT / 'warm_empty_bag.json'
+    if quantity != 1 or getattr(interaction.handler, 'automatic_checkout', False) is not True:
+        return False
+    try:
+        data = json.loads(cache.read_text(encoding='utf-8'))
+        valid = (type(data) is dict and data.get('empty') is True
+                 and type(data.get('created_at')) in (int, float)
+                 and 0 <= time() - data['created_at'] < 120
+                 and isinstance(data.get('fingerprint'), str) and len(data['fingerprint']) == 64
+                 and data.get('fingerprint') == warm_cart_fingerprint(flow.session)
+                 and isinstance(data.get('public_key'), str)
+                 and re.fullmatch(r'[A-Za-z0-9._:-]{1,512}', data['public_key']))
+    except (OSError, ValueError, TypeError):
+        valid = False
+    if not valid:
+        return False
+    # Consume before any mutation. A failed/ambiguous add cannot reuse this
+    # shortcut; subsequent attempts start with a fresh live cart read.
+    cache.unlink()
+    page = requests.Response()
+    page.status_code = 200
+    page.url = BASE_URL + '/shop/bag'
+    page.duo_public_config_prewarmed = True
+    page._content = ('<meta name="globalnav-store-key" content="' + data['public_key'] + '">').encode()
+    log.info('[预热首次加购] 使用两分钟内的空购物袋公开配置；仍取新令牌并实时核对全部商品。')
+    add_error = _add_one_to_bag(flow.session, part, page=page)
+    flow.page(BASE_URL + '/shop/bag', '首次加购后购物袋')
+    actual = model_items(flow.require('shoppingCart').get('items', {}))
+    if actual != [(part, quantity)]:
+        raise ValueError(add_error + '加购后购物袋与目标商品、数量不一致；未结算，不自动重复加购。')
+    return True
+
+
+def purchase_sku(part, sms=False, quantity=1, *, prepare_only=False):
     part = normalize_sku(part)
     if type(quantity) is not int or quantity < 1:
         raise ValueError("加购数量必须是正整数。")
@@ -999,6 +1181,30 @@ def purchase_sku(part, sms=False, quantity=1):
         refreshed = ensure_strong_login(session, sms=sms)
         try:
             flow = Checkout(session)
+            checkpoint = ROOT / "prepared_checkout.json"
+            config = ROOT / "checkout.json"
+            config_hash = hashlib.sha256(config.read_bytes() if config.exists() else b'').hexdigest()
+            previous = {}
+            if checkpoint.exists():
+                try:
+                    previous = json.loads(checkpoint.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    pass
+            if not isinstance(previous, dict):
+                previous = {}
+            if (previous.get('sku') == part and previous.get('quantity') == quantity
+                    and previous.get('config_hash') == config_hash
+                    and 0 <= time() - previous.get('created_at', 0) < 300):
+                flow.page(BASE_URL + "/shop/checkout", "读取已准备的结算页面")
+                if field(flow.model, 'checkout.d.page') in ('Fulfillment', 'Shipping', 'Billing', 'Review') or isinstance(field(flow.model, 'checkout.review'), dict):
+                    log.info("[继续结算] 复用官网当前结算步骤，最终重新核对商品、金额和地址。")
+                    return continue_checkout(flow, [(part, quantity)], prepare_only=prepare_only)
+                log.info("[继续结算] 官网结算步骤不可复用，重新走购物袋流程。")
+            warmed = not refreshed and try_warm_first_add(flow, part, quantity)
+            if warmed:
+                if prepare_only:
+                    return pay_bag(flow=flow, prepare_only=True)
+                return pay_bag(flow=flow)
             flow.page(BASE_URL + "/shop/bag", "加购前购物袋")
             status = check_login(session, page=flow.page_response)
             if not status["logged_in"]:
@@ -1017,6 +1223,11 @@ def purchase_sku(part, sms=False, quantity=1):
                 print("商城已登录。")
             print(f"目标购买数量：{part} × {quantity}")
             add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
+            if getattr(interaction.handler, 'automatic_checkout', False):
+                write_private_json(checkpoint, {'sku': part, 'quantity': quantity,
+                    'config_hash': hashlib.sha256(config.read_bytes() if config.exists() else b'').hexdigest(), 'created_at': time()})
+            if prepare_only:
+                return pay_bag(flow=flow, prepare_only=True)
             return pay_bag(flow=flow)
         finally:
             save_auth(session)

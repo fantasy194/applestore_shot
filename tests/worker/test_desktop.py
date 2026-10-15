@@ -84,12 +84,12 @@ class ServiceTests(unittest.TestCase):
                     self.assertEqual(service.text(original), answer)
                     channel.prompt.assert_called_once_with('code', label, default='', **fields)
 
-    def test_password_failure_forgets_vault_without_losing_identity(self):
+    def test_password_failure_retains_vault_and_identity(self):
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);vault=Mock();service=Service(Channel('a','t',io.StringIO()),root,root,'a@example.test',vault)
             service.ensure_auth_file();service.cleanup_credentials(ValueError('401 -20101'))
-            vault.delete.assert_called_once_with('a')
+            vault.delete.assert_not_called()
             data=json.loads(service.auth.read_text());self.assertEqual(data['account'],'a@example.test');self.assertNotIn('password',data)
 
     def test_windows_and_macos_browser_locations(self):

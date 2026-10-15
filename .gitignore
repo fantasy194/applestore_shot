@@ -17,6 +17,13 @@ purchase.json
 task.json
 payment*.json
 payment*.png
+automation.json
+order_submission.json
+test_order_submission.json
+test_order_history.json
+order_cancellations.json
+prepared_checkout.json
+warm_empty_bag.json
 *.har
 *.log
 .chrome-profile/

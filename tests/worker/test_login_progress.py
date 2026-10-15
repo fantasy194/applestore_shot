@@ -1,5 +1,6 @@
 import contextlib
 import io
+from datetime import timedelta
 from threading import Event
 import unittest
 from unittest.mock import patch
@@ -12,6 +13,25 @@ from apple_login import AppleStoreLogin
 
 
 class LoginProgressTests(unittest.TestCase):
+    def test_request_timing_separates_header_wait_from_body_without_secrets(self):
+        client = AppleStoreLogin()
+        self.addCleanup(client.session.close)
+        url = 'https://secure6.www.apple.com.cn/shop/checkoutx/billing?token=private'
+        response = requests.Response()
+        response.status_code = 200
+        response.url = url
+        response._content = b'{}'
+        response.elapsed = timedelta(seconds=10)
+        response.raw = HTTPResponse(headers={})
+        response.request = requests.Request('POST', url).prepare()
+        with patch.object(client.session, 'request', return_value=response), \
+                patch.object(duo_killer, 'perf_counter', side_effect=[0, 10.2]), \
+                patch.object(duo_killer.log, 'disabled', False), self.assertLogs('duo_killer', level='INFO') as captured:
+            duo_killer.request_get(client.session, '计时测试', url, method='POST')
+        logs = '\n'.join(captured.output)
+        self.assertIn('等待响应头 10.00s', logs)
+        self.assertIn('本地处理 0.20s', logs)
+        self.assertNotIn('token=private', logs)
     def test_spinner_clears_on_success_failure_and_cancellation(self):
         for error in (None, ValueError('failed'), KeyboardInterrupt()):
             with self.subTest(error=type(error).__name__):

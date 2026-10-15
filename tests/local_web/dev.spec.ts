@@ -112,7 +112,7 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
     page.getByRole("button", { name: "保存地址预设" }),
   ).toBeEnabled();
   await page.getByRole("combobox", { name: "预制商品" }).click();
-  await page.getByRole("option", { name: /MK2W4CH/ }).click();
+  await page.getByRole("option", { name: /MK2P4CH/ }).click();
   await page.getByLabel("数量", { exact: true }).fill("3");
   await page.getByRole("button", { name: "保存购买预设", exact: true }).click();
   await expect(page.getByText("购买预设已保存", { exact: true })).toBeVisible();
@@ -138,7 +138,7 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
   });
   await page.reload();
   await expect(page.getByLabel("详细地址")).toHaveValue("测试路 8 号");
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2W4CH");
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2P4CH");
   await page.getByRole("link", { name: "DUO 状态", exact: true }).click();
   await expect(page).toHaveURL(/#\/duo$/);
   const sidebar = await page.locator(".sidebar").boundingBox();
@@ -183,7 +183,7 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
     })
     .click();
   await expect(page.getByLabel("详细地址")).toHaveValue("测试路 8 号");
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2W4CH");
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2P4CH");
   await page.getByRole("link", { name: "账号工作台", exact: true }).click();
   const source = (value: string) =>
     `window.__devProbe = ${JSON.stringify(value)}; if (import.meta.hot) import.meta.hot.accept();\n`;

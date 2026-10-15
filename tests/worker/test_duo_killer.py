@@ -707,7 +707,7 @@ class FirstRunTests(unittest.TestCase):
 
 
 class FailedLoginLifecycleTests(unittest.TestCase):
-    def test_failed_auth_clears_session_and_reprompts_only_for_rejected_credentials(self):
+    def test_failed_auth_discards_failed_session_but_keeps_identity_password_and_trust(self):
         failures = (LoginError("rejected", status=401, codes=("-20101",)),
                     LoginError("bad code", status=400, codes=("-21669",)),
                     LoginError("callback failed", status=541), requests.Timeout("timeout"), EOFError())
@@ -737,18 +737,10 @@ class FailedLoginLifecycleTests(unittest.TestCase):
                     self.assertEqual({c["name"] for group in saved["cookies"].values() for c in group}, {"shld_bt_ck"})
                     self.assertEqual(saved["trust_cookies"], config["trust_cookies"])
                     self.assertEqual(saved["custom"], "keep")
-                    if getattr(error, "status", None) == 401:
-                        self.assertEqual((saved["account"], saved["password"]), ("", ""))
-                        with patch("builtins.input", side_effect=["test@example.invalid", " new-secret "]) as prompt:
-                            self.assertTrue(duo_killer.ensure_auth_file())
-                            self.assertEqual(prompt.call_count, 2)
-                        repaired = json.loads(path.read_text())
-                        self.assertEqual(repaired["password"], " new-secret ")
-                        self.assertEqual(repaired["trust_cookies"], config["trust_cookies"])
-                    else:
-                        self.assertEqual(saved["password"], "old-secret")
-                        with patch("builtins.input", side_effect=AssertionError("不能要求重输密码")):
-                            self.assertFalse(duo_killer.ensure_auth_file())
+                    self.assertEqual((saved["account"], saved["password"]),
+                                     (config["account"], "old-secret"))
+                    with patch("builtins.input", side_effect=AssertionError("不能要求重置账号")):
+                        self.assertFalse(duo_killer.ensure_auth_file())
                     if os.name != 'nt':  # Windows uses inherited per-user ACLs, not POSIX mode bits.
                         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
@@ -1062,8 +1054,10 @@ class CheckoutAuthenticationTests(unittest.TestCase):
                              "checkout": {"fulfillment": {"d": {"ready": True}}}},
                             "https://secure8.www.apple.com.cn/shop/checkout/start")
         with patch("apple_login.load_credentials", return_value=("test@example.invalid", "password")), \
-                patch.object(AppleStoreLogin, "login", autospec=True, return_value=landing) as login:
+                patch.object(AppleStoreLogin, "login", autospec=True, return_value=landing) as login, \
+                patch.object(duo_killer, "save_auth") as save:
             self.assertTrue(duo_killer.reauthenticate_checkout(flow))
+            save.assert_called_once_with(session)
             self.assertIs(login.call_args.args[0].session, session)
             self.assertEqual(login.call_args.kwargs["signin_url"], entry)
             self.assertEqual(login.call_args.kwargs["signin_response"].url, entry)

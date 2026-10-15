@@ -75,7 +75,7 @@ export default function App() {
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState("");
   const [dispatching, setDispatching] = useState(false);
-  const [sku, setSku] = useState("MK2U4CH");
+  const [sku, setSku] = useState("MK2M4CH");
   const [quantity, setQuantity] = useState(2);
   const [taskTarget, setTaskTarget] = useState<Task | null>(null);
   const [focusTaskId, setFocusTaskId] = useState("");
@@ -127,6 +127,15 @@ export default function App() {
       const state = await bridge.snapshot();
       if (!disposed) {
         setSnapshot(state);
+        // A single enrolled account is already chosen. Reopening the UI must
+        // not enqueue another login check behind its unfinished checkout.
+        // Worker actions still verify the Apple session before using it.
+        const savedAccounts = state.accounts.filter((a) => !a.pending);
+        if (savedAccounts.length === 1) {
+          setAccountId(savedAccounts[0].id);
+          setEnabledIds([savedAccounts[0].id]);
+          setSessionReady(true);
+        }
         setReady(true);
       } else unlisten();
     })().catch((e) => {
@@ -143,7 +152,7 @@ export default function App() {
   const account = snapshot.accounts.find((a) => a.id === accountId);
   useLayoutEffect(() => setRevealed(false), [accountId, setRevealed]);
   useEffect(() => {
-    setSku(account?.preset_sku || "MK2U4CH");
+    setSku(account?.preset_sku || "MK2M4CH");
     setQuantity(account?.preset_quantity || 2);
   }, [account?.id, account?.preset_sku, account?.preset_quantity]);
   const tasks = snapshot.tasks
@@ -164,8 +173,13 @@ export default function App() {
     .filter(active)
     .sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
   const allActive = activeTasks.length;
+  const resumingTask =
+    !account?.pending &&
+    tasks.some(
+      (t) => t.id === taskTarget?.id && active(t) && t.action !== "enroll",
+    );
   const viewingGate =
-    !sessionReady ||
+    (!sessionReady && !resumingTask) ||
     (adding && (!taskTarget || taskTarget.action === "enroll"));
   const settingsTarget =
     taskTarget &&
@@ -570,17 +584,6 @@ export default function App() {
                           <ProductSelect sku={sku} onChange={setSku} />
                           <div className="buy-fields">
                             <label>
-                              商品 SKU
-                              <input
-                                required
-                                value={sku}
-                                onChange={(e) =>
-                                  setSku(e.target.value.toUpperCase())
-                                }
-                                placeholder="MK2U4CH"
-                              />
-                            </label>
-                            <label>
                               数量
                               <input
                                 type="number"
@@ -595,18 +598,38 @@ export default function App() {
                             </label>
                           </div>
                           <p className="muted">
-                            购物袋已有该商品时，数量调整为这里填写的总数。结算前会显示全部商品与金额。
+                            {sku === "MLH74FE"
+                              ? "抛光布测试：自动送货并填写地址、联系方式，核对商品、数量、金额和地址后直接创建真实待付款订单，展示支付二维码。"
+                              : "固定送货，优先使用本地地址和联系方式。白色 256GB、1 台且总额不超过 15,999 元时自动创建订单；型号、数量或金额不符会停止。"}
                           </p>
                           <div className="button-row">
                             <button
                               className="primary"
                               type="submit"
-                              disabled={busy || !sku.trim() || quantity < 1}
+                              disabled={busy || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity < 1}
                             >
                               立即下单
                               <ArrowRight size={16} />
                             </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => start("login", { warm_only: true })}
+                            >
+                              预热登录（不加购）
+                            </button>
+                            <button type="button" disabled={busy} onClick={() => start("login", { renew_device_trust: true })}>
+                              重新验证设备（保留账号）
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity !== 1}
+                              onClick={() => start("purchase", { sku, quantity, prepare_only: true })}
+                            >
+                              提前准备（不下单）
+                            </button>
                           </div>
+                          <p className="muted">商品未开放加购时，可先预热登录，不加购、不下单；结算仍可能要求认证。提前准备需要商品可加购，会填写结算信息但不创建订单。5 分钟内下单优先读取当前结算页并重新核对，不保证库存。</p>
                         </form>
                       </section>
                     </>
@@ -654,7 +677,7 @@ export default function App() {
                         支付完成后主动查询，确认 Apple 返回的最新订单状态。
                       </p>
                       {latest(["orders"]) ? (
-                        <OrderTable result={latest(["orders"])!} />
+                        <OrderTable result={latest(["orders"])!} disabled={busy} onCancelOrder={(order_number) => start("cancel_order", { order_number })} />
                       ) : (
                         <InlineEmpty text="点击查询订单，读取官网订单列表。" />
                       )}
@@ -733,11 +756,11 @@ export default function App() {
                   >
                     <div className="section-title">
                       <h2>{actionNames[task.action]}</h2>
-                      <span className={`status ${task.status}`}>
-                        {active(task) && task.status !== "waiting" && (
+                      <span className={`status ${task.result?.status === "pending_payment" ? "succeeded" : task.status}`}>
+                        {active(task) && task.status !== "waiting" && task.result?.status !== "pending_payment" && (
                           <LoaderCircle size={13} className="spin" />
                         )}
-                        {stateNames[task.status]}
+                        {task.result?.status === "pending_payment" ? "订单已创建" : stateNames[task.status]}
                       </span>
                     </div>
                     <p className="task-account">{format(account.email)}</p>
@@ -764,12 +787,12 @@ export default function App() {
                             onClick={() => cancel(task)}
                           >
                             <X size={14} />
-                            取消
+                            {task.result?.status === "pending_payment" ? "停止加载二维码" : "取消"}
                           </button>
                         )}
                       </>
                     )}
-                    {task.status === "succeeded" && task.result && (
+                    {task.result && (task.status === "succeeded" || task.result.status === "pending_payment") && (
                       <Result
                         task={task}
                         onOrders={() => {
@@ -777,6 +800,8 @@ export default function App() {
                           start("orders");
                         }}
                         onQr={() => start("qr", { source_task: task.id })}
+                        onCancelOrder={() => start("cancel_order", { order_number: task.result!.order_number })}
+                        cancelled={snapshot.tasks.some((t) => t.account_id === task.account_id && t.result?.status === "order_cancelled" && t.result?.order_number === task.result!.order_number)}
                         disabled={busy}
                       />
                     )}
@@ -900,7 +925,7 @@ function ItemTable({ items, total }: { items: Data[]; total?: string }) {
     </>
   );
 }
-function OrderTable({ result }: { result: Data }) {
+function OrderTable({ result, disabled, onCancelOrder }: { result: Data; disabled: boolean; onCancelOrder: (number: string) => void }) {
   return (
     <>
       <div className="table-wrap">
@@ -910,6 +935,7 @@ function OrderTable({ result }: { result: Data }) {
               <th>订单号 / 商品</th>
               <th>数量</th>
               <th>状态 / 配送</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -922,6 +948,7 @@ function OrderTable({ result }: { result: Data }) {
                   </td>
                   <td>{item.quantity}</td>
                   <td>{item.delivery_info || "官网未返回状态"}</td>
+                  <td>{i === 0 && <button disabled={disabled} onClick={() => onCancelOrder(order.order_number)}>取消订单 {order.order_number}</button>}</td>
                 </tr>
               )),
             )}
@@ -986,23 +1013,39 @@ function Result({
   task,
   onOrders,
   onQr,
+  onCancelOrder,
+  cancelled,
   disabled,
 }: {
   task: Task;
   onOrders: () => void;
   onQr: () => void;
+  onCancelOrder: () => void;
+  cancelled: boolean;
   disabled: boolean;
 }) {
   const { format } = useAccountPrivacy();
   const result = task.result!;
+  if (cancelled && result.status === "pending_payment") return <p>订单 {result.order_number} 已取消，付款二维码已隐藏。</p>;
+  if (task.action === "cancel_order") return <div>
+    <p>{result.message}</p>
+    <p>订单 {result.order_number}</p>
+    {result.detail_url && <a href={result.detail_url} target="_blank" rel="noopener noreferrer">在 Apple 官网查看订单</a>}
+    <button disabled={disabled} onClick={onOrders}>查询订单状态</button>
+  </div>;
   if (result.status === "pending_payment")
     return (
       <div className="payment">
         <h3>订单已创建，等待付款</h3>
+        {typeof result.order_confirmed_elapsed_seconds === "number" && (
+          <p className="muted">订单确认耗时：约 {result.order_confirmed_elapsed_seconds} 秒（含排队，不含二维码）。</p>
+        )}
         <p>
           订单 {result.order_number || "请查询订单确认"}
           {result.amount_due && ` · ${result.amount_due}`}
         </p>
+        {result.items && <ItemTable items={result.items} total={result.order_total} />}
+        {result.delivery_address && <p>送货地址：{result.delivery_address}</p>}
         {result.qr_data ? (
           <img
             src={result.qr_data}
@@ -1010,6 +1053,8 @@ function Result({
             width={208}
             height={208}
           />
+        ) : result.qr_loading && task.status === "running" ? (
+          <p role="status"><LoaderCircle size={16} className="spin" /> 订单已创建，正在加载支付宝付款二维码…</p>
         ) : (
           <>
             <p>{result.qr_error || "重新获取此订单的付款二维码。"}</p>
@@ -1022,6 +1067,9 @@ function Result({
         <button className="primary" disabled={disabled} onClick={onOrders}>
           <RefreshCw size={15} />
           我已支付，查询订单
+        </button>
+        <button disabled={disabled || !result.order_number} onClick={onCancelOrder}>
+          取消订单
         </button>
       </div>
     );
@@ -1040,7 +1088,7 @@ function Result({
     return (
       <div className="result-line">
         <Check size={16} />
-        商城会话已保存，可继续选购。
+        {result.warm_login ? result.message : "商城会话已保存，可继续选购。"}
       </div>
     );
   if (task.action === "add")
@@ -1108,6 +1156,7 @@ function PromptForm({
       <h3>{format(prompt.label)}</h3>
       {confirmation ? (
         <>
+          {prompt.details?.operation === "cancel_order" && <p>订单 {prompt.details.order_number}。确认后将向 Apple 提交取消。</p>}
           <ItemTable
             items={prompt.details?.items || []}
             total={prompt.details?.total}
@@ -1219,7 +1268,7 @@ function PromptForm({
           {busy ? (
             <LoaderCircle size={15} className="spin" />
           ) : confirmation ? (
-            "确认创建订单"
+            prompt.details?.operation === "cancel_order" ? "确认取消订单" : "确认创建订单"
           ) : (
             "继续"
           )}
@@ -1231,7 +1280,7 @@ function PromptForm({
           onClick={confirmation ? () => submit(false) : onCancel}
         >
           <X size={14} />
-          取消
+          {prompt.details?.operation === "cancel_order" ? "保留订单" : "取消"}
         </button>
       </div>
     </form>

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { MapPin } from "lucide-react";
 import { LOCAL_ID, type Account, type Action, type Data } from "./types";
 
@@ -30,9 +30,12 @@ export function AddressForm({
     delivery: {},
     address: {},
   });
+  const addressRead = useRef("");
   useEffect(() => {
+    if (busy || addressRead.current === account.id) return;
+    addressRead.current = account.id;
     start("address_read");
-  }, [account.id]);
+  }, [account.id, busy]);
   const savedConfig = JSON.stringify(result?.config);
   useEffect(() => {
     if (result?.config)

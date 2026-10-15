@@ -21,6 +21,7 @@ const ACTIONS: &[&str] = &[
     "login",
     "me",
     "orders",
+    "cancel_order",
     "bag",
     "add",
     "purchase",
@@ -464,6 +465,18 @@ impl Engine {
             return Err("请先完成账号添加与登录验证".into());
         }
         let mut tasks = self.tasks.lock().unwrap();
+        // Read/check requests can be triggered again by page navigation.
+        // Reuse the outstanding task instead of building a duplicate queue.
+        if matches!(action.as_str(), "me" | "address_read") {
+            if let Some(existing) = tasks.values().find(|t| {
+                t.account_id == account_id && t.action == action && !terminal(&t.status)
+            }) {
+                return Ok(existing.id.clone());
+            }
+        }
+        if tasks.values().any(|t| t.account_id == account_id && t.status == "waiting") {
+            return Err("该账号正在等待输入或订单确认，请从顶部进行中的任务继续操作，或先取消该任务".into());
+        }
         if tasks
             .values()
             .filter(|t| t.account_id == account_id && !terminal(&t.status))
@@ -749,6 +762,15 @@ pub fn apply_event(task: &mut Task, event: &Value) {
                 task.logs.remove(0);
             }
         }
+        "progress_result" => {
+            if task.order_submitted && !terminal(&task.status)
+                && event["result"]["status"] == "pending_payment"
+                && event["result"]["order_number"].as_str().is_some_and(|n| !n.is_empty()) {
+                task.result = Some(event["result"].clone());
+                task.prompt = None;
+                task.stage = "订单已创建，正在加载付款二维码".into();
+            }
+        }
         "result" => {
             task.status = "succeeded".into();
             task.result = Some(event["result"].clone());
@@ -809,11 +831,60 @@ mod tests {
         }
     }
     #[test]
+    fn order_progress_is_visible_without_finishing_task() {
+        let mut t = task();
+        t.status = "running".into();
+        t.order_submitted = true;
+        apply_event(&mut t, &json!({"type":"progress_result","result":{
+            "status":"pending_payment","order_number":"TEST-001","amount_due":"RMB 69","qr_loading":true}}));
+        assert_eq!(t.status, "running");
+        assert_eq!(t.result.as_ref().unwrap()["order_number"], "TEST-001");
+        apply_event(&mut t, &json!({"type":"error","message":"QR interrupted"}));
+        assert_eq!(t.status, "failed");
+        assert_eq!(t.result.as_ref().unwrap()["status"], "pending_payment");
+    }
+    #[test]
     fn replies_are_bound_to_account_and_request() {
         let t = task();
         assert!(validate_reply(&t, "a", "p", &json!("012345")).is_ok());
         assert!(validate_reply(&t, "b", "p", &json!("012345")).is_err());
         assert!(validate_reply(&t, "a", "old", &json!("012345")).is_err());
+    }
+    #[tokio::test]
+    async fn repeated_read_tasks_reuse_the_outstanding_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let a = engine.add_account("a@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending = false;
+        let host = TaskHost { worker: PathBuf::from("unused"), script: None, on_update: Arc::new(|_| {}) };
+        for action in ["me", "address_read"] {
+            for status in ["queued", "running", "waiting"] {
+                let mut existing = task();
+                existing.account_id = a.id.clone();
+                existing.action = action.into();
+                existing.status = status.into();
+                engine.tasks.lock().unwrap().insert(existing.id.clone(), existing);
+                assert_eq!(engine.start(host.clone(), a.id.clone(), action.into(), json!({})).unwrap(), "t");
+                assert_eq!(engine.tasks.lock().unwrap().len(), 1);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn waiting_for_input_blocks_new_tasks_only_for_that_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let a = engine.add_account("a@example.test".into()).unwrap();
+        let b = engine.add_account("b@example.test".into()).unwrap();
+        for account in engine.accounts.lock().unwrap().iter_mut() { account.pending = false; }
+        let mut waiting = task();
+        waiting.account_id = a.id.clone();
+        waiting.action = "purchase".into();
+        engine.tasks.lock().unwrap().insert(waiting.id.clone(), waiting);
+        let host = TaskHost { worker: PathBuf::from("unused"), script: None, on_update: Arc::new(|_| {}) };
+        assert!(engine.start(host.clone(), a.id.clone(), "address_read".into(), json!({})).unwrap_err().contains("正在等待输入"));
+        assert!(engine.start(host.clone(), b.id, "address_read".into(), json!({})).is_ok());
+        engine.tasks.lock().unwrap().get_mut("t").unwrap().status = "cancelled".into();
+        assert!(engine.start(host, a.id, "address_read".into(), json!({})).is_ok());
     }
     #[test]
     fn confirmation_is_explicit_and_selection_is_constrained() {

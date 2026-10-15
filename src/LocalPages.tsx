@@ -91,13 +91,10 @@ export function ProductSelect({
       label="预制商品"
       value={known ? sku.replace(/\/A$/i, "") : ""}
       onChange={onChange}
-      options={[
-        { value: "", label: "自定义 SKU" },
-        ...presetProducts.map((p) => ({
+      options={presetProducts.map((p) => ({
           value: p.sku,
           label: `${p.name} · ${p.sku}`,
-        })),
-      ]}
+        }))}
     />
   );
 }
@@ -237,7 +234,7 @@ function PurchasePreset({
   bridge: Bridge;
   refresh: () => Promise<void>;
 }) {
-  const [sku, setSku] = useState(account.preset_sku || "MK2U4CH");
+  const [sku, setSku] = useState(account.preset_sku || "MK2M4CH");
   const [quantity, setQuantity] = useState(account.preset_quantity || 2);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
@@ -271,14 +268,6 @@ function PurchasePreset({
         <ProductSelect sku={sku} onChange={changeSku} />
         <div className="buy-fields">
           <label>
-            商品 SKU
-            <input
-              required
-              value={sku}
-              onChange={(e) => changeSku(e.target.value.toUpperCase())}
-            />
-          </label>
-          <label>
             数量
             <input
               required
@@ -297,7 +286,7 @@ function PurchasePreset({
           预制商品仅用于快捷选择，价格与可购买状态以官网实时结果及结账金额为准。
         </p>
         <div className="button-row">
-          <button type="submit" disabled={saving}>
+          <button type="submit" disabled={saving || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, ""))}>
             保存购买预设
           </button>
           <span role="status">{status}</span>
@@ -323,16 +312,10 @@ export function DuoStatus({ snapshot, bridge, refresh }: PageProps) {
   const busy = starting || tasks.some(active);
   const live: Data[] = result?.items || [];
   const normalize = (sku: string) => sku.toUpperCase().replace(/\/A$/, "");
-  const known = new Set(duoProducts.map((p) => p.sku));
-  const rows = [
-    ...duoProducts.map((p) => ({
+  const rows = duoProducts.map((p) => ({
       preset: p,
       item: live.find((i) => normalize(i.sku) === p.sku),
-    })),
-    ...live
-      .filter((i) => !known.has(normalize(i.sku)))
-      .map((item) => ({ preset: undefined, item })),
-  ];
+    }));
   return (
     <main className="local-page duo-page">
       <header className="local-heading">
@@ -367,7 +350,7 @@ export function DuoStatus({ snapshot, bridge, refresh }: PageProps) {
         </button>
       </header>
       <p className="muted">
-        内置 8
+        内置 {duoProducts.length}
         款预制商品。点击刷新读取官网选购页；未知表示官网未提供明确的加购许可，不代表有货。
       </p>
       {error && (

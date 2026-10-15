@@ -165,7 +165,7 @@ def hashcash(bits, challenge, max_seconds=30):
 
 
 class AppleStoreLogin:
-    def __init__(self, user_agent=UA, auth_path=None, session=None):
+    def __init__(self, user_agent=UA, auth_path=None, session=None, *, renew_device_trust=False):
         self.session = session if session is not None else requests.Session()
         if session is None:
             self.session.headers.update({"User-Agent": user_agent, "Accept-Language": "zh-CN,zh;q=0.9"})
@@ -175,6 +175,8 @@ class AppleStoreLogin:
         self.auth_headers = {}
         self.hc = {}
         self.account = None
+        self.renew_device_trust = renew_device_trust
+        self.trust_persistence_ready = not renew_device_trust
 
     @property
     def browser_profile(self):
@@ -320,6 +322,9 @@ class AppleStoreLogin:
         for cookie in list(self.session.cookies):
             if TRUST_COOKIE_NAME.fullmatch(cookie.name) and cookie.domain.lstrip(".") == "idmsa.apple.com.cn":
                 self.session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+        if self.renew_device_trust:
+            log.info('[设备信任] 本次使用官方二次验证更新信任；旧保存配置保留，不自动删除。')
+            return
         restored = stored_device_trust(config, self.account)
         for data in restored:
             cookie = requests.cookies.create_cookie(
@@ -331,6 +336,8 @@ class AppleStoreLogin:
             interaction.report_stage("已恢复本机设备信任，正在登录")
 
     def update_trust(self, response):
+        if not self.trust_persistence_ready:
+            return
         if self.auth_path is None or not self.account:
             return
         # CookieJar 已由 requests 更新；同时检测过期/删除的 Set-Cookie，避免旧值复活。
@@ -375,7 +382,11 @@ class AppleStoreLogin:
                 kwargs["headers"] = {**(kwargs.get("headers") or {}), "Cookie": quoted}
         # 不自动重试登录，也不把认证头随重定向转发。
         if self.store_request is not None:
-            stage = "Apple 账号认证" if is_auth_host else "登录商城"
+            path = urlsplit(url).path
+            stage = ("Apple 账号认证" if is_auth_host else
+                     "交换商城会话凭证" if path.endswith('/signIn/idms/authx') else
+                     "初始化结算会话" if path == '/shop/checkout/start' else
+                     "读取结算页面" if path == '/shop/checkout' else "登录商城")
             response = self.store_request(self.session, stage, url, method=method,
                                           allow_redirects=False, **kwargs)
         else:
@@ -601,7 +612,10 @@ class AppleStoreLogin:
                 print("本次验证码未通过，请确认验证码来源与当前验证方式一致后重新输入。")
                 code = input("👉 短信六位验证码（输入 d 改用设备）：" if sms
                              else "👉 设备六位验证码：").strip()
-        self.auth("GET", "/2sv/trust", allowed=(200, 204))
+        trust_response, _ = self.auth("GET", "/2sv/trust", allowed=(200, 204))
+        if self.renew_device_trust:
+            self.trust_persistence_ready = True
+            self.update_trust(trust_response)
 
     def discard_failed_login(self, error):
         auth_names = {"as_ltn_cn", "as_cn", "as_disa", "as_rec", "myacinfo", "acn01"}
@@ -618,10 +632,6 @@ class AppleStoreLogin:
         config = json.loads(self.auth_path.read_text(encoding="utf-8"))
         for group, cookies in config.get("cookies", {}).items():
             config["cookies"][group] = [c for c in cookies if not is_auth(c["name"], c["domain"])]
-        if isinstance(error, LoginError) and error.status == 401 and "-20101" in error.codes:
-            config["trust_account"] = config.get("trust_account") or config.get("account", "")
-            config["account"] = ""
-            config["password"] = ""
         fd, temporary = tempfile.mkstemp(dir=self.auth_path.parent, prefix=".auth-")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as file:
@@ -642,13 +652,31 @@ class AppleStoreLogin:
             if isinstance(error, LoginError) and error.status == 401 and "-20101" in error.codes:
                 raise LoginError(
                     "Apple 账号或密码验证失败（HTTP 401，错误代码 -20101）。"
-                    "已清空本地账密及登录 Cookie，下次运行将重新输入账号和密码；"
-                    "其他配置和设备信任已保留。此错误不一定由密码输错导致。",
+                    "账号、保存的密码和设备信任已保留；本次失败会话已失效，不自动重试。"
+                    "此错误不一定由密码输错导致，请先核对官网登录。",
                     status=error.status, codes=error.codes) from None
             raise
 
+    def begin_authentication_context(self):
+        """Do not replay an imported session-only IDMS transaction cookie.
+
+        Keep the account, password, store cookies and DES device trust. The
+        authorize response issues a fresh aasp for this transaction; it must
+        then survive federate/init/complete without being cleared again.
+        """
+        removed = 0
+        for cookie in list(self.session.cookies):
+            if (cookie.name == 'aasp' and cookie.domain.lstrip('.') == 'idmsa.apple.com.cn'
+                    and cookie.expires is None):
+                self.session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+                removed += 1
+        self.auth_headers = {}
+        self.hc = {}
+        log.info('[认证上下文] 开始新认证，旧会话级 aasp 数量=%s；商城会话与设备信任保留。', removed)
+
     def _login(self, account, password, sms=False, *, signin_url=None, signin_response=None):
         self.account = account
+        self.begin_authentication_context()
         self.restore_trust()
         if signin_url is None:
             self.bootstrap()
@@ -713,6 +741,10 @@ class AppleStoreLogin:
         if "myacinfo" not in names:
             raise LoginError("账号认证后缺少可发送给商城的 myacinfo，未提交回调。")
         response = self.request("POST", self.callback, data={"grantCode": ""}, headers=headers)
+        after = self.session.prepare_request(requests.Request('POST', self.callback))
+        after_names = {part.strip().partition('=')[0] for part in after.headers.get('Cookie', '').split(';')}
+        if 'myacinfo' not in after_names:
+            log.info('商城回调响应后 myacinfo 已不可发送，按服务器返回的凭证有效期处理；后续结算可能再次要求账号认证。')
         if response.status_code == 541:
             self.mark_rejected_browser_context()
         data = self.expect(response, (200,))

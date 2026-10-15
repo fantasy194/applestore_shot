@@ -17,6 +17,16 @@ def value(node, path, default=None):
     return node
 
 
+def automatic_checkout():
+    return getattr(interaction.handler, 'automatic_checkout', False) is True
+
+
+def local_address_ready(config):
+    return (bool(config.get('address', {}).get('street'))
+            and all(config.get('delivery', {}).get(k) for k in ('state', 'city', 'district'))
+            and all(config.get('contact', {}).get(k) for k in ('lastName', 'firstName', 'emailAddress', 'fullDaytimePhone')))
+
+
 def read_config(path):
     config = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     if not isinstance(config, dict):
@@ -168,7 +178,15 @@ def region_data(flow, path, wanted=None, *, prefer_current=False):
     for key, label in (('state', '省份'), ('city', '城市'), ('district', '区县')):
         node = flow.require(path)
         data = node['d']
-        options = [(o['value'], o.get('label', o['value'])) for o in data.get(key + 'Options', []) if o.get('value')]
+        options = [(o['value'], o.get('label', o['value'])) for o in (data.get(key + 'Options') or []) if o.get('value')]
+        # Municipality pages can omit the city selector while returning the
+        # fixed city explicitly. Reuse that server value, never infer a city
+        # from the user's preset or carry a city over from another province.
+        if (key == 'city' and not options
+                and selected.get('state') in ('北京', '上海', '天津', '重庆')
+                and data.get('state') == selected['state']
+                and data.get('city') == selected['state']):
+            options = [(data['city'], data['city'])]
         desired = wanted.get(key) or data.get(key)
         matches = list(dict.fromkeys(k for k, title in options if desired in (k, title)))
         if not matches and desired:
@@ -218,7 +236,7 @@ def invoice_data(flow, path):
     invoice = value(flow.model, path + '.eFapiaoSelector')
     if not invoice:
         return {}  # 混合自提的发票已在取货联系人页面填写。
-    if value(invoice, 'd.selectFapiao') != 'e_personal_fdf':
+    if value(invoice, 'd.selectFapiao') != 'e_personal_fdf' and not (automatic_checkout() and invoice.get('ePersonalFapiao')):
         raise ValueError('当前仅支持个人电子发票，请先在官网选择。')
     return {path + '.eFapiaoSelector.selectFapiao': 'e_personal_fdf',
             path + '.eFapiaoSelector.ePersonalFapiao.invoiceHeader': value(invoice, 'ePersonalFapiao.d.invoiceHeader', '')}
@@ -261,7 +279,7 @@ def home_delivery(flow, config):
     if flow.require(selector)['d'].get('selectFulfillmentLocation') != 'HOME':
         raise ValueError('服务端未确认切换为送货，已停止。')
     tab = path + '.deliveryTab.delivery'
-    payload.update(region_data(flow, tab + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=True))
+    payload.update(region_data(flow, tab + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=not automatic_checkout()))
     payload.update(shipping_options(flow, tab + '.shipmentGroups'))
     flow.action(path, 'continueFromFulfillmentToShipping', payload)
     flow.require('checkout.shipping')
@@ -344,7 +362,20 @@ def shipping(flow, config_path, auth_path=None):
         current = saved[0]
     can_add = any(a.get('value') == 'newAddr' and not a.get('disabled')
                   for a in selector.get('radioAddresses', []))
-    if saved:
+    if automatic_checkout():
+        config = read_config(config_path)
+        if local_address_ready(config):
+            if not can_add:
+                raise ValueError('官网未提供本地地址填写入口；未改用其他地址，未提交订单。')
+            selected = 'newAddr'
+            interaction.report_stage('自动使用本地地址和联系方式')
+        elif saved and current:
+            # Only an explicit default or a unique saved address is safe.
+            selected = 'saved'
+            interaction.report_stage('本地地址不完整，自动使用官网默认地址')
+        else:
+            raise ValueError('没有完整本地地址或唯一官网默认地址，请先保存地址；未提交订单。')
+    elif saved:
         choices = [('saved', '使用官网已有的地址')]
         if can_add:
             choices.append(('newAddr', '使用本地快捷地址进行配置'))
@@ -379,7 +410,7 @@ def shipping(flow, config_path, auth_path=None):
         payload.update({address + '.' + k: details[k] for k in ('lastName', 'firstName')})
         payload.update({address + '.street': config['address']['street'], address + '.street2': config.get('address', {}).get('street2', ''),
                         address + '.copyContact.fullDaytimePhone': details['fullDaytimePhone'],
-                        path + '.addressSelector.newAddress.saveToAddressBook': 'true'})
+                        path + '.addressSelector.newAddress.saveToAddressBook': 'false' if automatic_checkout() else 'true'})
         email = details['emailAddress']
         print('收货地址：' + ' '.join(config['delivery'].values()) + ' ' + config['address']['street'])
     else:

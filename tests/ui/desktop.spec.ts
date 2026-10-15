@@ -100,8 +100,11 @@ async function fixture(
             logs: [],
           };
           tasks.unshift(task);
-          root.started.push({ accountId, action, id });
-          if (
+          root.started.push({ accountId, action, id, params });
+          if (action === "login" && params.warm_only === true) {
+            task.status = "succeeded";
+            task.result = { warm_login: true, message: "登录预热完成，未加购、未下单。" };
+          } else if (
             action === "login" ||
             action === "enroll" ||
             (action === "me" && root.waitForMe)
@@ -112,6 +115,13 @@ async function fixture(
               kind: "password",
               label: "输入 Apple 账号密码",
             };
+          } else if (action === "cancel_order") {
+            task.status = "waiting";
+            task.prompt = { id: "cancel-" + id, kind: "confirm", label: "确认取消订单 " + params.order_number,
+              details: { operation: "cancel_order", order_number: params.order_number, items: [{ name: "抛光布", quantity: 1, subtotal: "RMB 69" }], total: "RMB 69" } };
+          } else if (action === "purchase" && params.prepare_only === true) {
+            task.status = "succeeded";
+            task.result = { success: true, status: "prepared", message: "准备完成，未创建订单。" };
           } else if (action === "purchase") {
             task.status = "waiting";
             task.prompt = {
@@ -176,16 +186,16 @@ async function fixture(
                   queried_at: new Date().toISOString(),
                   items: [
                     {
-                      sku: "MK2Q4CH/A",
-                      name: "iPhone Duo 512GB Night Sky",
+                      sku: "MK2P4CH/A",
+                      name: "iPhone Duo 512GB Star White",
                       price: 17999,
                       can_add_to_bag: false,
                       coming_soon: true,
                       reason: "即将发售",
                     },
                     {
-                      sku: "MK2U4CH/A",
-                      name: "iPhone Duo 1TB Night Sky",
+                      sku: "MK2M4CH/A",
+                      name: "iPhone Duo 256GB Star White",
                       price: 21499,
                       can_add_to_bag: null,
                       coming_soon: false,
@@ -255,6 +265,13 @@ async function fixture(
               apple_id: a.email,
             };
             update(task);
+          } else if (task.action === "cancel_order") {
+            task.status = "succeeded";
+            task.prompt = null;
+            task.result = { success: value === true, status: value === true ? "order_cancelled" : "cancellation_aborted",
+              order_number: root.started.find((t: any) => t.id === taskId).params.order_number,
+              message: value === true ? "官网已确认订单取消。" : "已放弃取消，原订单保留。" };
+            update(task);
           } else {
             task.status = "succeeded";
             task.prompt = null;
@@ -288,6 +305,64 @@ async function enterWorkspace(page: Page) {
   await page.getByRole("button", { name: "检查并使用所选账号" }).click();
   await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
 }
+
+test("reopening a single enrolled account keeps its preset without another login task", async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(async () => {
+    const api = (window as any).__DUO_KILLER_TEST__;
+    await api.remove("b");
+    await api.savePreset("a", "MK2M4CH", 1);
+  });
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2M4CH");
+  await expect(page.getByLabel("数量", { exact: true })).toHaveValue("1");
+  expect(await page.evaluate(() => (window as any).started)).toHaveLength(0);
+  await page.reload();
+  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2M4CH");
+  expect(await page.evaluate(() => (window as any).started)).toHaveLength(0);
+});
+
+test("prepare button requests preparation without opening order confirmation", async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(async () => {
+    await (window as any).__DUO_KILLER_TEST__.remove("b");
+    await (window as any).__DUO_KILLER_TEST__.savePreset("a", "MK2M4CH", 1);
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "提前准备（不下单）", exact: true }).click();
+  await expect(page.getByText("准备完成，未创建订单。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "创建订单", exact: true })).toHaveCount(0);
+  const tasks = await page.evaluate(() => (window as any).started);
+  expect(tasks).toHaveLength(1);
+  expect(tasks[0].params.prepare_only).toBe(true);
+});
+
+test("warm login does not depend on product availability and does not purchase", async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(async () => { await (window as any).__DUO_KILLER_TEST__.remove("b"); });
+  await page.goto("/");
+  await page.getByRole("button", { name: "预热登录（不加购）", exact: true }).click();
+  await expect(page.getByText("登录预热完成，未加购、未下单。", { exact: true })).toBeVisible();
+  const calls = await page.evaluate(() => (window as any).started);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].action).toBe("login");
+  expect(calls[0].params).toEqual({ warm_only: true });
+});
+
+test("waiting checkout can be reopened and settings do not enqueue address reads", async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(() => {
+    (window as any).__DUO_KILLER_TEST__.start("a", "purchase", {});
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "1 个任务进行中", exact: true }).click();
+  await expect(page.getByRole("button", { name: "确认创建订单", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "本地配置", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "本地配置", exact: true })).toBeVisible();
+  expect((await page.evaluate(() => (window as any).started)).filter((t: any) => t.action === "address_read")).toHaveLength(0);
+});
 
 test("new account is only added after password and OTP succeed", async ({
   page,
@@ -403,7 +478,7 @@ test("order confirmation is explicit and can be rejected", async ({ page }) => {
   await enterWorkspace(page);
   await page.getByRole("button", { name: "立即下单" }).click();
   await expect(
-    page.getByRole("cell", { name: "测试商品 MK2U4CH" }),
+    page.getByRole("cell", { name: "测试商品 MK2M4CH" }),
   ).toBeVisible();
   await expect(page.getByText("总支付", { exact: true })).toBeVisible();
   expect(await page.evaluate(() => (window as any).sent)).toHaveLength(0);
@@ -451,15 +526,16 @@ test("purchase presets belong to one account", async ({ page }) => {
   await page.goto("/");
   await enterWorkspace(page);
   await page.getByRole("link", { name: "本地配置", exact: true }).click();
-  await page.getByLabel("商品 SKU").fill("MLH74FE");
+  await page.getByRole("combobox", { name: "预制商品" }).click();
+  await page.getByRole("option", { name: /抛光布/ }).click();
   await page.getByLabel("数量", { exact: true }).fill("3");
   await page.getByRole("button", { name: "保存购买预设", exact: true }).click();
   await expect(page.getByText("购买预设已保存", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "账号工作台", exact: true }).click();
   await page.getByRole("button", { name: /备用账号 seco/ }).click();
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2U4CH");
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2M4CH");
   await page.getByRole("button", { name: /日常账号 fir/ }).click();
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MLH74FE");
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MLH74FE");
   await expect(page.getByLabel("数量", { exact: true })).toHaveValue("3");
 });
 
@@ -499,6 +575,53 @@ test("payment result offers an order query without creating another order", asyn
     page.getByRole("cell", { name: "我们正在等待你的付款" }),
   ).toBeVisible();
   expect(await page.evaluate(() => (window as any).sent)).toHaveLength(1);
+});
+
+test("cancel order asks explicit confirmation without creating another purchase", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByRole("button", { name: "立即下单", exact: true }).click();
+  await page.getByRole("button", { name: "确认创建订单", exact: true }).click();
+  await page.getByRole("button", { name: "取消订单", exact: true }).click();
+  await expect(page.getByRole("button", { name: "确认取消订单", exact: true })).toBeVisible();
+  const cancelTask = (await page.evaluate(() => (window as any).started)).find((t: any) => t.action === "cancel_order");
+  expect((await page.evaluate(() => (window as any).sent)).filter((t: any) => t.taskId === cancelTask.id)).toHaveLength(0);
+  await page.getByRole("button", { name: "确认取消订单", exact: true }).click();
+  await expect(page.getByText("官网已确认订单取消。", { exact: true })).toBeVisible();
+  expect((await page.evaluate(() => (window as any).started)).filter((t: any) => t.action === "purchase")).toHaveLength(1);
+});
+
+test("created order is visible while QR is loading and remains after QR failure", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByRole("button", { name: "立即下单", exact: true }).click();
+  await page.getByRole("button", { name: "确认创建订单", exact: true }).click();
+  await page.evaluate(() => {
+    const root = window as any;
+    const id = root.started.find((t: any) => t.action === "purchase").id;
+    root.finish(id, { status: "running", order_submitted: true, result: {
+      status: "pending_payment", order_number: "EARLY-001", amount_due: "RMB 69", qr_loading: true,
+      order_confirmed_elapsed_seconds: 18 } });
+  });
+  await expect(page.getByRole("heading", { name: "订单已创建，等待付款" })).toBeVisible();
+  await expect(page.getByText("订单 EARLY-001 · RMB 69")).toBeVisible();
+  await expect(page.getByText("订单确认耗时：约 18 秒（含排队，不含二维码）。")).toBeVisible();
+  await expect(page.getByText("订单已创建", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "停止加载二维码", exact: true })).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("正在加载支付宝付款二维码");
+  await page.evaluate(() => {
+    const root = window as any;
+    const id = root.started.find((t: any) => t.action === "purchase").id;
+    root.finish(id, { status: "succeeded", result: {
+      status: "pending_payment", order_number: "EARLY-001", amount_due: "RMB 69", qr_loading: false,
+      qr_error: "二维码读取超时，订单保留" } });
+  });
+  await expect(page.getByText("订单 EARLY-001 · RMB 69")).toBeVisible();
+  await expect(page.getByText("二维码读取超时，订单保留")).toBeVisible();
+  await expect(page.getByRole("button", { name: "获取二维码", exact: true })).toBeEnabled();
+  expect((await page.evaluate(() => (window as any).started)).filter((t: any) => t.action === "purchase")).toHaveLength(1);
 });
 
 test("startup selects nothing, checks chosen accounts sequentially, and resets on reload", async ({
@@ -621,14 +744,14 @@ test("public DUO route needs no account and retains clearly dated results on fai
   await fixture(page, false);
   await page.goto("/#/duo");
   await expect(page.getByRole("heading", { name: "DUO 状态" })).toBeVisible();
-  await expect(page.locator("tbody tr")).toHaveCount(8);
+  await expect(page.locator("tbody tr")).toHaveCount(2);
   await expect(
     page.getByLabel("Apple 账号", { exact: true }),
   ).not.toBeVisible();
   expect(await page.evaluate(() => (window as any).started.length)).toBe(0);
   await page.getByRole("button", { name: "刷新状态" }).click();
-  const closed = page.locator("tr").filter({ hasText: "MK2Q4CH" });
-  const unknown = page.locator("tr").filter({ hasText: "MK2U4CH" });
+  const closed = page.locator("tr").filter({ hasText: "MK2P4CH" });
+  const unknown = page.locator("tr").filter({ hasText: "MK2M4CH" });
   await expect(closed).toContainText("未开放");
   await expect(unknown).toContainText("未知");
   await expect(unknown).toContainText("许可待确认");
@@ -659,11 +782,11 @@ test("preset products fill purchase fields without submitting an order", async (
   await page.goto("/");
   await enterWorkspace(page);
   await page.getByRole("combobox", { name: "预制商品" }).click();
-  await page.getByRole("option", { name: /MK2V4CH/ }).click();
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2V4CH");
+  await page.getByRole("option", { name: /MK2P4CH/ }).click();
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2P4CH");
   await page.getByRole("combobox", { name: "预制商品" }).click();
   await page.getByRole("option", { name: /抛光布/ }).click();
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MLH74FE");
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MLH74FE");
   const purchase = page.locator("section").filter({
     has: page.getByRole("heading", { name: "购买商品", exact: true }),
   });
@@ -681,7 +804,7 @@ test("preset products fill purchase fields without submitting an order", async (
     ),
   ).toBe(false);
   await page.getByRole("link", { name: "DUO 状态", exact: true }).click();
-  await expect(page.locator("tbody tr")).toHaveCount(8);
+  await expect(page.locator("tbody tr")).toHaveCount(2);
   await expect(
     page.getByRole("cell", { name: "抛光布", exact: true }),
   ).toHaveCount(0);
@@ -911,14 +1034,14 @@ test("shared dropdown supports keyboard, dismissal and narrow viewport placement
   await select.press("ArrowDown");
   await expect(select).toHaveAttribute("aria-expanded", "true");
   await select.press("End");
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2U4CH");
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2M4CH");
   await select.press("Escape");
   await expect(page.getByRole("listbox")).toHaveCount(0);
   await expect(select).toBeFocused();
   await select.press("ArrowDown");
   await select.press("End");
   await select.press("Enter");
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MLH74FE");
+  await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MLH74FE");
   await select.click();
   await expect(page.getByRole("option", { name: /抛光布/ })).toHaveAttribute(
     "aria-selected",

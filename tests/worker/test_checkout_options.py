@@ -283,6 +283,36 @@ class CheckoutOptionsTests(unittest.TestCase):
         self.assertEqual(data['region.district'], '双流区')
         self.assertEqual(flow.calls, [])
 
+    def test_municipality_uses_explicit_server_city_without_city_options(self):
+        for city in ('北京', '上海', '天津', '重庆'):
+            for city_options in ('missing', None, []):
+                with self.subTest(city=city, city_options=city_options):
+                    region = deepcopy(REGION)
+                    region['d'].update(state=city, city=city,
+                                       stateOptions=[{'value': city, 'label': city}])
+                    if city_options == 'missing':
+                        region['d'].pop('cityOptions')
+                    else:
+                        region['d']['cityOptions'] = city_options
+                    flow = FakeFlow({'region': region})
+                    with patch('builtins.input', side_effect=AssertionError('固定城市不应要求选择')):
+                        data = options.region_data(flow, 'region',
+                                                   {'state': city + '市', 'city': city + '市', 'district': '锦江区'})
+                    self.assertEqual(data['region.city'], city)
+                    self.assertEqual(flow.calls, [])
+
+    def test_missing_city_options_does_not_invent_or_reuse_another_city(self):
+        for state, city in (('四川', '成都'), ('上海', ''), ('上海', '成都')):
+            with self.subTest(state=state, city=city):
+                region = deepcopy(REGION)
+                region['d'].update(state=state, city=city,
+                                   stateOptions=[{'value': state, 'label': state}])
+                region['d'].pop('cityOptions')
+                flow = FakeFlow({'region': region})
+                with self.assertRaisesRegex(ValueError, '城市：没有可选项'):
+                    options.region_data(flow, 'region', {'state': state, 'city': '上海'})
+                self.assertEqual(flow.calls, [])
+
     def test_district_exact_match_wins_over_suffix_match(self):
         flow = FakeFlow({'region': deepcopy(REGION)})
         flow.model['region']['d'].update(district='示例县', districtOptions=[
