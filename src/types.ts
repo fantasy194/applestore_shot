@@ -47,6 +47,7 @@ export interface Task {
   result: Data | null;
   order_submitted: boolean;
   logs: string[];
+  schedule?: { at_ms: number; sku: string; quantity: number; fulfillment: "HOME" | "RETAIL"; triggered_at_ms?: number };
 }
 export interface Snapshot {
   accounts: Account[];
@@ -63,7 +64,7 @@ export const localDefaults: Account = {
   preset_quantity: 1,
 };
 export const active = (task: Task) =>
-  ["queued", "running", "waiting"].includes(task.status);
+  ["scheduled", "queued", "running", "waiting"].includes(task.status);
 export const actionNames: Record<Action, string> = {
   enroll: "添加并登录账号",
   login: "登录账号",
@@ -84,6 +85,7 @@ export const actionNames: Record<Action, string> = {
   qr: "获取付款二维码",
 };
 export const stateNames: Record<string, string> = {
+  scheduled: "等待定时",
   queued: "排队中",
   running: "执行中",
   waiting: "需要操作",

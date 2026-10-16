@@ -60,6 +60,58 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PurchaseSchedule {
+    pub at_ms: u64,
+    pub sku: String,
+    pub quantity: u32,
+    pub fulfillment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_at_ms: Option<u64>,
+}
+fn purchase_schedule(action: &str, params: &Value, current_ms: u64) -> Result<Option<PurchaseSchedule>, String> {
+    let Some(target) = params.get("scheduled_at") else { return Ok(None) };
+    if action != "purchase" || params["prepare_only"] == true {
+        return Err("定时仅支持正式购买商品".into());
+    }
+    let at_ms = target.as_u64().filter(|at| *at > current_ms.saturating_add(1000) && *at <= 253_402_300_799_999)
+        .ok_or("请设置至少一秒后的有效定时时间")?;
+    let sku = params["sku"].as_str().unwrap_or("").trim().to_ascii_uppercase();
+    let sku = sku.strip_suffix("/A").unwrap_or(&sku).to_owned();
+    if sku.is_empty() || sku.len() > 30 || !sku.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("定时商品 SKU 无效".into());
+    }
+    let quantity = params["quantity"].as_u64().filter(|q| *q > 0 && *q <= u32::MAX as u64)
+        .ok_or("定时购买数量必须为正整数")? as u32;
+    let fulfillment = match params.get("fulfillment") {
+        None => "HOME", Some(value) => value.as_str().ok_or("定时收货方式无效")?
+    };
+    if !matches!(fulfillment, "HOME" | "RETAIL") { return Err("定时收货方式无效".into()) }
+    Ok(Some(PurchaseSchedule { at_ms, sku, quantity, fulfillment: fulfillment.into(), triggered_at_ms: None }))
+}
+fn check_schedule_lateness(target: u64, current: u64) -> Result<(), String> {
+    if current.saturating_sub(target) > 3000 {
+        return Err("已错过定时时间超过 3 秒（可能因休眠或系统繁忙），未补发下单；请重新设置".into());
+    }
+    Ok(())
+}
+async fn wait_for_schedule(target: u64, cancel: &mut watch::Receiver<bool>) -> Result<(), String> {
+    loop {
+        if *cancel.borrow() { return Err("cancelled".into()) }
+        let current = now_ms();
+        if current >= target { return check_schedule_lateness(target, current) }
+        let duration = std::time::Duration::from_millis((target - current).min(250));
+        tokio::select! { biased;
+            _ = cancel.changed() => return Err("cancelled".into()),
+            _ = tokio::time::sleep(duration) => {}
+        }
+    }
+}
+
 pub fn terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "cancelled" | "interrupted")
 }
@@ -95,6 +147,8 @@ pub struct Task {
     pub result: Option<Value>,
     pub order_submitted: bool,
     pub logs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<PurchaseSchedule>,
 }
 #[derive(Serialize)]
 pub struct Snapshot {
@@ -198,7 +252,9 @@ impl Engine {
                             if !terminal(&task.status) {
                                 task.status = "interrupted".into();
                                 task.prompt = None;
-                                task.stage = if task.order_submitted {
+                                task.stage = if task.schedule.is_some() && !task.order_submitted {
+                                    "本地服务已重启，定时任务已停止；请重新设定，未补发下单"
+                                } else if task.order_submitted {
                                     "应用上次退出时正在提交订单，请先查询订单"
                                 } else {
                                     "应用上次退出时任务中断，可重新发起操作"
@@ -443,6 +499,10 @@ impl Engine {
         if params.to_string().len() > 900_000 {
             return Err("任务参数过大".into());
         }
+        let schedule = purchase_schedule(&action, &params, now_ms())?;
+        let params = if let Some(s) = &schedule {
+            json!({"sku":s.sku,"quantity":s.quantity,"fulfillment":s.fulfillment})
+        } else { params };
         let removing = self.removing.lock().unwrap();
         if removing.contains(&account_id) {
             return Err("这个账号正在移除，无法开始新任务".into());
@@ -466,6 +526,10 @@ impl Engine {
             return Err("请先完成账号添加与登录验证".into());
         }
         let mut tasks = self.tasks.lock().unwrap();
+        if (action == "checkout" || action == "purchase" && params["prepare_only"] != true) && tasks.values().any(|t|
+            t.account_id == account_id && t.schedule.is_some() && !terminal(&t.status)) {
+            return Err("该账号已有定时抢购，请先取消原定时任务，避免重复下单".into());
+        }
         // Read/check requests can be triggered again by page navigation.
         // Reuse the outstanding task instead of building a duplicate queue.
         if matches!(action.as_str(), "me" | "address_read") {
@@ -493,14 +557,15 @@ impl Engine {
                 id: id.clone(),
                 account_id: account_id.clone(),
                 action: action.clone(),
-                status: "queued".into(),
-                stage: "等待执行".into(),
+                status: if schedule.is_some() { "scheduled" } else { "queued" }.into(),
+                stage: if schedule.is_some() { "等待定时触发；电脑须保持唤醒，本地服务须保持运行" } else { "等待执行" }.into(),
                 created_at: now(),
                 updated_at: now(),
                 prompt: None,
                 result: None,
                 order_submitted: false,
                 logs: vec![],
+                schedule,
             },
         );
         drop(tasks);
@@ -589,7 +654,22 @@ impl Engine {
     ) {
         // Only serialize work for this account; other accounts run independently.
         let result: Result<(), String> = async {
-            let _account = acquire_account(lock, &mut cancel).await?;
+            let schedule = self.tasks.lock().unwrap().get(&id).and_then(|t| t.schedule.clone());
+            if let Some(s) = &schedule { wait_for_schedule(s.at_ms, &mut cancel).await?; }
+            let _account = if let Some(s) = &schedule {
+                if self.tasks.lock().unwrap().values().any(|t| t.account_id == account.id && t.id != id && !terminal(&t.status)) {
+                    return Err("定时时间已到，但该账号仍有未完成任务；未延迟排队下单，请处理后重新设定".into());
+                }
+                let permit = lock.try_acquire_owned().map_err(|_| "定时时间已到，但账号正忙；未延迟下单")?;
+                if *cancel.borrow() { return Err("cancelled".into()) }
+                check_schedule_lateness(s.at_ms, now_ms())?;
+                self.update(&app, &id, |t| {
+                    if let Some(s) = t.schedule.as_mut() { s.triggered_at_ms = Some(now_ms()); }
+                    t.status = "queued".into();
+                    t.stage = "定时时间已到，准备启动下单".into();
+                });
+                permit
+            } else { acquire_account(lock, &mut cancel).await? };
             if account.id != LOCAL_ID && !self.accounts.lock().unwrap().iter().any(|a| a.id == account.id) {
                 return Err("账号已移除，任务已停止".into());
             }
@@ -601,6 +681,10 @@ impl Engine {
             if let Some(control) = self.controls.lock().unwrap().get_mut(&id) { control.pid = child.id(); }
             let mut stdin = child.stdin.take().ok_or("没有任务输入通道")?;
             let stdout = child.stdout.take().ok_or("没有任务输出通道")?;
+            if let Some(s) = &schedule {
+                if *cancel.borrow() { return Err("cancelled".into()) }
+                check_schedule_lateness(s.at_ms, now_ms())?;
+            }
             stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params})).as_bytes()).await.map_err(|e| e.to_string())?;
             let mut lines = BufReader::new(stdout).lines();
             self.update(&app, &id, |t| { t.status = "running".into(); t.stage = "开始执行".into(); });
@@ -829,6 +913,7 @@ mod tests {
             result: None,
             order_submitted: false,
             logs: vec![],
+            schedule: None,
         }
     }
     #[test]
@@ -1251,4 +1336,124 @@ mod tests {
             "MK2U4CH"
         );
     }
+    fn scheduled_params(at: u64) -> Value {
+        json!({"sku":"MJT84CH","quantity":1,"fulfillment":"RETAIL","scheduled_at":at})
+    }
+    #[test]
+    fn schedule_validates_time_and_freezes_purchase_selection() {
+        let params = scheduled_params(10_000);
+        let s = purchase_schedule("purchase", &params, 1_000).unwrap().unwrap();
+        assert_eq!((s.at_ms, s.sku.as_str(), s.quantity, s.fulfillment.as_str()), (10_000,"MJT84CH",1,"RETAIL"));
+        assert!(purchase_schedule("login", &params, 1_000).is_err());
+        for patch in [json!({"scheduled_at":999}), json!({"scheduled_at":"10000"}),
+                      json!({"quantity":0}), json!({"quantity":1.5}), json!({"sku":"../bad"}),
+                      json!({"fulfillment":"OTHER"}), json!({"prepare_only":true})] {
+            let mut bad = params.clone();
+            bad.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+            assert!(purchase_schedule("purchase", &bad, 1_000).is_err());
+        }
+        assert!(purchase_schedule("purchase", &json!({}), 1_000).unwrap().is_none());
+        assert!(check_schedule_lateness(1000, 4000).is_ok());
+        assert!(check_schedule_lateness(1000, 4001).is_err());
+    }
+    #[tokio::test]
+    async fn schedule_wait_observes_cancellation_and_never_waits_on_a_missed_time() {
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(true).unwrap();
+        assert_eq!(wait_for_schedule(now_ms()+100_000, &mut rx).await.unwrap_err(), "cancelled");
+        let (_tx, mut rx) = watch::channel(false);
+        assert!(wait_for_schedule(now_ms()-10_000, &mut rx).await.unwrap_err().contains("错过"));
+        assert!(wait_for_schedule(now_ms(), &mut rx).await.is_ok());
+    }
+    #[tokio::test]
+    async fn scheduled_task_does_not_hold_account_lock_and_cancels_before_worker_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let a = engine.add_account("schedule@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending = false;
+        let host = TaskHost { worker: temp.path().join("missing-worker"), script:None, on_update:Arc::new(|_|{}) };
+        let id = engine.start(host.clone(), a.id.clone(), "purchase".into(), scheduled_params(now_ms()+60_000)).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(engine.tasks.lock().unwrap()[&id].status,"scheduled");
+        assert!(engine.controls.lock().unwrap()[&id].pid.is_none());
+        let lock = engine.locks.lock().unwrap()[&a.id].clone();
+        let permit = lock.try_acquire_owned().unwrap();
+        drop(permit);
+        assert!(engine.start(host.clone(),a.id.clone(),"purchase".into(),scheduled_params(now_ms()+120_000)).unwrap_err().contains("已有定时"));
+        assert!(engine.start(host.clone(),a.id.clone(),"purchase".into(),json!({"sku":"MJT84CH","quantity":1})).is_err());
+        assert!(engine.start(host.clone(),a.id.clone(),"checkout".into(),json!({})).is_err());
+        engine.cancel(&a.id,&id).unwrap();
+        for _ in 0..100 {
+            if terminal(&engine.tasks.lock().unwrap()[&id].status) { break }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(engine.tasks.lock().unwrap()[&id].status,"cancelled");
+        assert!(engine.tasks.lock().unwrap()[&id].schedule.as_ref().unwrap().triggered_at_ms.is_none());
+    }
+    #[test]
+    fn scheduled_tasks_are_interrupted_on_restart_and_not_automatically_replayed() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let a = engine.add_account("restart@example.test".into()).unwrap();
+        let mut scheduled = task();
+        scheduled.id = Uuid::new_v4().to_string(); scheduled.account_id=a.id.clone();
+        scheduled.action="purchase".into(); scheduled.status="scheduled".into(); scheduled.prompt=None;
+        scheduled.schedule=purchase_schedule("purchase",&scheduled_params(now_ms()+60_000),now_ms()).unwrap();
+        private_json(&scope_dir(temp.path(),&a.id).join("tasks").join(&scheduled.id).join("task.json"),&scheduled).unwrap();
+        let restored=Engine::new(temp.path().into()).unwrap();
+        let task=restored.tasks.lock().unwrap()[&scheduled.id].clone();
+        assert_eq!(task.status,"interrupted"); assert!(task.stage.contains("定时任务已停止"));
+        assert!(restored.controls.lock().unwrap().is_empty());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scheduled_dispatch_runs_once_at_deadline_with_frozen_params() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let a = engine.add_account("dispatch@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending=false;
+        let script=temp.path().join("fake.sh");
+        fs::write(&script, r#"IFS= read -r payload
+printf '%s\n' "$payload" >> "$2/dispatch.jsonl"
+printf '{"v":1,"type":"result","account_id":"%s","task_id":"%s","result":{"success":true,"status":"mock_completed"}}\n' "$4" "$6"
+"#).unwrap();
+        let host=TaskHost { worker:"/bin/sh".into(),script:Some(script),on_update:Arc::new(|_|{}) };
+        let at=now_ms()+1200;
+        let id=engine.start(host,a.id.clone(),"purchase".into(),scheduled_params(at)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!temp.path().join("dispatch.jsonl").exists());
+        engine.save_preset(&a.id,"MK2M4CH".into(),2).unwrap();
+        for _ in 0..300 {
+            if terminal(&engine.tasks.lock().unwrap()[&id].status) { break }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let task=engine.tasks.lock().unwrap()[&id].clone();
+        assert_eq!(task.status,"succeeded", "{}",task.stage);
+        assert!(task.schedule.unwrap().triggered_at_ms.unwrap() >= at);
+        let raw=fs::read_to_string(temp.path().join("dispatch.jsonl")).unwrap();
+        assert_eq!(raw.lines().count(),1);
+        let input:Value=serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(input["params"],json!({"sku":"MJT84CH","quantity":1,"fulfillment":"RETAIL"}));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(fs::read_to_string(temp.path().join("dispatch.jsonl")).unwrap().lines().count(),1);
+    }
+    #[tokio::test]
+    async fn scheduled_task_fails_if_another_account_task_is_unfinished_at_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine=Engine::new(temp.path().into()).unwrap();
+        let a=engine.add_account("busy@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending=false;
+        let host=TaskHost { worker:temp.path().join("must-not-spawn"),script:None,on_update:Arc::new(|_|{}) };
+        let id=engine.start(host,a.id.clone(),"purchase".into(),scheduled_params(now_ms()+1200)).unwrap();
+        let mut busy=task(); busy.account_id=a.id.clone(); busy.status="running".into();
+        engine.tasks.lock().unwrap().insert("t".into(),busy);
+        for _ in 0..300 {
+            if terminal(&engine.tasks.lock().unwrap()[&id].status) { break }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let task=engine.tasks.lock().unwrap()[&id].clone();
+        assert_eq!(task.status,"failed"); assert!(task.stage.contains("未完成任务"));
+        assert!(task.schedule.unwrap().triggered_at_ms.is_none());
+    }
+
 }

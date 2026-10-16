@@ -57,6 +57,27 @@ class ServiceTests(unittest.TestCase):
         import alipay_qr
         alipay_qr.ROOT = self.qr_root
 
+    def test_scheduled_wait_is_excluded_from_checkout_elapsed_time(self):
+        from unittest.mock import Mock
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            triggered = int((time.time() - 2) * 1000)
+            (root / 'task.json').write_text(json.dumps({'created_at': int(time.time()) - 3600,
+                'schedule': {'triggered_at_ms': triggered}}))
+            service = Service(Mock(), root, root, 'fixture@example.test', Mock())
+            self.assertEqual(service.task_created_at, triggered / 1000)
+
+    def test_unsupported_schedule_never_becomes_an_immediate_purchase(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = Service(Mock(), root, root, 'fixture@example.test', Mock())
+            with patch.object(duo_killer, 'purchase_sku') as purchase:
+                with self.assertRaisesRegex(ValueError, '未开始购买'):
+                    service.run('purchase', {'sku': 'MJT84CH', 'quantity': 1, 'scheduled_at': 9999999999999})
+            purchase.assert_not_called()
+
     def test_import_strips_password_and_other_domains(self):
         data=empty_auth('a@example.test');data['password']='not-to-persist'
         data['cookies']['account_session']=[dict(name='one',value='fixture',domain='.apple.com.cn'),dict(name='two',value='no',domain='evil.test')]

@@ -101,7 +101,11 @@ async function fixture(
           };
           tasks.unshift(task);
           root.started.push({ accountId, action, id, params });
-          if (action === "login" && params.warm_only === true) {
+          if (action === "purchase" && params.scheduled_at) {
+            task.status = "scheduled";
+            task.stage = "等待定时触发";
+            task.schedule = { at_ms: params.scheduled_at, sku: params.sku, quantity: params.quantity, fulfillment: params.fulfillment };
+          } else if (action === "login" && params.warm_only === true) {
             task.status = "succeeded";
             task.result = { warm_login: true, message: "登录预热完成，未加购、未下单。" };
           } else if (
@@ -1483,4 +1487,50 @@ test("preparation clear bag uses the same confirmation without starting checkout
   await expect(page.getByRole("button", { name: "确认清空购物袋", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "保留购物袋", exact: true }).click();
   expect(await page.evaluate(() => (window as any).started.filter((t: any) => t.action !== "me").map((t: any) => t.action))).toEqual(["clear_bag"]);
+});
+
+
+test("scheduled purchase freezes selection, uses Beijing time and survives navigation", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByLabel("开始时间（北京时间）", { exact: true }).fill("2090-10-16T20:00:03");
+  await page.getByLabel("定时收货方式", { exact: true }).selectOption("RETAIL");
+  await page.getByRole("button", { name: "设定定时抢购", exact: true }).click();
+  await expect(page.getByRole("button", { name: "取消定时抢购", exact: true })).toBeVisible();
+  const scheduled = await page.evaluate(() => (window as any).started.find((t: any) => t.params.scheduled_at));
+  expect(scheduled.params).toMatchObject({ sku: "MK2M4CH", quantity: 1, fulfillment: "RETAIL", scheduled_at: Date.parse("2090-10-16T20:00:03+08:00") });
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "预热登录（不加购）", exact: true })).toBeEnabled();
+  await page.getByRole("combobox", { name: "预制商品" }).click();
+  await page.getByRole("option", { name: /抛光布/ }).click();
+  const section = page.locator("section").filter({ has: page.getByRole("heading", { name: "定时抢购", exact: true }) });
+  await expect(section.getByText(/iPhone Duo 256GB/)).toBeVisible();
+  await page.getByRole("link", { name: "本地配置", exact: true }).click();
+  await page.getByRole("link", { name: "账号工作台", exact: true }).click();
+  await expect(page.getByRole("button", { name: "取消定时抢购", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "取消定时抢购", exact: true }).click();
+  await expect(page.getByRole("button", { name: "设定定时抢购", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).started.filter((t: any) => t.action === "purchase").length)).toBe(1);
+});
+
+test("past scheduled time cannot dispatch a purchase", async ({ page }) => {
+  await fixture(page); await page.goto("/"); await enterWorkspace(page);
+  await page.getByLabel("开始时间（北京时间）", { exact: true }).fill("2000-01-01T00:00:01");
+  await page.getByRole("button", { name: "设定定时抢购", exact: true }).click();
+  await expect(page.getByText("请设置至少一秒后的有效北京时间。", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).started.some((t: any) => t.action === "purchase"))).toBe(false);
+});
+
+test("backend-restored scheduled task is shown without scheduling a new purchase", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/"); await enterWorkspace(page);
+  await page.evaluate(() => {
+    const root = window as any;
+    root.__DUO_KILLER_TEST__.start("a", "purchase", { sku: "MJT84CH", quantity: 2, fulfillment: "HOME", scheduled_at: Date.parse("2090-10-16T20:00:00+08:00") });
+  });
+  await expect(page.getByRole("button", { name: "取消定时抢购", exact: true })).toBeVisible();
+  const section = page.locator("section").filter({ has: page.getByRole("heading", { name: "定时抢购", exact: true }) });
+  await expect(section.getByText(/iPhone 18 Pro.*2 件/)).toBeVisible();
+  expect(await page.evaluate(() => (window as any).started.filter((t: any) => t.action === "purchase").length)).toBe(1);
 });

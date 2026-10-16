@@ -32,6 +32,7 @@ import { AccountGate } from "./AccountGate";
 import { RemoveAccountDialog } from "./RemoveAccountDialog";
 import { SelectField } from "./SelectField";
 import { ActiveTaskNav } from "./ActiveTaskNav";
+import { SchedulePurchase } from "./SchedulePurchase";
 import {
   active,
   LOCAL_ID,
@@ -158,7 +159,8 @@ export default function App() {
   const tasks = snapshot.tasks
     .filter((t) => t.account_id === accountId)
     .sort((a, b) => b.created_at - a.created_at || b.updated_at - a.updated_at);
-  const busy = tasks.some(active) || dispatching;
+  const busy = tasks.some((t) => active(t) && t.status !== "scheduled") || dispatching;
+  const scheduledTask = tasks.find((t) => t.status === "scheduled");
   const waiting = tasks.find((t) => t.status === "waiting");
   const task =
     tasks.find((t) => t.id === taskTarget?.id && active(t)) ||
@@ -619,7 +621,7 @@ export default function App() {
                             <button
                               className="primary"
                               type="submit"
-                              disabled={busy || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity < 1}
+                              disabled={busy || !!scheduledTask || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity < 1}
                             >
                               立即下单
                               <ArrowRight size={16} />
@@ -628,7 +630,7 @@ export default function App() {
                               className="primary"
                               type="submit"
                               data-fulfillment="RETAIL"
-                              disabled={busy || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity < 1}
+                              disabled={busy || !!scheduledTask || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity < 1}
                             >
                               立即下单（自提）
                               <ArrowRight size={16} />
@@ -636,6 +638,8 @@ export default function App() {
                           </div>
                         </form>
                       </section>
+                      <SchedulePurchase key={account.id} sku={sku} quantity={quantity} busy={busy}
+                        task={scheduledTask} start={start} cancel={cancel} />
                     </>
                   )}
                   {tab === "bag" && (
@@ -661,7 +665,7 @@ export default function App() {
                       <div className="button-row">
                       <button
                         className="primary"
-                        disabled={busy}
+                        disabled={busy || !!scheduledTask}
                         onClick={() => start("checkout")}
                       >
                         结算购物袋
@@ -766,7 +770,7 @@ export default function App() {
                     <div className="section-title">
                       <h2>{actionNames[task.action]}</h2>
                       <span className={`status ${["cancel_order", "clear_bag"].includes(task.action) && task.result?.success === false ? "waiting" : task.result?.status === "pending_payment" ? "succeeded" : task.status}`}>
-                        {active(task) && task.status !== "waiting" && task.result?.status !== "pending_payment" && (
+                        {active(task) && task.status !== "scheduled" && task.status !== "waiting" && task.result?.status !== "pending_payment" && (
                           <LoaderCircle size={13} className="spin" />
                         )}
                         {task.result?.status === "order_expired" ? "订单已过期" : task.action === "cancel_order" && task.result?.success === false ? "尚未取消" : task.action === "clear_bag" && task.result?.success === false ? "尚未清空" : task.result?.status === "pending_payment" ? "已取得订单号" : stateNames[task.status]}

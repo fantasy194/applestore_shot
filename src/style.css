@@ -1353,3 +1353,13 @@ button.danger-button:hover:not(:disabled) {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+.schedule-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 20px 0;
+}
+@media (max-width: 700px) {
+  .schedule-fields { grid-template-columns: 1fr; }
+}

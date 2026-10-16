@@ -40,7 +40,9 @@ class Service:
         self.pickup_selected = None
         self.task_created_at = None
         try:
-            created = json.loads((task_dir / 'task.json').read_text(encoding='utf-8')).get('created_at')
+            record = json.loads((task_dir / 'task.json').read_text(encoding='utf-8'))
+            triggered = record.get('schedule', {}).get('triggered_at_ms') if isinstance(record.get('schedule'), dict) else None
+            created = triggered / 1000 if type(triggered) in (int, float) else record.get('created_at')
             if type(created) in (int, float) and 0 < created <= time.time():
                 self.task_created_at = created
         except (OSError, ValueError, TypeError):
@@ -301,6 +303,10 @@ class Service:
                     duo_killer.save_auth(session)
 
     def run(self, action, params):
+        # Only the engine may defer a purchase. An older service must never
+        # silently pass a scheduling request through as an immediate purchase.
+        if 'scheduled_at' in params:
+            raise ValueError('当前本地服务尚未登记此定时请求，请重启启动程序后重新设定；未开始购买。')
         self.action = action
         self.fulfillment_mode = params.get('fulfillment', 'HOME') if action in ('purchase', 'checkout') else 'HOME'
         if self.fulfillment_mode not in ('HOME', 'RETAIL'):
