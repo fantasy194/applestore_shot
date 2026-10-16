@@ -88,3 +88,31 @@ class CheckoutConnectionTests(unittest.TestCase):
                 close.assert_called_once()
                 request.assert_called_once()
                 self.assertIs(request.call_args.kwargs['data'], payload)
+
+    def test_pickup_preparation_refreshes_transport_without_replaying_posts(self):
+        stages = ('selectFulfillmentLocationAction', 'search', 'select',
+                  'continueFromFulfillmentToPickupContact', 'continueFromFulfillmentToShipping')
+        for stage in stages:
+            with self.subTest(stage=stage), requests.Session() as session:
+                url = 'https://secure11.www.apple.com.cn/shop/checkoutx/fulfillment'
+                session.cookies.set('as_ltn_cn', 'fixture', domain='.apple.com.cn', path='/')
+                payload = {'fixture': 'current-model'}
+                with patch.object(session.get_adapter(url), 'close') as close, \
+                        patch.object(session, 'request', side_effect=requests.Timeout()) as request:
+                    with self.assertRaises(requests.Timeout):
+                        checkout_retry.request(session, 'POST', url, stage=stage, data=payload)
+                    close.assert_called_once()
+                    request.assert_called_once()
+                    self.assertIs(request.call_args.kwargs['data'], payload)
+                    self.assertEqual(session.cookies.get('as_ltn_cn'), 'fixture')
+
+    def test_pickup_contact_uses_observed_checkoutx_route_and_sends_once(self):
+        for stage in ('continueFromPickupContactToBilling', 'continueFromPickupContactToShipping'):
+            with self.subTest(stage=stage), requests.Session() as session:
+                url = 'https://secure11.www.apple.com.cn/shop/checkoutx?_a=fixture&_m=checkout.pickupContact'
+                with patch.object(session.get_adapter(url), 'close') as close, \
+                        patch.object(session, 'request', side_effect=requests.Timeout()) as request:
+                    with self.assertRaises(requests.Timeout):
+                        checkout_retry.request(session, 'POST', url, stage=stage)
+                    close.assert_called_once()
+                    request.assert_called_once()

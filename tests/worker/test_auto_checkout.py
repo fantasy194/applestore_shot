@@ -1,4 +1,5 @@
 import json
+from urllib.parse import urlencode
 from copy import deepcopy
 from pathlib import Path
 import tempfile
@@ -44,7 +45,9 @@ class AutoOrderFlow(FakeFlow):
                 if self.fail_submission:
                     raise requests.Timeout()
                 self.url = 'https://secure.www.apple.com.cn/shop/checkout/interstitial'
-                self.model = {'externalPayAuth': {'d': {'externalUrl': 'https://openapi.alipay.com/gateway.do?fixture=only',
+                pay_url = 'https://openapi.alipay.com/gateway.do?' + urlencode({'biz_content': json.dumps({
+                    'subject': 'TEST-ONLY-001', 'total_amount': self.total.replace('RMB ', '').replace(',', '')})})
+                self.model = {'externalPayAuth': {'d': {'externalUrl': pay_url,
                     'orderNumber': 'TEST-ONLY-001', 'amountDue': self.total}}}
         else:
             super().action(module, name, data)
@@ -139,7 +142,7 @@ class AutoCheckoutTests(unittest.TestCase):
             {'sku': 'MK2M4CH', 'quantity': 1, 'max_total': '15999.00'},
             {'sku': 'MJT84CH', 'quantity': 1, 'max_total': '9999.00'}]}
 
-    def test_both_phone_policies_enforce_their_own_amount_limits(self):
+    def test_old_phone_policies_do_not_limit_current_prices(self):
         self.enable_both_phones()
         self.assertTrue(self.service.confirm(self.details()))
         details = self.details()
@@ -147,36 +150,76 @@ class AutoCheckoutTests(unittest.TestCase):
         details['total'] = 'RMB 9,999'
         self.assertTrue(self.service.confirm(details))
         details['total'] = 'RMB 9,999.01'
-        with self.assertRaisesRegex(ValueError, '上限 9999.00'):
-            self.service.confirm(details)
+        self.assertTrue(self.service.confirm(details))
         self.service.channel.prompt.assert_not_called()
 
-    def test_phone_policy_rejects_unapproved_items_before_add_to_bag(self):
+    def test_old_phone_policy_does_not_restrict_selected_sku_or_quantity(self):
         self.enable_both_phones()
-        with patch.object(duo_killer, 'purchase_sku') as purchase:
+        with patch.object(duo_killer, 'purchase_sku', return_value={}) as purchase:
             for sku, quantity in (('MLH74FE', 1), ('MJT74CH', 1), ('MJT84CH', 2)):
-                with self.subTest(sku=sku, quantity=quantity), self.assertRaises(ValueError):
+                with self.subTest(sku=sku, quantity=quantity):
                     self.service.run('purchase', {'sku': sku, 'quantity': quantity})
-            purchase.assert_not_called()
+                    purchase.assert_called_with(sku, quantity=quantity)
+
+    def test_automatic_checkout_does_not_require_a_legacy_policy_file(self):
+        path = self.root / 'automation.json'
+        for content in (None, 'not valid JSON', '{"enabled":false,"products":[]}'):
+            with self.subTest(content=content):
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_text(content)
+                current = Service(self.service.channel, self.root, self.root, 'fixture@example.test', Mock())
+                with patch.object(duo_killer, 'purchase_sku', return_value={}) as purchase:
+                    current.run('purchase', {'sku': 'MJT84CH', 'quantity': 2})
+                purchase.assert_called_once_with('MJT84CH', quantity=2)
+                self.assertTrue(current.automatic_checkout)
+                self.assertEqual(current.purchase_selection, ('MJT84CH/A', 2))
+
+    def test_any_selected_sku_quantity_and_official_price_reach_mock_payment(self):
+        flow = AutoOrderFlow(sku='MJT74CH/A', total='RMB 30,000')
+        flow.item['itemQuantity']['d']['quantity'] = 2
+        flow.model['shoppingCart']['items']['item-0']['itemQuantity']['d']['quantity'] = 2
+        with patch.object(duo_killer, 'purchase_sku', side_effect=lambda *a, **kw: duo_killer.pay_bag(flow=flow)), \
+                patch.object(duo_killer, 'save_auth'), patch.object(duo_killer, 'get_payment_qr', return_value={}):
+            result = self.service.run('purchase', {'sku': 'MJT74CH', 'quantity': 2})
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(result['items'][0]['sku'], 'MJT74CH/A')
+        self.assertEqual(result['items'][0]['quantity'], 2)
+        self.assertEqual(result['amount_due'], 'RMB 30,000')
+        self.assertEqual(flow.submissions, 1)
+        self.service.channel.prompt.assert_not_called()
+
+    def test_unrestricted_purchase_still_stops_when_review_differs_from_selection(self):
+        for sku, quantity in [('MK2M4CH/A', 1), ('MJT84CH/A', 1)]:
+            with self.subTest(review_sku=sku, review_quantity=quantity):
+                flow = AutoOrderFlow(sku=sku, total='RMB 20,000')
+                flow.item['itemQuantity']['d']['quantity'] = quantity
+                with patch.object(duo_killer, 'purchase_sku', side_effect=lambda *a, **kw: duo_killer.pay_bag(flow=flow)), \
+                        patch.object(duo_killer, 'save_auth'), self.assertRaisesRegex(ValueError, '本次选择不一致'):
+                    self.service.run('purchase', {'sku': 'MJT84CH', 'quantity': 2})
+                self.assertEqual(flow.submissions, 0)
 
     def enable_duo_512(self):
         self.enable_both_phones()
         self.service.order_policy['products'].append({
             'sku': 'MK2P4CH', 'quantity': 1, 'max_total': '17999.00'})
 
-    def test_duo_512_has_its_own_amount_cap_and_quantity_guard(self):
+    def test_review_matches_selection_without_fixed_price_or_quantity_cap(self):
         self.enable_duo_512()
         details = self.details()
         details['items'][0]['sku'] = 'MK2P4CH/A'
         details['total'] = 'RMB 17,999'
         self.assertTrue(self.service.confirm(details))
         details['total'] = 'RMB 17,999.01'
-        with self.assertRaisesRegex(ValueError, '上限 17999.00'):
-            self.service.confirm(details)
+        self.assertTrue(self.service.confirm(details))
         details['total'] = 'RMB 17,999'
         details['items'][0]['quantity'] = 2
+        self.service.purchase_selection = ('MK2P4CH/A', 1)
         with self.assertRaises(ValueError):
             self.service.confirm(details)
+        self.service.purchase_selection = ('MK2P4CH/A', 2)
+        self.assertTrue(self.service.confirm(details))
         self.service.channel.prompt.assert_not_called()
 
     def test_duo_512_reaches_qr_with_single_order_submission_and_no_prompts(self):
@@ -194,23 +237,23 @@ class AutoCheckoutTests(unittest.TestCase):
         self.assertTrue(result['qr_data'].startswith('data:image/png;base64,'))
         self.service.channel.prompt.assert_not_called()
 
-    def test_duo_512_remains_opt_in_and_rejects_modified_cap(self):
+    def test_legacy_amount_configuration_does_not_block_other_selected_products(self):
         self.enable_both_phones()
-        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaises(ValueError):
+        with patch.object(duo_killer, 'purchase_sku', return_value={}) as purchase:
             self.service.run('purchase', {'sku': 'MK2P4CH', 'quantity': 1})
-        purchase.assert_not_called()
+        purchase.assert_called_once_with('MK2P4CH', quantity=1)
         self.enable_duo_512()
         self.service.order_policy['products'][-1]['max_total'] = '18000.00'
-        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaises(ValueError):
+        with patch.object(duo_killer, 'purchase_sku', return_value={}) as purchase:
             self.service.run('purchase', {'sku': 'MK2P4CH', 'quantity': 1})
-        purchase.assert_not_called()
+        purchase.assert_called_once_with('MK2P4CH', quantity=1)
 
-    def test_phone_policy_requires_complete_local_address_before_purchase(self):
+    def test_old_product_policy_allows_official_address_fallback(self):
         self.enable_both_phones()
         checkout_options.save_config(self.service.checkout, {})
-        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaisesRegex(ValueError, '本地送货地址'):
+        with patch.object(duo_killer, 'purchase_sku', return_value={}) as purchase:
             self.service.run('purchase', {'sku': 'MJT84CH', 'quantity': 1})
-        purchase.assert_not_called()
+        purchase.assert_called_once_with('MJT84CH', quantity=1)
 
     def test_phone_with_attached_applecare_is_rejected_before_confirmation_or_submission(self):
         self.enable_both_phones()
@@ -271,8 +314,9 @@ class AutoCheckoutTests(unittest.TestCase):
             duo_killer.confirm_order(flow.model)
 
     def test_other_items_quantities_currencies_amounts_and_addresses_are_rejected(self):
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
         cases = []
-        for total in ('RMB 15,999.01', 'USD 15999', 'RMB 0', 'RMB 15,99'):
+        for total in ('USD 15999', 'RMB 0', 'RMB 15,99'):
             d = self.details(); d['total'] = total; cases.append(d)
         d = self.details(); d['items'][0]['quantity'] = 2; cases.append(d)
         d = self.details(); d['items'][0]['sku'] = 'MK2P4CH/A'; cases.append(d)
@@ -503,7 +547,8 @@ class AutoCheckoutTests(unittest.TestCase):
 
     def test_polishing_cloth_confirmation_rejects_other_bag_items(self):
         self.service.test_order = True
-        with self.assertRaisesRegex(ValueError, '额外商品'):
+        self.service.purchase_selection = ('MLH74FE/A', 1)
+        with self.assertRaisesRegex(ValueError, '本次选择不一致'):
             self.service.confirm(self.details())
         self.service.channel.prompt.assert_not_called()
 
@@ -655,14 +700,45 @@ class AutoCheckoutTests(unittest.TestCase):
                 self.assertEqual(flow.submissions, 0)
                 self.assertEqual(sum(name == 'edit' for _, name, _ in flow.calls), 1)
 
+    def test_extra_cart_items_stop_before_any_checkout_write(self):
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
+        flow = AutoOrderFlow()
+        extra = deepcopy(flow.item)
+        extra['d'].update(sku='MLH74FE/A', name='抛光布')
+        flow.model['shoppingCart']['items']['item-extra'] = extra
+        with self.assertRaisesRegex(ValueError, 'MLH74FE/A'):
+            duo_killer.pay_bag(flow=flow)
+        self.assertEqual(flow.calls, [])
+        self.assertEqual(flow.submissions, 0)
+        self.assertFalse((self.root / 'prepared_checkout.json').exists())
+
+    def test_pre_add_allows_only_empty_or_same_sku_for_quantity_update(self):
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
+        flow = AutoOrderFlow()
+        flow.model['shoppingCart']['items']['item-0']['itemQuantity']['d']['quantity'] = 2
+        duo_killer.verify_purchase_bag(flow, allow_quantity_update=True)
+        with self.assertRaisesRegex(ValueError, '数量'):
+            duo_killer.verify_purchase_bag(flow)
+        flow.model['shoppingCart']['items'] = {}
+        duo_killer.verify_purchase_bag(flow, allow_quantity_update=True)
+
+    def test_failed_final_address_verification_never_creates_prepared_marker(self):
+        flow = AutoOrderFlow()
+        with patch.object(self.service, 'confirm', side_effect=ValueError('address verification failed')):
+            with self.assertRaisesRegex(ValueError, 'address verification failed'):
+                duo_killer.pay_bag(flow=flow, prepare_only=True)
+        self.assertEqual(flow.submissions, 0)
+        self.assertFalse((self.root / 'prepared_checkout.json').exists())
+
     def test_changed_address_or_expired_preparation_falls_back_to_bag(self):
-        for changed in ('address', 'expired'):
+        for changed in ('address', 'expired', 'fulfillment', 'unverified'):
             with self.subTest(changed=changed):
                 flow = AutoOrderFlow()
                 duo_killer.pay_bag(flow=flow, prepare_only=True)
                 checkpoint = self.root / 'prepared_checkout.json'
                 data = json.loads(checkpoint.read_text())
-                data['config_hash' if changed == 'address' else 'created_at'] = 'changed' if changed == 'address' else 0
+                data[{'address': 'config_hash', 'expired': 'created_at', 'fulfillment': 'fulfillment_mode', 'unverified': 'review_verified'}[changed]] = {
+                    'address': 'changed', 'expired': 0, 'fulfillment': 'RETAIL', 'unverified': False}[changed]
                 checkpoint.write_text(json.dumps(data))
                 self.service.ensure_auth_file()
                 with patch.object(duo_killer, 'Checkout', return_value=flow), \

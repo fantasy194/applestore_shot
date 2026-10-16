@@ -20,6 +20,7 @@ import {
 import { duoProducts, presetProducts, priceText } from "./products";
 import { useAccountPrivacy } from "./AccountPrivacy";
 import { AddressForm } from "./AddressForm";
+import { PickupForm } from "./PickupForm";
 import { SelectField } from "./SelectField";
 
 export type Route = "workspace" | "settings" | "duo";
@@ -219,6 +220,7 @@ export function LocalSettings({
         }
         start={start}
       />
+      <PickupForm key={`pickup-${account.id}`} account={account} busy={busy} result={result || undefined} start={start} />
       <TaskStatus
         task={requested || addressTasks[0]}
         cancel={() => {

@@ -115,6 +115,10 @@ async function fixture(
               kind: "password",
               label: "输入 Apple 账号密码",
             };
+          } else if (action === "clear_bag") {
+            task.status = "waiting";
+            task.prompt = { id: "clear-" + id, kind: "confirm", label: "确认清空购物袋",
+              details: { operation: "clear_bag", items: [{ name: "抛光布", sku: "MLH74FE/A", quantity: 1, subtotal: "RMB 69" }], total: "RMB 69" } };
           } else if (action === "cancel_order") {
             task.status = "waiting";
             task.prompt = { id: "cancel-" + id, kind: "confirm", label: "确认取消订单 " + params.order_number,
@@ -173,7 +177,13 @@ async function fixture(
             };
           } else if (action === "address_read") {
             task.status = "succeeded";
-            task.result = { success: true, config: {} };
+            task.result = { success: true, config: structuredClone(root.localConfigs?.[accountId] || {}) };
+          } else if (action === "address_save") {
+            root.localConfigs ||= {};
+            const { pickup_only, ...saved } = params;
+            root.localConfigs[accountId] = { ...root.localConfigs[accountId], ...saved };
+            task.status = "succeeded";
+            task.result = { success: true, config: structuredClone(root.localConfigs[accountId]), message: "自提门店和取货联系人已保存。" };
           } else if (action === "catalog") {
             task.status = root.catalogFails ? "failed" : "succeeded";
             task.stage = root.catalogFails
@@ -265,6 +275,13 @@ async function fixture(
               apple_id: a.email,
             };
             update(task);
+          } else if (task.action === "clear_bag") {
+            task.status = "succeeded";
+            task.prompt = null;
+            task.result = { success: value === true, status: value === true ? "bag_cleared" : "bag_clear_aborted",
+              items: value === true ? [] : [{ name: "抛光布", sku: "MLH74FE/A", quantity: 1 }],
+              message: value === true ? "官网已确认购物袋为空。" : "已保留购物袋，未移除商品。" };
+            update(task);
           } else if (task.action === "cancel_order") {
             task.status = "succeeded";
             task.prompt = null;
@@ -303,7 +320,7 @@ async function enterWorkspace(page: Page) {
   await page.getByRole("checkbox", { name: /使用 日常账号/ }).check();
   await page.getByRole("checkbox", { name: /使用 备用账号/ }).check();
   await page.getByRole("button", { name: "检查并使用所选账号" }).click();
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
 }
 
 test("reopening a single enrolled account keeps its preset without another login task", async ({ page }) => {
@@ -314,12 +331,12 @@ test("reopening a single enrolled account keeps its preset without another login
     await api.savePreset("a", "MK2M4CH", 1);
   });
   await page.goto("/");
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
   await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2M4CH");
   await expect(page.getByLabel("数量", { exact: true })).toHaveValue("1");
   expect(await page.evaluate(() => (window as any).started)).toHaveLength(0);
   await page.reload();
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
   await expect(page.getByRole("combobox", { name: "预制商品" })).toContainText("MK2M4CH");
   expect(await page.evaluate(() => (window as any).started)).toHaveLength(0);
 });
@@ -372,13 +389,13 @@ test("new account is only added after password and OTP succeed", async ({
   await page.getByLabel("Apple 账号", { exact: true }).fill("new@example.test");
   await page.getByRole("button", { name: "继续登录", exact: true }).click();
   await expect(page.getByLabel("密码", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "立即下单" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toHaveCount(0);
   await page.getByLabel("密码", { exact: true }).fill("fixture-password");
   await page.getByRole("button", { name: "继续", exact: true }).click();
-  await expect(page.getByRole("button", { name: "立即下单" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toHaveCount(0);
   await page.getByLabel("六位验证码").fill("012345");
   await page.getByRole("button", { name: "继续", exact: true }).click();
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
   const state = await page.evaluate(() =>
     (window as any).__DUO_KILLER_TEST__.snapshot(),
   );
@@ -476,7 +493,7 @@ test("order confirmation is explicit and can be rejected", async ({ page }) => {
   await fixture(page);
   await page.goto("/");
   await enterWorkspace(page);
-  await page.getByRole("button", { name: "立即下单" }).click();
+  await page.getByRole("button", { name: "立即下单", exact: true }).click();
   await expect(
     page.getByRole("cell", { name: "测试商品 MK2M4CH" }),
   ).toBeVisible();
@@ -558,17 +575,60 @@ test("delivery choices keep the real option value and default", async ({
   );
 });
 
+test("pickup purchase button sends RETAIL", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByRole("button", { name: "立即下单（自提）", exact: true }).click();
+  const task = (await page.evaluate(() => (window as any).started)).find((t: any) => t.action === "purchase");
+  expect(task.params).toMatchObject({ fulfillment: "RETAIL", quantity: 1, sku: "MK2M4CH" });
+  expect(await page.evaluate(() => (window as any).sent)).toHaveLength(0);
+});
+
+test("pickup preset preloads saved contact and saves only within its account", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.evaluate(() => {
+    (window as any).localConfigs = { a: {
+      contact: { lastName: "张", firstName: "三", fullDaytimePhone: "13800000000", emailAddress: "pickup@example.test" },
+      delivery: { state: "上海", city: "上海", district: "闵行区" }, address: { street: "测试地址" },
+    } };
+  });
+  await page.getByRole("link", { name: "本地配置", exact: true }).click();
+  await expect(page.getByLabel("取货手机号", { exact: true })).toHaveValue("13800000000");
+  await expect(page.getByLabel("取货通知邮箱", { exact: true })).toHaveValue("pickup@example.test");
+  await page.getByLabel("自提城市 / 邮编", { exact: true }).fill("上海");
+  await page.getByLabel("自提门店", { exact: true }).fill("七宝");
+  const identity = page.getByLabel("取货证件号码后四位", { exact: true });
+  await expect(identity).toHaveAttribute("type", "password");
+  await identity.fill("123X");
+  await page.getByRole("button", { name: "保存自提预设", exact: true }).click();
+  await expect(page.getByText("自提门店和取货联系人已保存。", { exact: true })).toBeVisible();
+  const config = await page.evaluate(() => (window as any).localConfigs);
+  expect(config.a.pickup).toEqual({ search: "上海", store_name: "七宝", id_last4: "123X" });
+  expect(config.a.address).toEqual({ street: "测试地址" });
+  expect(config.b).toBeUndefined();
+  expect((await page.evaluate(() => (window as any).started)).some((t: any) => t.action === "purchase")).toBe(false);
+  await page.getByLabel("配置范围", { exact: true }).click();
+  await page.getByRole("option", { name: /备用账号/ }).click();
+  await expect(page.getByLabel("自提门店", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("取货手机号", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("取货证件号码后四位", { exact: true })).toHaveValue("");
+});
+
 test("payment result offers an order query without creating another order", async ({
   page,
 }) => {
   await fixture(page);
   await page.goto("/");
   await enterWorkspace(page);
-  await page.getByRole("button", { name: "立即下单" }).click();
+  await page.getByRole("button", { name: "立即下单", exact: true }).click();
+  expect((await page.evaluate(() => (window as any).started)).find((t: any) => t.action === "purchase").params.fulfillment).toBe("HOME");
   await page.screenshot({ path: "artifacts/ui-confirm.png", fullPage: true });
   await page.getByRole("button", { name: "确认创建订单", exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: "订单已创建，等待付款" }),
+    page.getByRole("heading", { name: "苹果已返回订单号，等待付款" }),
   ).toBeVisible();
   await page.getByRole("button", { name: "我已支付，查询订单" }).click();
   await expect(
@@ -605,10 +665,10 @@ test("created order is visible while QR is loading and remains after QR failure"
       status: "pending_payment", order_number: "EARLY-001", amount_due: "RMB 69", qr_loading: true,
       order_confirmed_elapsed_seconds: 18 } });
   });
-  await expect(page.getByRole("heading", { name: "订单已创建，等待付款" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "苹果已返回订单号，等待付款" })).toBeVisible();
   await expect(page.getByText("订单 EARLY-001 · RMB 69")).toBeVisible();
   await expect(page.getByText("订单确认耗时：约 18 秒（含排队，不含二维码）。")).toBeVisible();
-  await expect(page.getByText("订单已创建", { exact: true })).toBeVisible();
+  await expect(page.getByText("已取得订单号", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "停止加载二维码", exact: true })).toBeVisible();
   await expect(page.getByRole("status")).toContainText("正在加载支付宝付款二维码");
   await page.evaluate(() => {
@@ -623,6 +683,85 @@ test("created order is visible while QR is loading and remains after QR failure"
   await expect(page.getByRole("button", { name: "获取二维码", exact: true })).toBeEnabled();
   expect((await page.evaluate(() => (window as any).started)).filter((t: any) => t.action === "purchase")).toHaveLength(1);
 });
+
+test("unverified cancellation is shown as not cancelled instead of completed", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.getByRole("button", { name: "立即下单", exact: true }).click();
+  await page.getByRole("button", { name: "确认创建订单", exact: true }).click();
+  await page.getByRole("button", { name: "取消订单", exact: true }).click();
+  await page.evaluate(() => {
+    const root = window as any;
+    const id = root.started.find((t: any) => t.action === "cancel_order").id;
+    root.finish(id, { status: "succeeded", stage: "已完成", prompt: null, result: {
+      success: false, status: "cancellation_lookup_required", order_number: "W1234567890",
+      lookup_reason: "already_linked", message: "官网提示该订单号已关联 Apple ID；尚未发送取消。",
+    } });
+  });
+  await expect(page.getByText("尚未取消", { exact: true })).toBeVisible();
+  await expect(page.locator('[aria-label="当前任务"] .status')).toHaveClass(/waiting/);
+  await expect(page.getByText("官网提示该订单号已关联 Apple ID；尚未发送取消。", { exact: true })).toBeVisible();
+});
+
+test("order list tolerates failed history without result or order number", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  await page.evaluate(() => {
+    const root = window as any;
+    root.finish(root.started.find((t: any) => t.action === "me").id, {
+      status: "failed", result: null, stage: "历史查询失败",
+    });
+  });
+  await page.getByRole("button", { name: "订单", exact: true }).click();
+  await page.getByRole("button", { name: "查询订单", exact: true }).click();
+  await expect(page.getByRole("cell", { name: "我们正在等待你的付款" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "查询订单", exact: true })).toBeVisible();
+  expect(errors).toEqual([]);
+  expect((await page.evaluate(() => (window as any).started)).some((t: any) => t.action === "purchase")).toBe(false);
+});
+
+for (const via of ["cancel_order", "orders"] as const) {
+  test(`official expired order hides its stale payment controls via ${via}`, async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    await enterWorkspace(page);
+    await page.getByRole("button", { name: "立即下单", exact: true }).click();
+    await page.getByRole("button", { name: "确认创建订单", exact: true }).click();
+    await page.getByRole("button", { name: via === "orders" ? "我已支付，查询订单" : "取消订单", exact: true }).click();
+    await page.evaluate((action) => {
+      const root = window as any;
+      const purchase = root.started.find((t: any) => t.action === "purchase");
+      const id = root.started.find((t: any) => t.action === action).id;
+      // The synthetic purchase fixture returns this same order number.
+      root.finish(purchase.id, { result: { success: true, status: "pending_payment", order_number: "W1234567890", amount_due: "RMB 69" } });
+      root.finish(id, { status: "succeeded", prompt: null, result: action === "orders"
+        ? { success: true, orders: [{ order_number: "W1234567890", verified_by: "official_detail", items: [
+            { name: "抛光布", quantity: 1, status: "PAYMENT_EXPIRED_STORED_ORDER", delivery_info: "订单已过期",
+              detail_url: "https://secure11.www.apple.com.cn/shop/order/detail/123/W1234567890" }] }] }
+        : { success: true, status: "order_expired", order_number: "W1234567890", message: "官网已确认此订单超过付款期限，已过期；无需再次取消。" } });
+    }, via);
+    if (via === "cancel_order") await expect(page.getByText("订单已过期", { exact: true })).toBeVisible();
+    else {
+      await expect(page.getByRole("link", { name: "W1234567890", exact: true })).toHaveAttribute("href", /\/shop\/order\/detail\/123\/W1234567890$/);
+      await expect(page.getByRole("button", { name: "取消订单 W1234567890", exact: true })).toHaveCount(0);
+    }
+    // An in-flight QR task can deliver its old pending result after the status
+    // query. That stale result must never bring back payment controls.
+    await page.evaluate(() => {
+      const root = window as any;
+      root.finish(root.started.find((t: any) => t.action === "purchase").id, { status: "running" });
+    });
+    if (via === "orders") await page.getByRole("link", { name: "账号工作台", exact: true }).click();
+    await expect(page.getByText("订单 W1234567890 已过期，付款二维码已隐藏。", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "获取二维码", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "取消订单", exact: true })).toHaveCount(0);
+    expect((await page.evaluate(() => (window as any).started)).filter((t: any) => t.action === "purchase")).toHaveLength(1);
+  });
+}
 
 test("startup selects nothing, checks chosen accounts sequentially, and resets on reload", async ({
   page,
@@ -660,7 +799,7 @@ test("startup selects nothing, checks chosen accounts sequentially, and resets o
   await page.getByRole("button", { name: "继续", exact: true }).click();
   await page.getByLabel("六位验证码").fill("123456");
   await page.getByRole("button", { name: "继续", exact: true }).click();
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
   await page.reload();
   await expect(
     page.getByRole("checkbox", { name: /使用 日常账号/ }),
@@ -679,7 +818,7 @@ test("unselected accounts are never requested or activated", async ({
   await page.goto("/");
   await page.getByRole("checkbox", { name: /使用 备用账号/ }).check();
   await page.getByRole("button", { name: "检查并使用所选账号" }).click();
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
   expect(
     await page.evaluate(() =>
       (window as any).started.map((t: any) => t.accountId),
@@ -704,7 +843,7 @@ test("cancelled enrollment remains pending and can be retried", async ({
     (await page.evaluate(() => (window as any).__DUO_KILLER_TEST__.snapshot()))
       .accounts[0].pending,
   ).toBe(true);
-  await expect(page.getByRole("button", { name: "立即下单" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "继续登录 n**@example.test" }).click();
   await expect(page.getByLabel("密码", { exact: true })).toBeVisible();
 });
@@ -732,7 +871,7 @@ test("failed account stays disabled while the next selected account can complete
   });
   await expect(page.getByText("未启用：密码错误")).toBeVisible();
   await page.getByRole("button", { name: "使用已通过的 1 个账号" }).click();
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /日常账号 fir/ })).toHaveCount(
     0,
   );
@@ -790,9 +929,10 @@ test("preset products fill purchase fields without submitting an order", async (
   const purchase = page.locator("section").filter({
     has: page.getByRole("heading", { name: "购买商品", exact: true }),
   });
-  await expect(purchase.getByRole("button")).toHaveCount(1);
+  await expect(purchase.getByRole("button")).toHaveCount(2);
+  await expect(purchase.getByRole("button", { name: "立即下单（自提）", exact: true })).toBeVisible();
   await expect(
-    purchase.getByRole("button", { name: "立即下单" }),
+    purchase.getByRole("button", { name: "立即下单", exact: true }),
   ).toBeVisible();
   await expect(page.getByText("任务记录", { exact: true })).toHaveCount(0);
   await expect(page.getByText("查看过程记录", { exact: true })).toHaveCount(0);
@@ -910,7 +1050,7 @@ test("expired active account stays on the current route while other accounts rem
     .locator(".sidebar")
     .getByRole("button", { name: /备用账号/ })
     .click();
-  await expect(page.getByRole("button", { name: "立即下单" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单", exact: true })).toBeVisible();
 });
 
 test("account identity is masked by default and reveals only until account switch or reload", async ({
@@ -1258,7 +1398,7 @@ test("workspace removal is blocked during tasks and switches to remaining accoun
   await fixture(page);
   await page.goto("/");
   await enterWorkspace(page);
-  await page.getByRole("button", { name: "立即下单" }).click();
+  await page.getByRole("button", { name: "立即下单", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "移除账号", exact: true }),
   ).toBeDisabled();
@@ -1303,4 +1443,44 @@ test("unfinished enrollment can be removed after cancelling login", async ({
     0,
   );
   await expect(page.getByRole("textbox", { name: "Apple 账号" })).toBeVisible();
+});
+
+
+test("preparation is above purchase and separate from ordering", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  const prep = page.locator("section").filter({ has: page.getByRole("heading", { name: "抢购准备", exact: true }) });
+  const purchase = page.locator("section").filter({ has: page.getByRole("heading", { name: "购买商品", exact: true }) });
+  await expect(prep.getByRole("button")).toHaveCount(4);
+  await expect(purchase.getByRole("button")).toHaveCount(2);
+  expect((await prep.boundingBox())!.y).toBeLessThan((await purchase.boundingBox())!.y);
+});
+
+for (const confirm of [true, false]) {
+  test(`clear bag requires item confirmation: ${confirm}`, async ({ page }) => {
+    await fixture(page);
+    await page.goto("/");
+    await enterWorkspace(page);
+    await page.getByRole("button", { name: "购物袋", exact: true }).click();
+    await page.getByRole("button", { name: "清空购物袋", exact: true }).click();
+    await expect(page.getByRole("button", { name: "确认清空购物袋", exact: true })).toBeVisible();
+    await expect(page.getByText("确认后仅移除下列当前购物袋商品，不取消已有订单。")).toBeVisible();
+    await page.getByRole("button", { name: confirm ? "确认清空购物袋" : "保留购物袋", exact: true }).click();
+    await expect(page.getByText(confirm ? "官网已确认购物袋为空。" : "已保留购物袋，未移除商品。", { exact: true })).toBeVisible();
+    if (!confirm) await expect(page.getByText("尚未清空", { exact: true }).first()).toBeVisible();
+    expect(await page.evaluate(() => (window as any).started.filter((t: any) => t.action !== "me").map((t: any) => t.action))).toEqual(["clear_bag"]);
+  });
+}
+
+
+test("preparation clear bag uses the same confirmation without starting checkout", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await enterWorkspace(page);
+  const prep = page.locator("section").filter({ has: page.getByRole("heading", { name: "抢购准备", exact: true }) });
+  await prep.getByRole("button", { name: "清空购物袋", exact: true }).click();
+  await expect(page.getByRole("button", { name: "确认清空购物袋", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "保留购物袋", exact: true }).click();
+  expect(await page.evaluate(() => (window as any).started.filter((t: any) => t.action !== "me").map((t: any) => t.action))).toEqual(["clear_bag"]);
 });

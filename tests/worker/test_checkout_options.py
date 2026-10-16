@@ -480,6 +480,7 @@ class CheckoutOptionsTests(unittest.TestCase):
     def test_contact_rejection_does_not_proceed_to_shipping(self):
         flow = FakeFlow(contact_model())
         flow.action = lambda *args: None  # 模拟业务 200，但仍停留在表单，未通过校验。
+        flow.page = lambda *args, **kwargs: None  # Fresh GET confirms it remains on the contact step.
         with self.assertRaises(ValueError):
             options.pickup_contact(flow, deepcopy(CONFIG), self.path)
 

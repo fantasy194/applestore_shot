@@ -1,8 +1,11 @@
 """Use live Apple order actions; never infer success from an HTTP 200."""
 import re
+from time import sleep
+from urllib.parse import urlsplit
 
 import requests
 import duo_killer as shop
+from order_access import account_detail_url, read_detail
 
 
 def inspect_order(flow, number):
@@ -18,23 +21,92 @@ def inspect_order(flow, number):
     return 'orderDetail.orderItems.' + key, node, canceled
 
 
-def cancel_order(session, number, channel, before_submit, *, allow_submit=True):
-    if not isinstance(number, str) or not re.fullmatch(r'W\d{6,20}', number):
-        raise ValueError('订单编号无效。')
-    listing = shop.order_list(session)
+def locate_order(session, number, listing, contact, *, allow_lookup=True):
+    """Read the observed account detail route, refresh, then try official lookup.
+
+    The form may associate a matching order with this logged-in account. Never
+    invent an account route, submit a separate linking action, or replay lookup.
+    """
     order = next((o for o in listing['orders'] if o['order_number'] == number), None)
     if not order:
-        raise ValueError('当前账号的订单列表未找到此订单，未取消。')
+        direct = account_detail_url(listing, number)
+        if direct:
+            try:
+                detail = read_detail(session, number, direct)
+            except (requests.RequestException, ValueError):
+                pass
+            else:
+                inspect_order(detail, number)
+                return detail, detail.url, listing.get('lookup_url'), None
+    if not order:
+        sleep(.5)
+        listing = shop.order_list(session, fresh=True)
+        order = next((o for o in listing['orders'] if o['order_number'] == number), None)
+    flow = shop.Checkout(session)
+    lookup_url = listing.get('lookup_url')
+    lookup_url = flow.apple_url(lookup_url) if lookup_url else None
+    lookup_reason = None
+    if not order and lookup_url and allow_lookup:
+        email = contact.get('emailAddress', '')
+        phone = contact.get('fullDaytimePhone', '')
+        if (urlsplit(lookup_url).path == '/shop/order/link/verify'
+                and isinstance(email, str) and re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)
+                and isinstance(phone, str) and re.fullmatch(r'\d{7,15}', phone)):
+            flow.page(lookup_url, '通过官网入口核对未列出的订单')
+            module = 'orderLinkModule'
+            action = shop.field(flow.model, module + '.a.submit.url')
+            bindings = shop.field(flow.model, module + '.b', {})
+            if (action and urlsplit(flow.apple_url(action)).path == '/shop/order/linkx/verify'
+                    and all(shop.field(bindings, key + '.submit') is True
+                            for key in ('orderNumber', 'phoneNumber', 'emailAddress'))):
+                shop.interaction.report_stage('正在用本地联系方式通过官网验证查找订单；尚未发送取消')
+                try:
+                    flow.action(module, 'submit', {
+                        module + '.orderNumber': number, module + '.phoneNumber': phone,
+                        module + '.emailAddress': email})
+                except (requests.RequestException, ValueError):
+                    # Lookup may have succeeded remotely. Do not replay its POST.
+                    pass
+                if isinstance(shop.field(flow.model, 'orderDetail'), dict):
+                    inspect_order(flow, number)
+                    return flow, flow.url, lookup_url, None
+                alert = shop.field(flow.model, 'orderLinkModule.d.alert', '')
+                if isinstance(alert, str) and 'already linked to an Apple ID' in alert:
+                    # This is the actual server alert, not b.*.p validation
+                    # templates. Do not expose the email embedded in its HTML.
+                    lookup_reason = 'already_linked'
+                listing = shop.order_list(session, fresh=True)
+                order = next((o for o in listing['orders'] if o['order_number'] == number), None)
+    if not order:
+        return None, None, lookup_url, lookup_reason
     urls = {item.get('detail_url') for item in order['items']}
     if len(urls) != 1 or not next(iter(urls)):
         raise ValueError('订单详情入口不明确，请在官网取消。')
-    flow = shop.Checkout(session)
     url = flow.apple_url(next(iter(urls)))
     flow.page(url, '读取待取消订单')
+    inspect_order(flow, number)
+    return flow, url, lookup_url, None
+
+
+def cancel_order(session, number, channel, before_submit, *, allow_submit=True, contact=None):
+    if not isinstance(number, str) or not re.fullmatch(r'W\d{6,20}', number):
+        raise ValueError('订单编号无效。')
+    listing = shop.order_list(session)
+    flow, url, lookup_url, lookup_reason = locate_order(session, number, listing, contact or {}, allow_lookup=allow_submit)
+    if flow is None:
+        return {'success': False, 'status': 'cancellation_lookup_required', 'order_number': number,
+                'detail_url': lookup_url, 'lookup_reason': lookup_reason,
+                'message': ('官网提示该订单号已关联 Apple ID，但当前账号列表未列出，未取得订单详情。'
+                            '请核对下单时的账号与官网订单详情；尚未发送取消。'
+                            if lookup_reason == 'already_linked' else
+                            '刷新后官网账号列表仍未列出此订单，自动查找也未取得可核对的详情；这不代表订单不存在。'
+                            '尚未发送取消，请使用官网“查找订单”入口，凭订单号、下单手机号和邮箱核对。')}
     path, node, canceled = inspect_order(flow, number)
     result = {'success': False, 'order_number': number, 'detail_url': url}
     if canceled:
         return {**result, 'success': True, 'status': 'order_cancelled', 'message': '官网已确认订单取消。'}
+    if shop.field(node, 'orderItemStatusTracker.d.currentStatus') == 'PAYMENT_EXPIRED_STORED_ORDER':
+        return {**result, 'success': True, 'status': 'order_expired', 'message': '官网已确认此订单超过付款期限，已过期；无需再次取消。'}
     if not allow_submit:
         return {**result, 'status': 'cancellation_unknown', 'message': '上一笔取消结果尚未确认，已仅查询状态；请稍后查询或在官网核对，不会重复发送取消。'}
     if shop.field(node, 'd.cancelEligible') is not True:

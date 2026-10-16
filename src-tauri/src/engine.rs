@@ -23,6 +23,7 @@ const ACTIONS: &[&str] = &[
     "orders",
     "cancel_order",
     "bag",
+    "clear_bag",
     "add",
     "purchase",
     "checkout",

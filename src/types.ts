@@ -11,6 +11,7 @@ export type Action =
   | "login"
   | "me"
   | "bag"
+  | "clear_bag"
   | "add"
   | "purchase"
   | "checkout"
@@ -68,6 +69,7 @@ export const actionNames: Record<Action, string> = {
   login: "登录账号",
   me: "检查登录",
   bag: "查询购物袋",
+  clear_bag: "清空购物袋",
   add: "设置购买数量",
   purchase: "购买商品",
   checkout: "结算购物袋",

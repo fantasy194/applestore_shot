@@ -198,7 +198,7 @@ export default function App() {
       setTab(
         target.action === "orders"
           ? "orders"
-          : ["bag", "checkout"].includes(target.action)
+          : ["bag", "clear_bag", "checkout"].includes(target.action)
             ? "bag"
             : target.action === "catalog"
               ? "catalog"
@@ -571,6 +571,19 @@ export default function App() {
                         </div>
                       </section>
                       <section className="section">
+                        <div className="section-title"><h2>抢购准备</h2><span>不创建订单</span></div>
+                        <div className="button-row">
+                          <button disabled={busy} onClick={() => start("login", { warm_only: true })}>预热登录（不加购）</button>
+                          <button disabled={busy} onClick={() => start("login", { renew_device_trust: true })}>重新验证设备（保留账号）</button>
+                          <button disabled={busy || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity < 1}
+                            onClick={() => start("purchase", { sku, quantity, prepare_only: true })}>提前准备（不下单）</button>
+                          <button className="danger-button" disabled={busy} onClick={() => start("clear_bag")}>
+                            <Trash2 size={15} />清空购物袋
+                          </button>
+                        </div>
+                        <p className="muted">商品未开放加购时，可先预热登录。提前准备会按下方选择的商品和数量检查购物袋、填写送货结算信息，但不创建订单。5 分钟内下单会重新核对当前结算页，不保证库存。</p>
+                      </section>
+                      <section className="section">
                         <div className="section-title">
                           <h2>购买商品</h2>
                           <span>按目标总数量更新</span>
@@ -578,7 +591,8 @@ export default function App() {
                         <form
                           onSubmit={(e) => {
                             e.preventDefault();
-                            start("purchase", { sku, quantity });
+                            start("purchase", { sku, quantity,
+                              fulfillment: (e.nativeEvent as SubmitEvent).submitter?.getAttribute("data-fulfillment") === "RETAIL" ? "RETAIL" : "HOME" });
                           }}
                         >
                           <ProductSelect sku={sku} onChange={setSku} />
@@ -589,7 +603,6 @@ export default function App() {
                                 type="number"
                                 required
                                 min={1}
-                                max={999}
                                 value={quantity}
                                 onChange={(e) =>
                                   setQuantity(Number(e.target.value))
@@ -599,8 +612,8 @@ export default function App() {
                           </div>
                           <p className="muted">
                             {sku === "MLH74FE"
-                              ? "抛光布测试：自动送货并填写地址、联系方式，核对商品、数量、金额和地址后直接创建真实待付款订单，展示支付二维码。"
-                              : "固定送货，优先使用本地地址和联系方式。当前账号已启用的商品可自动创建订单：Duo 白色 256GB 上限 15,999 元、512GB 上限 17,999 元，iPhone 18 Pro 银色 256GB 上限 9,999 元；均为 1 台、不加 AppleCare+。型号、数量或金额不符会停止。"}
+                              ? "抛光布测试：可选择送货或自提。核对商品、数量、金额及地址或门店后自动创建真实待付款订单，展示支付二维码。"
+                              : "立即下单使用本地送货地址；立即下单（自提）使用本地预设门店和取货联系人。按本次选择的商品和数量自动创建待付款订单，金额以官网结算为准；不加 AppleCare+。"}
                           </p>
                           <div className="button-row">
                             <button
@@ -612,24 +625,15 @@ export default function App() {
                               <ArrowRight size={16} />
                             </button>
                             <button
-                              type="button"
-                              disabled={busy}
-                              onClick={() => start("login", { warm_only: true })}
+                              className="primary"
+                              type="submit"
+                              data-fulfillment="RETAIL"
+                              disabled={busy || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity < 1}
                             >
-                              预热登录（不加购）
-                            </button>
-                            <button type="button" disabled={busy} onClick={() => start("login", { renew_device_trust: true })}>
-                              重新验证设备（保留账号）
-                            </button>
-                            <button
-                              type="button"
-                              disabled={busy || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, "")) || quantity !== 1}
-                              onClick={() => start("purchase", { sku, quantity, prepare_only: true })}
-                            >
-                              提前准备（不下单）
+                              立即下单（自提）
+                              <ArrowRight size={16} />
                             </button>
                           </div>
-                          <p className="muted">商品未开放加购时，可先预热登录，不加购、不下单；结算仍可能要求认证。提前准备需要商品可加购，会填写结算信息但不创建订单。5 分钟内下单优先读取当前结算页并重新核对，不保证库存。</p>
                         </form>
                       </section>
                     </>
@@ -646,14 +650,15 @@ export default function App() {
                       <p className="muted">
                         读取所选账号的实时购物袋，结算时可选择配送或自提。
                       </p>
-                      {latest(["bag"]) ? (
+                      {latest(["bag", "clear_bag"]) ? (
                         <ItemTable
-                          items={latest(["bag"])!.items || []}
-                          total={latest(["bag"])!.total}
+                          items={latest(["bag", "clear_bag"])!.items || []}
+                          total={latest(["bag", "clear_bag"])!.total}
                         />
                       ) : (
                         <InlineEmpty text="点击刷新，查看当前账号的购物袋。" />
                       )}
+                      <div className="button-row">
                       <button
                         className="primary"
                         disabled={busy}
@@ -662,6 +667,10 @@ export default function App() {
                         结算购物袋
                         <ArrowRight size={16} />
                       </button>
+                      <button className="danger-button" disabled={busy} onClick={() => start("clear_bag")}>
+                        <Trash2 size={15} />清空购物袋
+                      </button>
+                      </div>
                     </section>
                   )}
                   {tab === "orders" && (
@@ -756,11 +765,11 @@ export default function App() {
                   >
                     <div className="section-title">
                       <h2>{actionNames[task.action]}</h2>
-                      <span className={`status ${task.result?.status === "pending_payment" ? "succeeded" : task.status}`}>
+                      <span className={`status ${["cancel_order", "clear_bag"].includes(task.action) && task.result?.success === false ? "waiting" : task.result?.status === "pending_payment" ? "succeeded" : task.status}`}>
                         {active(task) && task.status !== "waiting" && task.result?.status !== "pending_payment" && (
                           <LoaderCircle size={13} className="spin" />
                         )}
-                        {task.result?.status === "pending_payment" ? "订单已创建" : stateNames[task.status]}
+                        {task.result?.status === "order_expired" ? "订单已过期" : task.action === "cancel_order" && task.result?.success === false ? "尚未取消" : task.action === "clear_bag" && task.result?.success === false ? "尚未清空" : task.result?.status === "pending_payment" ? "已取得订单号" : stateNames[task.status]}
                       </span>
                     </div>
                     <p className="task-account">{format(account.email)}</p>
@@ -779,7 +788,7 @@ export default function App() {
                           }
                           role={task.status === "failed" ? "alert" : undefined}
                         >
-                          {format(task.stage)}
+                          {task.action === "cancel_order" && task.result?.success === false ? "未确认取消" : task.action === "clear_bag" && task.result?.success === false ? "尚未清空" : format(task.stage)}
                         </p>
                         {active(task) && (
                           <button
@@ -801,7 +810,7 @@ export default function App() {
                         }}
                         onQr={() => start("qr", { source_task: task.id })}
                         onCancelOrder={() => start("cancel_order", { order_number: task.result!.order_number })}
-                        cancelled={snapshot.tasks.some((t) => t.account_id === task.account_id && t.result?.status === "order_cancelled" && t.result?.order_number === task.result!.order_number)}
+                        terminalStatus={confirmedOrderTerminal(snapshot.tasks, task.account_id, task.result!.order_number)}
                         disabled={busy}
                       />
                     )}
@@ -943,12 +952,12 @@ function OrderTable({ result, disabled, onCancelOrder }: { result: Data; disable
               (order.items || []).map((item: Data, i: number) => (
                 <tr key={order.order_number + "-" + i}>
                   <td>
-                    <span className="order-number">{order.order_number}</span>
+                    <span className="order-number">{item.detail_url ? <a href={item.detail_url} target="_blank" rel="noopener noreferrer">{order.order_number}</a> : order.order_number}</span>
                     <small>{item.name}</small>
                   </td>
                   <td>{item.quantity}</td>
                   <td>{item.delivery_info || "官网未返回状态"}</td>
-                  <td>{i === 0 && <button disabled={disabled} onClick={() => onCancelOrder(order.order_number)}>取消订单 {order.order_number}</button>}</td>
+                  <td>{i === 0 && !order.items.every((entry: Data) => /^(?:PAYMENT_EXPIRED_STORED_ORDER|CANCEL(?:ED|LED)(?:_[A-Z_]+)?)$/.test(entry.status || "")) && <button disabled={disabled} onClick={() => onCancelOrder(order.order_number)}>取消订单 {order.order_number}</button>}</td>
                 </tr>
               )),
             )}
@@ -1009,24 +1018,39 @@ function Catalog({
     </>
   );
 }
+function confirmedOrderTerminal(tasks: Task[], accountId: string, number: string): "cancelled" | "expired" | undefined {
+  if (typeof number !== "string" || !number) return;
+  for (const task of tasks) {
+    if (task.account_id !== accountId || !task.result || task.result.success === false) continue;
+    if (task.result?.order_number === number) {
+      if (task.result.status === "order_cancelled") return "cancelled";
+      if (task.result.status === "order_expired") return "expired";
+    }
+    if (task.action === "orders") {
+      const order = task.result?.orders?.find((o: Data) => o.order_number === number && o.verified_by === "official_detail");
+      if (order?.items?.length && order.items.every((item: Data) => item.status === "PAYMENT_EXPIRED_STORED_ORDER")) return "expired";
+      if (order?.items?.length && order.items.every((item: Data) => /^CANCEL(?:ED|LED)(?:_[A-Z_]+)?$/.test(item.status || ""))) return "cancelled";
+    }
+  }
+}
 function Result({
   task,
   onOrders,
   onQr,
   onCancelOrder,
-  cancelled,
+  terminalStatus,
   disabled,
 }: {
   task: Task;
   onOrders: () => void;
   onQr: () => void;
   onCancelOrder: () => void;
-  cancelled: boolean;
+  terminalStatus?: "cancelled" | "expired";
   disabled: boolean;
 }) {
   const { format } = useAccountPrivacy();
   const result = task.result!;
-  if (cancelled && result.status === "pending_payment") return <p>订单 {result.order_number} 已取消，付款二维码已隐藏。</p>;
+  if (terminalStatus && result.status === "pending_payment") return <p>订单 {result.order_number} {terminalStatus === "expired" ? "已过期" : "已取消"}，付款二维码已隐藏。</p>;
   if (task.action === "cancel_order") return <div>
     <p>{result.message}</p>
     <p>订单 {result.order_number}</p>
@@ -1036,7 +1060,8 @@ function Result({
   if (result.status === "pending_payment")
     return (
       <div className="payment">
-        <h3>订单已创建，等待付款</h3>
+        <h3>苹果已返回订单号，等待付款</h3>
+        <p className="muted">订单号来自结算结果；账号订单列表中的状态与归属尚未核实。</p>
         {typeof result.order_confirmed_elapsed_seconds === "number" && (
           <p className="muted">订单确认耗时：约 {result.order_confirmed_elapsed_seconds} 秒（含排队，不含二维码）。</p>
         )}
@@ -1046,6 +1071,7 @@ function Result({
         </p>
         {result.items && <ItemTable items={result.items} total={result.order_total} />}
         {result.delivery_address && <p>送货地址：{result.delivery_address}</p>}
+        {result.pickup_store && <p>自提门店：{result.pickup_store}</p>}
         {result.qr_data ? (
           <img
             src={result.qr_data}
@@ -1157,6 +1183,7 @@ function PromptForm({
       {confirmation ? (
         <>
           {prompt.details?.operation === "cancel_order" && <p>订单 {prompt.details.order_number}。确认后将向 Apple 提交取消。</p>}
+          {prompt.details?.operation === "clear_bag" && <p>确认后仅移除下列当前购物袋商品，不取消已有订单。</p>}
           <ItemTable
             items={prompt.details?.items || []}
             total={prompt.details?.total}
@@ -1268,7 +1295,7 @@ function PromptForm({
           {busy ? (
             <LoaderCircle size={15} className="spin" />
           ) : confirmation ? (
-            prompt.details?.operation === "cancel_order" ? "确认取消订单" : "确认创建订单"
+            prompt.details?.operation === "clear_bag" ? "确认清空购物袋" : prompt.details?.operation === "cancel_order" ? "确认取消订单" : "确认创建订单"
           ) : (
             "继续"
           )}
@@ -1280,7 +1307,7 @@ function PromptForm({
           onClick={confirmation ? () => submit(false) : onCancel}
         >
           <X size={14} />
-          {prompt.details?.operation === "cancel_order" ? "保留订单" : "取消"}
+          {prompt.details?.operation === "clear_bag" ? "保留购物袋" : prompt.details?.operation === "cancel_order" ? "保留订单" : "取消"}
         </button>
       </div>
     </form>

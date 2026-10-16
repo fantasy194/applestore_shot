@@ -78,7 +78,8 @@ def safe_url(url):
     public = {"product", "purchaseOption", "step", "acpart", "igt", "add-to-cart", "_a", "_m", "_s"}
     query = urlencode([(key, value if key in public else "[REDACTED]")
                        for key, value in parse_qsl(parsed.query, keep_blank_values=True)])
-    return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, query, ""))
+    path = re.sub(r'(/shop/order(?:x)?/guestx?/W\d{6,20}/)[^/]+', r'\1[REDACTED]', parsed.path)
+    return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], path, query, ""))
 
 
 @contextmanager
@@ -492,9 +493,12 @@ def account_info(session, *, reauthenticate=True):
             "email": apple_id if "@" in apple_id else None}
 
 
-def order_list(session):
+def order_list(session, *, fresh=False):
     flow = Checkout(session)
-    flow.page(BASE_URL + "/cn/shop/goto/order/list", "读取订单列表")
+    if fresh:
+        flow.page(BASE_URL + "/cn/shop/goto/order/list", "重新核对订单列表", fresh=True)
+    else:
+        flow.page(BASE_URL + "/cn/shop/goto/order/list", "读取订单列表")
     if urlsplit(flow.url).path.startswith("/shop/signIn"):
         if urlsplit(flow.url).path != "/shop/signIn/orders":
             raise ValueError("订单页返回了未支持的认证入口，已停止。")
@@ -539,6 +543,8 @@ def order_list(session):
     if type(has_items) is not bool or has_items != bool(orders) or type(has_more) is not bool:
         raise ValueError("订单列表状态与内容不一致，未返回空订单。")
     return {"success": True, "count": len(orders), "has_more": has_more, "orders": orders,
+            "lookup_url": flow.apple_url(field(listing, 'd.displayFindYourOrderURL'))
+                          if field(listing, 'd.displayFindYourOrderURL') else None,
             "message": "这是当前页订单；还有历史订单，可在官网订单列表继续查看。" if has_more
                        else "当前账号暂无订单。" if not orders else "订单列表读取完成。"}
 
@@ -895,6 +901,33 @@ def model_items(model):
                   for item in model_item_nodes(model))
 
 
+def selection_mismatch_message(items, selection, stage='购物袋'):
+    """Explain only product data; never include account/address/session data."""
+    wanted = f'{selection[0]} ×{selection[1]}' if selection else '单一商品，数量为正整数'
+    rows = ['{}（{}）×{}'.format(order_text(item.get('name')) or '商品',
+            order_text(item.get('sku')) or 'SKU 未返回', item.get('quantity', '?')) for item in items]
+    return ('购物袋商品或数量与本次选择不一致；本次选择：' + wanted + '；' + stage + '实际：'
+            + ('、'.join(rows) if rows else '空购物袋') + '。请先核对购物袋中的其他商品和数量；未提交订单。')
+
+
+def verify_purchase_bag(flow, *, allow_quantity_update=False):
+    handler = interaction.handler
+    selection = getattr(handler, 'purchase_selection', None)
+    if not selection or getattr(handler, 'automatic_checkout', False) is not True:
+        return
+    items = flow.require('shoppingCart').get('items', {})
+    actual = model_items(items)
+    valid = (len(actual) <= 1 and all(sku == selection[0] for sku, _ in actual)
+             if allow_quantity_update else actual == [selection])
+    if not valid:
+        rows = [{'name': field(item, 'd.name') or field(item, 'd.productName'),
+                 'sku': field(item, 'd.sku'), 'quantity': field(item, 'itemQuantity.d.quantity')}
+                for item in model_item_nodes(items)]
+        message = selection_mismatch_message(rows, selection)
+        log.warning('[购买前核对] %s', message)
+        raise ValueError(message)
+
+
 def order_text(value):
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
         return ""
@@ -928,11 +961,21 @@ def confirm_order(model):
     print("\n".join(rows))
     details = field(model, "checkout.companionBar.orderDetails", {})
     store = field(details, "fulfillmentCompanionBar.pickupSummary.d.store_name")
-    if store:
-        print("自提门店：" + order_text(store))
+    store_id = field(details, "fulfillmentCompanionBar.pickupSummary.d.storeId")
     address = field(review, "shippingReview.address.d", {})
     delivery = " ".join(order_text(address.get(key)) for key in ("state", "city", "district", "street", "street2")
                         if address.get(key)) if address.get("street") else field(details, "shippingCompanionBar.address.d.street")
+    contains_delivery = any(isinstance(group, dict) and bool(field(group, 'd.delivers'))
+                            for key, group in review.get('fulfillmentReview', {}).items() if key.startswith('reviewGroup-'))
+    pickup_proof = None
+    if not store and not delivery:
+        from pickup_options import review_pickup_selection
+        pickup_proof = review_pickup_selection(model, getattr(interaction.handler, 'pickup_selected', None))
+        if pickup_proof:
+            store, store_id = pickup_proof['store'], pickup_proof['store_id']
+            log.info('[自提复核] 官网复核页确认全部商品自提；门店来自本次已确认的选择：%s (%s)。', store, store_id)
+    if store:
+        print("自提门店：" + order_text(store))
     if delivery:
         print("送货地址：" + order_text(delivery))
     print(f"\n总支付：{total}")
@@ -941,7 +984,9 @@ def confirm_order(model):
                               "sku": field(item, "d.sku"), "quantity": int(field(item, "itemQuantity.d.quantity")),
                               "subtotal": order_price(field(item, "d.totalPrice"))}
                              for item in model_item_nodes(review.get("fulfillmentReview", {}))],
-                   "total": total, "store": order_text(store), "address": order_text(delivery)}
+                   "total": total, "store": order_text(store), "address": order_text(delivery),
+                   "contains_delivery": contains_delivery,
+                   "store_id": store_id, 'pickup_verification_source': pickup_proof['source'] if pickup_proof else None}
         if interaction.handler.confirm(details) is not True:
             raise ValueError("已取消下单，购物袋已保留。")
         return
@@ -953,6 +998,38 @@ def confirm_order(model):
         raise ValueError("已取消下单，购物袋已保留。")
 
 
+def validate_payment_result(result, expected_total=None):
+    """Compare checkout/order/Alipay references; this does not verify ownership."""
+    from decimal import Decimal
+    def money(value):
+        text = str(value)
+        match = re.fullmatch(r'(?:RMB|CNY|CN¥|¥|￥)?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元|RMB|CNY)?', text)
+        if not match:
+            raise ValueError('付款结果金额无法识别，尚未核实订单；未展示付款码。')
+        amount = Decimal(match[1].replace(',', ''))
+        if amount <= 0:
+            raise ValueError('付款结果金额无效，尚未核实订单；未展示付款码。')
+        return amount
+    number = result.get('order_number')
+    query = parse_qsl(urlsplit(result.get('payment_url', '')).query, keep_blank_values=True)
+    values = [v for k, v in query if k == 'biz_content']
+    try:
+        if len(values) != 1:
+            raise ValueError()
+        biz = json.loads(values[0])
+        if not isinstance(biz, dict) or not number or biz.get('subject') != number:
+            raise ValueError()
+    except (ValueError, TypeError) as error:
+        raise ValueError('付款链接与订单号无法核对，尚未核实订单；未展示付款码。') from error
+    amount = money(biz.get('total_amount'))
+    if (result.get('amount_due') is not None and money(result['amount_due']) != amount
+            or expected_total is not None and money(expected_total) != amount):
+        raise ValueError(f'订单 {number} 的付款金额与结算金额不一致，尚未核实订单；未展示付款码。')
+    if result.get('amount_due') is None:
+        result['amount_due'] = 'RMB ' + format(amount, '.2f')
+    result['payment_reference_verified'] = True
+
+
 def payment_result(flow):
     # 官网 payment-instructions.js 的“现在支付”绑定此模型。
     module = "externalPayAuth" if "externalPayAuth" in flow.model else "thankYouInterstitial"
@@ -962,9 +1039,11 @@ def payment_result(flow):
     if (header.get("isPost") or parsed.scheme != "https" or parsed.hostname != "openapi.alipay.com"
             or parsed.path != "/gateway.do" or parsed.username or parsed.password):
         raise ValueError("下单结果页未提供预期的支付宝 GET 支付链接，请在官网查看订单；不要重复下单。")
-    return {"success": True, "status": "pending_payment", "order_number": header.get("orderNumber"),
+    result = {"success": True, "status": "pending_payment", "order_number": header.get("orderNumber"),
             "amount_due": header.get("amountDue"), "payment_url": url,
-            "message": "订单已创建，尚未付款；请打开支付链接完成支付宝支付。"}
+            "message": "苹果已返回订单号和付款请求；账号订单列表中的状态与归属尚未核实。"}
+    validate_payment_result(result)
+    return result
 
 
 def payment_qr(result):
@@ -1022,6 +1101,7 @@ def pay_bag(*, flow=None, prepare_only=False):
             expected = model_items(cart.get("items", {}))
             if not expected:
                 raise ValueError("购物袋为空，无法下单。")
+            verify_purchase_bag(flow)  # Stop before checkout/auth/address/payment writes.
             data = {"shoppingCart.locationConsent.locationConsent": "false",
                     "shoppingCart.summary.promoCode.promoCode": field(cart, "summary.promoCode.d.promoCode", ""),
                     "shoppingCart.actions.fcscounter": "", "shoppingCart.actions.fcsdata": "",
@@ -1050,8 +1130,12 @@ def continue_checkout(flow, expected, *, prepare_only=False):
     if isinstance(field(flow.model, 'checkout.review'), dict):
         return pay_review(flow, expected, prepare_only=prepare_only)
     page = field(flow.model, 'checkout.d.page')
-    if page not in ('Shipping', 'Billing', 'Review'):
-        recover_step(flow, '送货', lambda: checkout_delivery(flow))
+    if page not in ('PickupContact', 'Shipping', 'Billing', 'Review'):
+        pickup = getattr(interaction.handler, 'fulfillment_mode', 'HOME') == 'RETAIL'
+        recover_step(flow, '自提' if pickup else '送货', lambda: checkout_delivery(flow))
+    if field(flow.model, 'checkout.d.page') == 'PickupContact':
+        from checkout_options import pickup_contact, read_config
+        recover_step(flow, '取货联系人', lambda: pickup_contact(flow, read_config(ROOT / 'checkout.json'), ROOT / 'checkout.json'))
     if field(flow.model, 'checkout.d.page') not in ('Billing', 'Review'):
         recover_step(flow, '地址', lambda: checkout_shipping(flow))
     if not isinstance(field(flow.model, 'checkout.review'), dict):
@@ -1132,11 +1216,13 @@ def pay_review(flow, expected, *, prepare_only=False):
     if getattr(interaction.handler, 'automatic_checkout', False) is True:
         if selected_applecare(review.get('fulfillmentReview', {})):
             raise ValueError('订单复核显示已选择 AppleCare 服务，不符合仅购买裸机的预设；未提交订单。')
+    confirm_order(flow.model)
     if len(expected) == 1 and getattr(interaction.handler, 'automatic_checkout', False):
         config = ROOT / "checkout.json"
         write_private_json(ROOT / "prepared_checkout.json", {'sku': expected[0][0], 'quantity': expected[0][1],
+            'fulfillment_mode': getattr(interaction.handler, 'fulfillment_mode', 'HOME'),
+            'review_verified': True,
             'config_hash': hashlib.sha256(config.read_bytes() if config.exists() else b'').hexdigest(), 'created_at': time()})
-    confirm_order(flow.model)
     if prepare_only:
         return {"success": True, "status": "prepared", "message": "准备完成，未创建订单。点击立即下单时重新读取官网确认页，核对后提交；会话或库存变化可能需要重新准备。"}
     order_details = getattr(interaction.handler, 'order_details', None)
@@ -1147,7 +1233,14 @@ def pay_review(flow, expected, *, prepare_only=False):
     save_auth(flow.session)  # QR retrieval must not delay persisting issued session cookies.
     (ROOT / "prepared_checkout.json").unlink(missing_ok=True)
     if order_details:
-        result.update(items=order_details['items'], delivery_address=order_details['address'], order_total=order_details['total'])
+        result.update(items=order_details['items'], delivery_address=order_details['address'],
+                      pickup_store=order_details.get('store', ''), order_total=order_details['total'])
+    try:
+        validate_payment_result(result, order_details['total'] if order_details else None)
+    except ValueError:
+        if PAYMENT_ROOT is not None:
+            write_private_json(PAYMENT_ROOT / 'payment.json', {**result, 'success': False, 'status': 'verification_required'})
+        raise
     if PAYMENT_ROOT is not None:
         # Keep the issued payment link even if fetching its QR image is interrupted.
         write_private_json(PAYMENT_ROOT / "payment.json", result)
@@ -1247,11 +1340,21 @@ def purchase_sku(part, sms=False, quantity=1, *, prepare_only=False):
                     pass
             if not isinstance(previous, dict):
                 previous = {}
-            if (previous.get('sku') == part and previous.get('quantity') == quantity
+            if (previous.get('review_verified') is True
+                    and previous.get('sku') == part and previous.get('quantity') == quantity
+                    and previous.get('fulfillment_mode', 'HOME') == getattr(interaction.handler, 'fulfillment_mode', 'HOME')
                     and previous.get('config_hash') == config_hash
                     and 0 <= time() - previous.get('created_at', 0) < 300):
                 flow.page(BASE_URL + "/shop/checkout", "读取已准备的结算页面")
-                if field(flow.model, 'checkout.d.page') in ('Fulfillment', 'Shipping', 'Billing', 'Review') or isinstance(field(flow.model, 'checkout.review'), dict):
+                usable = (field(flow.model, 'checkout.d.page') in ('Fulfillment', 'Shipping', 'Billing', 'Review')
+                          or isinstance(field(flow.model, 'checkout.review'), dict))
+                if (getattr(interaction.handler, 'fulfillment_mode', 'HOME') == 'RETAIL'
+                        and not field(flow.model, 'checkout.companionBar.orderDetails.fulfillmentCompanionBar.pickupSummary.d.store_name')):
+                    # This server hides stores on Review. A new task has no current
+                    # store-selection proof: rebuild it rather than trust old cache.
+                    usable = False
+                    log.info('[继续结算] 自提准备页未提供可重新核对的门店，重新选择官网门店；不使用旧任务的选择记录。')
+                if usable:
                     log.info("[继续结算] 复用官网当前结算步骤，最终重新核对商品、金额和地址。")
                     return continue_checkout(flow, [(part, quantity)], prepare_only=prepare_only)
                 log.info("[继续结算] 官网结算步骤不可复用，重新走购物袋流程。")
@@ -1276,11 +1379,10 @@ def purchase_sku(part, sms=False, quantity=1, *, prepare_only=False):
                 flow.page(BASE_URL + "/shop/bag", "重新登录后购物袋")
             else:
                 print("商城已登录。")
+            verify_purchase_bag(flow, allow_quantity_update=True)
             print(f"目标购买数量：{part} × {quantity}")
             add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
-            if getattr(interaction.handler, 'automatic_checkout', False):
-                write_private_json(checkpoint, {'sku': part, 'quantity': quantity,
-                    'config_hash': hashlib.sha256(config.read_bytes() if config.exists() else b'').hexdigest(), 'created_at': time()})
+            verify_purchase_bag(flow)
             if prepare_only:
                 return pay_bag(flow=flow, prepare_only=True)
             return pay_bag(flow=flow)

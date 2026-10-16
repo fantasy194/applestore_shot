@@ -9,6 +9,8 @@ import interaction
 log = logging.getLogger('duo_killer')
 STEPS = {
     '送货': ('Fulfillment', ('Shipping', 'Billing', 'Review'), 'fulfillment', 'continueFromFulfillmentToShipping'),
+    '自提': ('Fulfillment', ('PickupContact', 'Billing', 'Review'), 'fulfillment', 'continueFromFulfillmentToPickupContact'),
+    '取货联系人': ('PickupContact', ('Billing', 'Review'), 'pickupContact', 'continueFromPickupContactToBilling'),
     '地址': ('Shipping', ('Billing', 'Review'), 'shipping', 'continueFromShippingToBilling'),
     '支付方式': ('Billing', ('Review',), 'billing', 'continueFromBillingToReview'),
 }
@@ -50,7 +52,7 @@ def recover_step(flow, label, operation):
                 if path != '/shop/checkout' or not isinstance(current, str):
                     raise ValueError(f'{label}恢复未取得明确结算步骤；已停止，未重试。') from error
                 if current in advanced:
-                    node = checkout.get(current.lower())
+                    node = checkout.get('pickupContact' if current == 'PickupContact' else current.lower())
                     if not isinstance(node, dict):
                         raise ValueError(f'{label}恢复页面状态不完整；已停止，未重试。') from error
                     log.info('[结算恢复] %s已完成，官网当前步骤=%s，跳过重复提交。', label, current)

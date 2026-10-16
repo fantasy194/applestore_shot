@@ -92,6 +92,25 @@ class ServiceTests(unittest.TestCase):
             vault.delete.assert_not_called()
             data=json.loads(service.auth.read_text());self.assertEqual(data['account'],'a@example.test');self.assertNotIn('password',data)
 
+    def test_expiry_is_recorded_separately_from_cancellation_without_resetting_account(self):
+        from unittest.mock import Mock
+        for status, marker_state in [('order_expired', 'expired'), ('order_cancelled', 'cancelled')]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); vault = Mock()
+                service = Service(Channel('a', 't', io.StringIO()), root, root, 'a@example.test', vault)
+                service.ensure_auth_file()
+                original = service.auth.read_bytes()
+                marker = root / 'order_submission.json'
+                marker.write_text(json.dumps({'state': 'submitted', 'order_number': 'W1234567890'}))
+                with patch('order_cancel.cancel_order', return_value={
+                        'success': True, 'status': status, 'order_number': 'W1234567890'}), \
+                        patch.object(duo_killer, 'save_auth'):
+                    service.run('cancel_order', {'order_number': 'W1234567890'})
+                self.assertEqual(json.loads(marker.read_text())['state'], marker_state)
+                self.assertEqual(json.loads((root / 'order_cancellations.json').read_text())['W1234567890'], status)
+                self.assertEqual(service.auth.read_bytes(), original)
+                vault.delete.assert_not_called()
+
     def test_windows_and_macos_browser_locations(self):
         win=browser_candidates('win32',{'PROGRAMFILES':'C:/Program Files','LOCALAPPDATA':'C:/Local'})
         self.assertTrue(any(str(p).endswith('chrome.exe') for p in win))

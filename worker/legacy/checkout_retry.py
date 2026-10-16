@@ -22,7 +22,14 @@ def fresh_checkout_connection(session, method, url, stage):
     The final order POST also starts on a fresh connection but is sent once.
     Password verification and cancellation operations retain their transports.
     """
-    paths = {'continueFromShippingToBilling': '/shop/checkoutx/shipping',
+    paths = {'selectFulfillmentLocationAction': '/shop/checkoutx/fulfillment',
+             'search': '/shop/checkoutx/fulfillment',
+             'select': '/shop/checkoutx/fulfillment',
+             'continueFromFulfillmentToPickupContact': '/shop/checkoutx/fulfillment',
+             'continueFromFulfillmentToShipping': '/shop/checkoutx/fulfillment',
+             'continueFromPickupContactToBilling': '/shop/checkoutx',
+             'continueFromPickupContactToShipping': '/shop/checkoutx',
+             'continueFromShippingToBilling': '/shop/checkoutx/shipping',
              'continueFromBillingToReview': '/shop/checkoutx/billing',
              '交换商城会话凭证': '/shop/signIn/idms/authx',
              'continueFromReviewToProcess': '/shop/checkoutx/review',

@@ -14,23 +14,6 @@ import checkout_options
 from credentials import Vault
 
 
-def automatic_policies(config):
-    limits = {'MK2M4CH/A': '15999.00', 'MK2P4CH/A': '17999.00', 'MJT84CH/A': '9999.00'}
-    entries = config.get('products', [config])
-    if not isinstance(entries, list) or not entries:
-        raise ValueError('自动锁单配置缺少商品范围；未开始购买。')
-    result = {}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError('自动锁单商品配置无效；未开始购买。')
-        sku = duo_killer.normalize_sku(entry.get('sku', ''))
-        if (sku not in limits or sku in result or type(entry.get('quantity')) is not int
-                or entry['quantity'] != 1 or entry.get('max_total') != limits[sku]):
-            raise ValueError('自动锁单配置与本次授权不一致，请先确认配置。')
-        result[sku] = entry
-    return result
-
-
 def empty_auth(account):
     return {'account': account, 'cookies': {key: [] for key in
             ('account_session', 'server_managed', 'with_expiry', 'expiry_unknown')}, 'trust_cookies': []}
@@ -52,6 +35,9 @@ class Service:
         self.preparing = False
         self.retry_enabled = False
         self.order_details = None
+        self.purchase_selection = None
+        self.fulfillment_mode = 'HOME'
+        self.pickup_selected = None
         self.task_created_at = None
         try:
             created = json.loads((task_dir / 'task.json').read_text(encoding='utf-8')).get('created_at')
@@ -59,8 +45,6 @@ class Service:
                 self.task_created_at = created
         except (OSError, ValueError, TypeError):
             pass
-        policy_path = self.root / 'automation.json'
-        self.order_policy = json.loads(policy_path.read_text(encoding='utf-8')) if policy_path.exists() else {}
         self.auth = self.root / 'auth.json'
         self.checkout = self.root / 'checkout.json'
         duo_killer.ROOT, duo_killer.AUTH_PATH, duo_killer.LOG_PATH = self.root, self.auth, self.task_dir / 'requests.log'
@@ -134,7 +118,7 @@ class Service:
         if self.automatic_checkout or self.prefill_checkout:
             values = [key for key, _ in options]
             if label == '收货方式':
-                selected = 'HOME'
+                selected = self.fulfillment_mode
             elif label == '配送服务':
                 selected = default if default in values else values[0] if values else None
             else:
@@ -150,32 +134,40 @@ class Service:
         if self.automatic_checkout:
             from decimal import Decimal
             items = details.get('items', [])
-            policies = automatic_policies(self.order_policy)
-            legacy_cloth = self.test_order and 'products' not in self.order_policy
             item_sku = duo_killer.normalize_sku(items[0].get('sku', '')) if len(items) == 1 else ''
-            policy = self.order_policy if legacy_cloth else policies.get(item_sku)
-            expected_sku = 'MLH74FE' if legacy_cloth else item_sku
-            # Authorize only the exact item/quantity approved by the user.
-            if (policy is None or len(items) != 1 or item_sku != duo_killer.normalize_sku(expected_sku)
-                    or type(items[0].get('quantity')) is not int or items[0]['quantity'] != policy['quantity']):
-                raise ValueError('购物袋含额外商品或型号/数量不符合自动锁单预设；未提交订单。')
+            if (len(items) != 1 or type(items[0].get('quantity')) is not int or items[0]['quantity'] < 1
+                    or self.purchase_selection is not None
+                    and (item_sku, items[0]['quantity']) != self.purchase_selection):
+                raise ValueError(duo_killer.selection_mismatch_message(items, self.purchase_selection, '订单复核页'))
             match = re.fullmatch(r'(?:RMB|CNY|CN¥|¥|￥)?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元|RMB|CNY)?', str(details.get('total', '')))
             if not match:
                 raise ValueError('无法确认人民币订单总额；未提交订单。')
             total = Decimal(match[1].replace(',', ''))
             if total <= Decimal('0'):
                 raise ValueError('订单总额无效；未提交订单。')
-            if not legacy_cloth and total > Decimal(policy['max_total']):
-                raise ValueError('订单总额超过自动锁单上限 ' + policy['max_total'] + ' 元；未提交订单。')
-            if details.get('store') or not details.get('address'):
-                raise ValueError('订单复核未确认送货地址；未提交订单。')
             config = checkout_options.read_config(self.checkout)
-            street = config.get('address', {}).get('street')
-            if checkout_options.local_address_ready(config) and ''.join(str(street).split()) not in ''.join(str(details['address']).split()):
-                raise ValueError('官网复核地址与本地地址不一致；未提交订单。')
-            self.stage('准备完成，已核对商品、数量、地址和金额；未创建订单' if self.preparing
+            if self.fulfillment_mode == 'RETAIL':
+                from pickup_options import validate_preset, store_name
+                preset = validate_preset(config)['pickup']
+                if details.get('address') or details.get('contains_delivery') is True:
+                    raise ValueError('订单复核仍包含送货商品或地址，未确认全部商品自提；未提交订单。')
+                if not details.get('store'):
+                    raise ValueError('订单复核未返回门店，且缺少本次官网已确认门店与全部商品自提的完整依据；未提交订单。')
+                if store_name(details['store']) != store_name(preset['store_name']):
+                    raise ValueError('官网复核自提门店与本地指定门店不一致；未提交订单。')
+                if (self.pickup_selected and details.get('store_id')
+                        and details['store_id'] != self.pickup_selected['storeId']):
+                    raise ValueError('官网复核门店编号与已选门店不一致；未提交订单。')
+            else:
+                if details.get('store') or not details.get('address'):
+                    raise ValueError('订单复核未确认送货地址；未提交订单。')
+                street = config.get('address', {}).get('street')
+                if checkout_options.local_address_ready(config) and ''.join(str(street).split()) not in ''.join(str(details['address']).split()):
+                    raise ValueError('官网复核地址与本地地址不一致；未提交订单。')
+            self.stage('指定自提门店、商品、数量和官网金额已核对，自动创建订单' if self.fulfillment_mode == 'RETAIL' and not self.preparing
+                       else '准备完成，已核对商品、数量、地址和金额；未创建订单' if self.preparing
                        else '抛光布、数量、地址和金额已核对，自动创建订单' if self.test_order
-                       else '商品、数量、地址和金额上限已核对，自动创建订单')
+                       else '本次所选商品、数量、官网金额和地址已核对，自动创建订单')
             return True
         return self.channel.prompt('confirm', '确认商品与金额，创建订单', details=details, account=self.account)
 
@@ -310,33 +302,37 @@ class Service:
 
     def run(self, action, params):
         self.action = action
+        self.fulfillment_mode = params.get('fulfillment', 'HOME') if action in ('purchase', 'checkout') else 'HOME'
+        if self.fulfillment_mode not in ('HOME', 'RETAIL'):
+            raise ValueError('收货方式无效，未开始购买。')
+        self.pickup_selected = None
         self.preparing = params.get('prepare_only') is True
+        self.purchase_selection = ((duo_killer.normalize_sku(params.get('sku', 'MK2M4CH')), quantity(params))
+                                   if action == 'purchase' else None)
         self.test_order = action == 'purchase' and duo_killer.normalize_sku(params.get('sku', '')) == 'MLH74FE/A'
-        self.automatic_checkout = action in ('purchase', 'checkout') and self.order_policy.get('enabled') is True
+        self.automatic_checkout = action in ('purchase', 'checkout')
         config = checkout_options.read_config(self.checkout)
+        if action in ('purchase', 'checkout') and self.fulfillment_mode == 'RETAIL':
+            from pickup_options import validate_preset
+            validate_preset(config)  # Fail before authentication or adding to the bag.
         self.prefill_checkout = action in ('purchase', 'checkout') and checkout_options.local_address_ready(config)
         if self.prefill_checkout:
             validate_address(config)
             if not self.automatic_checkout:
                 self.stage('自动使用已保存的送货地址、官网默认配送和支付宝；最终提交仍需确认')
-        self.retry_enabled = self.order_policy.get('enabled') is True and action in ('purchase', 'checkout', 'qr', 'orders', 'bag', 'catalog')
-        if self.automatic_checkout:
-            policies = automatic_policies(self.order_policy)
-            if 'products' in self.order_policy and not self.prefill_checkout:
-                raise ValueError('请先完整保存本账号的本地送货地址；未加购、未提交订单。')
-            allowed = set(policies)
-            if 'products' not in self.order_policy:
-                allowed.add('MLH74FE/A')
-            if action == 'purchase' and (duo_killer.normalize_sku(params.get('sku', '')) not in allowed or quantity(params) != 1):
-                raise ValueError('商品或数量不在自动锁单授权范围内；未开始购买。')
+        self.retry_enabled = action in ('purchase', 'checkout', 'qr', 'orders', 'bag', 'catalog')
         self.channel.checkpoint()
         if action == 'address_read':
             return {'success': True, 'config': checkout_options.read_config(self.checkout)}
         if action == 'address_save':
             config = checkout_options.read_config(self.checkout)
-            config.update(validate_address(params))
+            if params.get('pickup_only') is True:
+                from pickup_options import validate_preset
+                config.update(validate_preset(params))
+            else:
+                config.update(validate_address(params))
             checkout_options.save_config(self.checkout, config)
-            return {'success': True, 'config': config, 'message': '快捷地址已保存，结账时可选择使用。'}
+            return {'success': True, 'config': config, 'message': '自提门店和取货联系人已保存。' if params.get('pickup_only') is True else '快捷地址已保存，结账时可选择使用。'}
         if action == 'import_auth':
             data = validate_import(params.get('data'), self.account)
             duo_killer.write_private_json(self.auth, data)
@@ -382,6 +378,17 @@ class Service:
             result = duo_killer.add_to_bag(params.get('sku', ''), quantity=quantity(params), set_total=True)
         elif action == 'checkout':
             result = duo_killer.pay_bag()
+        elif action == 'clear_bag':
+            from cart_clear import clear_bag
+            with requests.Session() as session:
+                duo_killer.load_auth(session, json.loads(self.auth.read_text(encoding='utf-8')))
+                try:
+                    result = clear_bag(session, self.channel)
+                finally:
+                    duo_killer.save_auth(session)
+            if result.get('removed_count') or result.get('status') == 'bag_cleared':
+                for name in ('prepared_checkout.json', 'warm_empty_bag.json'):
+                    (self.root / name).unlink(missing_ok=True)
         elif action == 'cancel_order':
             from order_cancel import cancel_order
             number = params.get('order_number')
@@ -397,18 +404,19 @@ class Service:
                 duo_killer.load_auth(session, json.loads(self.auth.read_text(encoding='utf-8')))
                 try:
                     result = cancel_order(session, number, self.channel, before_submit,
-                                          allow_submit=history.get(number) != 'cancellation_unknown')
+                                          allow_submit=history.get(number) != 'cancellation_unknown',
+                                          contact=checkout_options.read_config(self.checkout).get('contact', {}))
                 finally:
                     duo_killer.save_auth(session)
-            if result.get('status') == 'order_cancelled':
-                history[number] = 'order_cancelled'
+            if result.get('status') in ('order_cancelled', 'order_expired'):
+                history[number] = result['status']
                 duo_killer.write_private_json(history_path, history)
                 for name in ('order_submission.json', 'test_order_submission.json'):
                     path = self.root / name
                     if path.exists():
                         marker = json.loads(path.read_text(encoding='utf-8'))
                         if marker.get('order_number') == number:
-                            marker['state'] = 'cancelled'
+                            marker['state'] = 'expired' if result['status'] == 'order_expired' else 'cancelled'
                             duo_killer.write_private_json(path, marker)
         elif action == 'qr':
             source_id = str(params.get('source_task', ''))
@@ -416,6 +424,7 @@ class Service:
             if str(uuid.UUID(source_id)) != source_id:
                 raise ValueError('付款任务编号无效。')
             data = json.loads((self.root / 'tasks' / source_id / 'payment.json').read_text(encoding='utf-8'))
+            duo_killer.validate_payment_result(data, data.get('order_total'))
             duo_killer.payment_qr(data)
             duo_killer.write_private_json(self.task_dir / 'payment.json', data)
             result = data
@@ -427,6 +436,8 @@ class Service:
                 try:
                     if action == 'orders':
                         result = duo_killer.order_list(session)
+                        from order_access import supplement_known_orders
+                        result = supplement_known_orders(session, result, self.root)
                     else:
                         flow = duo_killer.Checkout(session)
                         flow.page(duo_killer.BASE_URL + '/shop/bag', '读取购物袋')
@@ -460,8 +471,8 @@ class Service:
 
 def quantity(params):
     value = params.get('quantity', 1)
-    if type(value) is not int or not 1 <= value <= 999:
-        raise ValueError('数量须为 1–999 的整数；实际限购数量以官网为准。')
+    if type(value) is not int or value < 1:
+        raise ValueError('数量须为正整数；实际限购数量以官网为准。')
     return value
 
 

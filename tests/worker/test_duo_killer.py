@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import time
+from urllib.parse import urlencode
 import unittest
 from unittest.mock import patch
 
@@ -1304,7 +1305,9 @@ class PurchaseFlowTests(unittest.TestCase):
                     patch.object(duo_killer, "Checkout") as factory, \
                     patch.object(duo_killer, "reauthenticate_checkout"), patch.object(duo_killer, "checkout_delivery"), \
                     patch.object(duo_killer, "checkout_shipping"), \
-                    patch.object(duo_killer, "finish_payment", return_value={"success": True}) as finish, \
+                    patch.object(duo_killer, "finish_payment", return_value={"success": True,
+                        "order_number": "W1234567890", "payment_url": 'https://openapi.alipay.com/gateway.do?' +
+                        urlencode({'biz_content': json.dumps({'subject': 'W1234567890', 'total_amount': '3107.00'})})}) as finish, \
                     patch.object(duo_killer, "payment_qr") as qr, contextlib.redirect_stdout(io.StringIO()):
                 flow = factory.return_value
                 flow.model = self.review_model()

@@ -265,6 +265,8 @@ def pickup_contact(flow, config, config_path):
     address = path + '.selfPickupContact.selfContact.address'
     flow.require(address)
     payload = verification(flow, address)
+    from pickup_options import identity_payload, fulfillment_error
+    payload.update(identity_payload(flow, path + '.selfPickupContact.nationalIdSelf', config))
     details = contact(config)
     config['contact'] = details
     save_config(config_path, config)
@@ -277,7 +279,14 @@ def pickup_contact(flow, config, config_path):
     flow.action(path, action, payload)
     expected = 'Shipping' if action.endswith('Shipping') else 'Billing'
     if value(flow.model, 'checkout.d.page') != expected:
-        raise ValueError('取货联系人未通过服务端校验，请检查姓名、手机及邮箱；未继续结账。')
+        error = fulfillment_error(value(flow.model, path, {}))
+        if not error:
+            # The POST can finish while its partial response still shows the old page.
+            flow.page(flow.apple_url('/shop/checkout'), '核对取货联系人是否已完成', fresh=True)
+            error = fulfillment_error(value(flow.model, path, {}))
+        if value(flow.model, 'checkout.d.page') != expected:
+            raise ValueError('取货联系人未通过服务端校验：' + (error or '官网仍停留在联系人步骤，请核对页面提示')
+                             + '；未继续结账，不重复发送联系人表单。')
     flow.require('checkout.shipping' if action.endswith('Shipping') else 'checkout.billing')
 
 
@@ -312,13 +321,35 @@ def fulfillment(flow, config_path):
         return
     locator = path + '.pickupTab.pickup.storeLocator'
     node = flow.require(locator)
-    search = ask('自提门店所在城市/地区', value(node, 'd.searchInput', '') or config.get('delivery', {}).get('city', ''))
+    if automatic_options():
+        from pickup_options import validate_preset
+        search = validate_preset(config)['pickup']['search']
+    else:
+        search = ask('自提门店所在城市/地区', config.get('pickup', {}).get('search') or value(node, 'd.searchInput', '') or config.get('delivery', {}).get('city', ''))
     region = locator + '.address.stateCitySelectorForCheckout'
-    store_data = {locator + '.showAllStores': 'false', locator + '.selectStore': '', locator + '.searchInput': search}
+    # The default visible subset can omit the explicitly requested store.
+    # Ask for all results in this search area; selection remains exact and
+    # a disabled/missing target never falls back to another store or HOME.
+    store_data = {locator + '.showAllStores': 'true' if automatic_options() else 'false',
+                  locator + '.selectStore': '', locator + '.searchInput': search}
     store_data.update({region + '.' + k: value(flow.model, region + '.d.' + k, '')
                       for k in ('state', 'city', 'district', 'provinceCityDistrict', 'countryCode')})
     flow.action(locator, 'search', store_data)
-    stores = value(flow.model, locator + '.searchResults.d.retailStores', [])
+    from pickup_options import search_results
+    stores = search_results(flow.require(locator))
+    if automatic_options():
+        import logging
+        from duo_killer import order_text
+        summary = [{'name': order_text(s.get('storeName')), 'id': order_text(s.get('storeId')),
+                    'disabled': s.get('storeDisabled')} for s in stores[:30] if isinstance(s, dict)] if isinstance(stores, list) else []
+        logging.getLogger('duo_killer').info('[自提门店] 搜索区域=%s，全部结果=%s，返回数量=%s，门店=%s',
+            order_text(search), store_data[locator + '.showAllStores'], len(stores) if isinstance(stores, list) else '格式异常', summary)
+    if automatic_options():
+        from pickup_options import select_store
+        chosen = select_store(stores, config['pickup'])
+        selected = chosen['storeId']
+    else:
+        selected = None
     choices = []
     for store in stores:
         lines = value(store, 'availability.lineItemAvailability', [])
@@ -335,8 +366,9 @@ def fulfillment(flow, config_path):
         choices.append(('HOME', '为我送货（不选门店，改为配送）'))
         if no_stores:
             print('当前没有可选自提门店，可以改为送货。')
-    selected = choose('选择自提门店或改为送货（取货状态由官网返回）', choices,
-                      'HOME' if no_stores and delivery_available else None)
+    if not automatic_options():
+        selected = choose('选择自提门店或改为送货（取货状态由官网返回）', choices,
+                          'HOME' if no_stores and delivery_available else None)
     if selected == 'HOME':
         home_delivery(flow, config)
         return
@@ -344,15 +376,35 @@ def fulfillment(flow, config_path):
     flow.action(locator, 'select', store_data)
     if value(flow.model, locator + '.d.selectStore') != selected:
         raise ValueError('服务端未确认所选自提门店，已停止。')
+    if automatic_options():
+        interaction.handler.pickup_selected = chosen
+        interaction.report_stage('自动选择自提门店：' + chosen['storeName'])
     payload.update(store_data)
     forced = path + '.pickupTab.deliveryForced'
     if value(flow.model, forced + '.shipmentGroups'):
+        if automatic_options():
+            raise ValueError('自提订单中仍包含必须送货的商品，未自动改为配送，未提交订单。')
         print('此订单包含必须配送的商品，继续配置送货地区和配送服务。')
         payload.update(region_data(flow, forced + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=True))
         payload.update(shipping_options(flow, forced + '.shipmentGroups'))
+    from pickup_options import time_slot_payload, fulfillment_error
+    payload.update(time_slot_payload(flow, path + '.pickupTab.pickup.timeSlot', selected,
+                                    None if automatic_options() else choose))
     flow.action(path, 'continueFromFulfillmentToPickupContact', payload)
-    flow.require('checkout.pickupContact')
-    pickup_contact(flow, config, config_path)
+    def advanced():
+        node = {'PickupContact': 'pickupContact', 'Billing': 'billing', 'Review': 'review'}.get(value(flow.model, 'checkout.d.page'))
+        return bool(node and isinstance(value(flow.model, 'checkout.' + node), dict))
+    if not advanced():
+        error = fulfillment_error(value(flow.model, path, {}))
+        if not error:
+            # A partial response may not include the next step. Read, never replay.
+            flow.page(flow.apple_url('/shop/checkout'), '核对自提配送是否已完成', fresh=True)
+            error = fulfillment_error(value(flow.model, path, {}))
+        if not advanced():
+            raise ValueError('自提配送未通过官网校验：' + (error or '尚未进入取货联系人步骤，请核对门店和取货时段')
+                             + '；未提交订单，不重复发送继续请求。')
+    if not automatic_options() and isinstance(value(flow.model, 'checkout.pickupContact'), dict):
+        pickup_contact(flow, config, config_path)
 
 
 def shipping(flow, config_path, auth_path=None):
