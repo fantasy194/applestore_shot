@@ -14,6 +14,23 @@ import checkout_options
 from credentials import Vault
 
 
+def automatic_policies(config):
+    limits = {'MK2M4CH/A': '15999.00', 'MK2P4CH/A': '17999.00', 'MJT84CH/A': '9999.00'}
+    entries = config.get('products', [config])
+    if not isinstance(entries, list) or not entries:
+        raise ValueError('自动锁单配置缺少商品范围；未开始购买。')
+    result = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError('自动锁单商品配置无效；未开始购买。')
+        sku = duo_killer.normalize_sku(entry.get('sku', ''))
+        if (sku not in limits or sku in result or type(entry.get('quantity')) is not int
+                or entry['quantity'] != 1 or entry.get('max_total') != limits[sku]):
+            raise ValueError('自动锁单配置与本次授权不一致，请先确认配置。')
+        result[sku] = entry
+    return result
+
+
 def empty_auth(account):
     return {'account': account, 'cookies': {key: [] for key in
             ('account_session', 'server_managed', 'with_expiry', 'expiry_unknown')}, 'trust_cookies': []}
@@ -30,6 +47,7 @@ class Service:
         self.action = None
         self.submitted = False
         self.automatic_checkout = False
+        self.prefill_checkout = False
         self.test_order = False
         self.preparing = False
         self.retry_enabled = False
@@ -94,7 +112,7 @@ class Service:
 
     def text(self, label, default=''):
         kind = 'code' if '验证码' in label else 'text'
-        if self.automatic_checkout and kind != 'code':
+        if (self.automatic_checkout or self.prefill_checkout) and kind != 'code':
             raise ValueError('自动结账缺少必要信息：' + label + '。请先完善本地地址和联系方式。')
         label = label.replace('👉 ', '')
         fields = {}
@@ -113,7 +131,7 @@ class Service:
         return value
 
     def choose(self, label, options, default=None):
-        if self.automatic_checkout:
+        if self.automatic_checkout or self.prefill_checkout:
             values = [key for key, _ in options]
             if label == '收货方式':
                 selected = 'HOME'
@@ -132,10 +150,13 @@ class Service:
         if self.automatic_checkout:
             from decimal import Decimal
             items = details.get('items', [])
-            policy = self.order_policy
-            expected_sku = 'MLH74FE' if self.test_order else policy['sku']
+            policies = automatic_policies(self.order_policy)
+            legacy_cloth = self.test_order and 'products' not in self.order_policy
+            item_sku = duo_killer.normalize_sku(items[0].get('sku', '')) if len(items) == 1 else ''
+            policy = self.order_policy if legacy_cloth else policies.get(item_sku)
+            expected_sku = 'MLH74FE' if legacy_cloth else item_sku
             # Authorize only the exact item/quantity approved by the user.
-            if (len(items) != 1 or duo_killer.normalize_sku(items[0].get('sku', '')) != duo_killer.normalize_sku(expected_sku)
+            if (policy is None or len(items) != 1 or item_sku != duo_killer.normalize_sku(expected_sku)
                     or type(items[0].get('quantity')) is not int or items[0]['quantity'] != policy['quantity']):
                 raise ValueError('购物袋含额外商品或型号/数量不符合自动锁单预设；未提交订单。')
             match = re.fullmatch(r'(?:RMB|CNY|CN¥|¥|￥)?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元|RMB|CNY)?', str(details.get('total', '')))
@@ -144,7 +165,7 @@ class Service:
             total = Decimal(match[1].replace(',', ''))
             if total <= Decimal('0'):
                 raise ValueError('订单总额无效；未提交订单。')
-            if not self.test_order and total > Decimal(policy['max_total']):
+            if not legacy_cloth and total > Decimal(policy['max_total']):
                 raise ValueError('订单总额超过自动锁单上限 ' + policy['max_total'] + ' 元；未提交订单。')
             if details.get('store') or not details.get('address'):
                 raise ValueError('订单复核未确认送货地址；未提交订单。')
@@ -159,7 +180,7 @@ class Service:
         return self.channel.prompt('confirm', '确认商品与金额，创建订单', details=details, account=self.account)
 
     def submission_path(self):
-        # A polishing-cloth test must not consume the Duo submission guard.
+        # Keep polishing-cloth test records separate from phone orders.
         return self.root / ('test_order_submission.json' if self.test_order else 'order_submission.json')
 
     def payment_ready(self, result):
@@ -185,15 +206,16 @@ class Service:
             return
         self.channel.checkpoint()
         if fields.get('order_submitted'):
-            if self.test_order and self.submission_path().exists():
+            if self.submission_path().exists():
                 previous = json.loads(self.submission_path().read_text(encoding='utf-8'))
-                if previous.get('state') == 'pending_payment':
-                    history_path = self.root / 'test_order_history.json'
+                if previous.get('state') in ('pending_payment', 'submission_unknown'):
+                    history_path = self.root / ('test_order_history.json' if self.test_order else 'order_history.json')
                     history = json.loads(history_path.read_text(encoding='utf-8')) if history_path.exists() else []
                     history.append(previous)
                     duo_killer.write_private_json(history_path, history)
-            # Persist before sending placeOrder. A timeout must not allow a
-            # subsequent task to create an additional order blindly.
+            # Record an uncertain response, but do not use past order state to
+            # block another explicitly requested checkout. Apple decides whether
+            # that new checkout is accepted; this task still sends placeOrder once.
             duo_killer.write_private_json(self.submission_path(), {
                 'state': 'submission_unknown', 'task_id': self.channel.task_id,
                 'details': self.order_details,
@@ -291,20 +313,22 @@ class Service:
         self.preparing = params.get('prepare_only') is True
         self.test_order = action == 'purchase' and duo_killer.normalize_sku(params.get('sku', '')) == 'MLH74FE/A'
         self.automatic_checkout = action in ('purchase', 'checkout') and self.order_policy.get('enabled') is True
+        config = checkout_options.read_config(self.checkout)
+        self.prefill_checkout = action in ('purchase', 'checkout') and checkout_options.local_address_ready(config)
+        if self.prefill_checkout:
+            validate_address(config)
+            if not self.automatic_checkout:
+                self.stage('自动使用已保存的送货地址、官网默认配送和支付宝；最终提交仍需确认')
         self.retry_enabled = self.order_policy.get('enabled') is True and action in ('purchase', 'checkout', 'qr', 'orders', 'bag', 'catalog')
         if self.automatic_checkout:
-            if (self.order_policy.get('sku') != 'MK2M4CH' or self.order_policy.get('quantity') != 1
-                    or self.order_policy.get('max_total') != '15999.00'):
-                raise ValueError('自动锁单配置与本次授权不一致，请先确认配置。')
-            marker = self.submission_path()
-            if marker.exists():
-                previous = json.loads(marker.read_text(encoding='utf-8'))
-                if (previous.get('state') == 'submission_unknown'
-                        or previous.get('state') == 'pending_payment' and not self.test_order):
-                    raise ValueError('已有提交结果未确认或待付款订单，请先核对官网订单；已阻止重复锁单。')
-            expected_sku = 'MLH74FE/A' if self.test_order else 'MK2M4CH/A'
-            if action == 'purchase' and (duo_killer.normalize_sku(params.get('sku', '')) != expected_sku or quantity(params) != 1):
-                raise ValueError('支持白色 256GB 自动锁单或抛光布测试，数量须为 1；未开始购买。')
+            policies = automatic_policies(self.order_policy)
+            if 'products' in self.order_policy and not self.prefill_checkout:
+                raise ValueError('请先完整保存本账号的本地送货地址；未加购、未提交订单。')
+            allowed = set(policies)
+            if 'products' not in self.order_policy:
+                allowed.add('MLH74FE/A')
+            if action == 'purchase' and (duo_killer.normalize_sku(params.get('sku', '')) not in allowed or quantity(params) != 1):
+                raise ValueError('商品或数量不在自动锁单授权范围内；未开始购买。')
         self.channel.checkpoint()
         if action == 'address_read':
             return {'success': True, 'config': checkout_options.read_config(self.checkout)}
@@ -325,7 +349,11 @@ class Service:
             return query_duo(duo_killer.request_get) if params.get('mode') == 'duo' else query_store(duo_killer.request_get, phone_only=params.get('mode') == 'phone')
         self.ensure_auth_file()
         if action in ('enroll', 'me'):
-            result = self.check_account(enrolling=action == 'enroll')
+            if action == 'enroll' and params.get('browser_login') is True:
+                from browser_login import login_in_browser
+                result = login_in_browser(self)
+            else:
+                result = self.check_account(enrolling=action == 'enroll')
         elif action == 'login':
             if params.get('warm_only') is True:
                 self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')

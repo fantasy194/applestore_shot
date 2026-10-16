@@ -100,10 +100,14 @@ export function AccountGate({
     }
   }, [snapshot.tasks, currentId]);
 
-  async function execute(id: string, action: Action): Promise<Task | null> {
+  async function execute(
+    id: string,
+    action: Action,
+    params: Record<string, unknown> = {},
+  ): Promise<Task | null> {
     setCurrentAccount(id);
     setCurrentId("");
-    const taskId = await bridge.start(id, action, {});
+    const taskId = await bridge.start(id, action, params);
     if (stopped.current || !mounted.current) {
       await bridge.cancel(id, taskId);
       return null;
@@ -169,12 +173,12 @@ export function AccountGate({
     if (!stopped.current && passed.length === selected.length && passed.length)
       onDone(passed);
   }
-  async function enroll(id: string) {
+  async function enroll(id: string, browserLogin = false) {
     stopped.current = false;
     setRunning(true);
     setError("");
     try {
-      const result = await execute(id, "enroll");
+      const result = await execute(id, "enroll", { browser_login: browserLogin });
       if (!mounted.current) return;
       await refresh();
       if (confirmed(result) && !stopped.current) onDone([id]);
@@ -315,6 +319,9 @@ export function AccountGate({
                   </span>
                   <button onClick={() => enroll(a.id)}>
                     继续登录 {format(a.name)}
+                  </button>
+                  <button onClick={() => enroll(a.id, true)}>
+                    使用官网浏览器登录
                   </button>
                   {removeButton(a)}
                 </div>

@@ -65,7 +65,7 @@ export function AddressForm({
         {account.id === LOCAL_ID
           ? "新账号将继承此地址，已有账号不会被覆盖。"
           : "保存为此账号的本地预设。"}
-        结账时仍可选择官网已有地址或快捷地址。
+        完整保存后，下单自动使用此地址、送货方式和官网默认配送服务，支付方式为支付宝。已启用自动锁单的商品会在核对型号、数量、地址和金额上限后直接创建未付款订单并显示二维码。
       </p>
       <p className="address-guidance">
         {result?.config?.address?.street

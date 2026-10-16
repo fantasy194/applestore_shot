@@ -17,8 +17,9 @@ def value(node, path, default=None):
     return node
 
 
-def automatic_checkout():
-    return getattr(interaction.handler, 'automatic_checkout', False) is True
+def automatic_options():
+    return (getattr(interaction.handler, 'automatic_checkout', False) is True
+            or getattr(interaction.handler, 'prefill_checkout', False) is True)
 
 
 def local_address_ready(config):
@@ -180,11 +181,13 @@ def region_data(flow, path, wanted=None, *, prefer_current=False):
         data = node['d']
         options = [(o['value'], o.get('label', o['value'])) for o in (data.get(key + 'Options') or []) if o.get('value')]
         # Municipality pages can omit the city selector while returning the
-        # fixed city explicitly. Reuse that server value, never infer a city
-        # from the user's preset or carry a city over from another province.
+        # fixed city explicitly. Selectstate responses may omit the submitted
+        # state, leaving its initially empty value in the merged model. The
+        # state was selected from official options; an explicit matching city
+        # confirms this municipality even if state was not echoed back.
         if (key == 'city' and not options
                 and selected.get('state') in ('北京', '上海', '天津', '重庆')
-                and data.get('state') == selected['state']
+                and data.get('state') in (None, '', selected['state'])
                 and data.get('city') == selected['state']):
             options = [(data['city'], data['city'])]
         desired = wanted.get(key) or data.get(key)
@@ -205,7 +208,15 @@ def region_data(flow, path, wanted=None, *, prefer_current=False):
         payload = {path + '.' + k: data.get(k, '') for k in ('state', 'city', 'district', 'provinceCityDistrict')}
         payload.update({path + '.' + k: v for k, v in selected.items()})
         payload[path + '.countryCode'] = 'CN'
-        if chosen != data.get(key) and 'Select' + key in node.get('a', {}):
+        # Fresh checkout HTML may retain the selected province/city but omit
+        # the dependent lists. Re-select that server-provided value once to
+        # hydrate its children, even when the selection itself is unchanged.
+        fixed_city = (chosen in ('北京', '上海', '天津', '重庆')
+                      and data.get('city') == chosen)
+        missing_children = (key == 'state' and not data.get('cityOptions')
+                            and not (fixed_city and data.get('districtOptions'))
+                            or key == 'city' and not data.get('districtOptions'))
+        if (chosen != data.get(key) or missing_children) and 'Select' + key in node.get('a', {}):
             # 改省/市时不携带上一地区的下级选择。
             for child in ('city', 'district') if key == 'state' else ('district',) if key == 'city' else ():
                 payload[path + '.' + child] = ''
@@ -236,7 +247,7 @@ def invoice_data(flow, path):
     invoice = value(flow.model, path + '.eFapiaoSelector')
     if not invoice:
         return {}  # 混合自提的发票已在取货联系人页面填写。
-    if value(invoice, 'd.selectFapiao') != 'e_personal_fdf' and not (automatic_checkout() and invoice.get('ePersonalFapiao')):
+    if value(invoice, 'd.selectFapiao') != 'e_personal_fdf' and not (automatic_options() and invoice.get('ePersonalFapiao')):
         raise ValueError('当前仅支持个人电子发票，请先在官网选择。')
     return {path + '.eFapiaoSelector.selectFapiao': 'e_personal_fdf',
             path + '.eFapiaoSelector.ePersonalFapiao.invoiceHeader': value(invoice, 'ePersonalFapiao.d.invoiceHeader', '')}
@@ -279,7 +290,7 @@ def home_delivery(flow, config):
     if flow.require(selector)['d'].get('selectFulfillmentLocation') != 'HOME':
         raise ValueError('服务端未确认切换为送货，已停止。')
     tab = path + '.deliveryTab.delivery'
-    payload.update(region_data(flow, tab + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=not automatic_checkout()))
+    payload.update(region_data(flow, tab + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=not automatic_options()))
     payload.update(shipping_options(flow, tab + '.shipmentGroups'))
     flow.action(path, 'continueFromFulfillmentToShipping', payload)
     flow.require('checkout.shipping')
@@ -362,7 +373,7 @@ def shipping(flow, config_path, auth_path=None):
         current = saved[0]
     can_add = any(a.get('value') == 'newAddr' and not a.get('disabled')
                   for a in selector.get('radioAddresses', []))
-    if automatic_checkout():
+    if automatic_options():
         config = read_config(config_path)
         if local_address_ready(config):
             if not can_add:
@@ -410,7 +421,7 @@ def shipping(flow, config_path, auth_path=None):
         payload.update({address + '.' + k: details[k] for k in ('lastName', 'firstName')})
         payload.update({address + '.street': config['address']['street'], address + '.street2': config.get('address', {}).get('street2', ''),
                         address + '.copyContact.fullDaytimePhone': details['fullDaytimePhone'],
-                        path + '.addressSelector.newAddress.saveToAddressBook': 'false' if automatic_checkout() else 'true'})
+                        path + '.addressSelector.newAddress.saveToAddressBook': 'false' if automatic_options() else 'true'})
         email = details['emailAddress']
         print('收货地址：' + ' '.join(config['delivery'].values()) + ' ' + config['address']['street'])
     else:

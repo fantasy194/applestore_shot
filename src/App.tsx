@@ -76,7 +76,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [dispatching, setDispatching] = useState(false);
   const [sku, setSku] = useState("MK2M4CH");
-  const [quantity, setQuantity] = useState(2);
+  const [quantity, setQuantity] = useState(1);
   const [taskTarget, setTaskTarget] = useState<Task | null>(null);
   const [focusTaskId, setFocusTaskId] = useState("");
   const [removingAccount, setRemovingAccount] = useState<Account | null>(null);
@@ -153,7 +153,7 @@ export default function App() {
   useLayoutEffect(() => setRevealed(false), [accountId, setRevealed]);
   useEffect(() => {
     setSku(account?.preset_sku || "MK2M4CH");
-    setQuantity(account?.preset_quantity || 2);
+    setQuantity(account?.preset_quantity || 1);
   }, [account?.id, account?.preset_sku, account?.preset_quantity]);
   const tasks = snapshot.tasks
     .filter((t) => t.account_id === accountId)
@@ -600,7 +600,7 @@ export default function App() {
                           <p className="muted">
                             {sku === "MLH74FE"
                               ? "抛光布测试：自动送货并填写地址、联系方式，核对商品、数量、金额和地址后直接创建真实待付款订单，展示支付二维码。"
-                              : "固定送货，优先使用本地地址和联系方式。白色 256GB、1 台且总额不超过 15,999 元时自动创建订单；型号、数量或金额不符会停止。"}
+                              : "固定送货，优先使用本地地址和联系方式。当前账号已启用的商品可自动创建订单：Duo 白色 256GB 上限 15,999 元、512GB 上限 17,999 元，iPhone 18 Pro 银色 256GB 上限 9,999 元；均为 1 台、不加 AppleCare+。型号、数量或金额不符会停止。"}
                           </p>
                           <div className="button-row">
                             <button

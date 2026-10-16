@@ -747,6 +747,11 @@ class AppleStoreLogin:
             log.info('商城回调响应后 myacinfo 已不可发送，按服务器返回的凭证有效期处理；后续结算可能再次要求账号认证。')
         if response.status_code == 541:
             self.mark_rejected_browser_context()
+            log.info('商城回调诊断：HTTP 541；Content-Type=%s；响应字节数=%s；'
+                     'Apple 账号认证已完成；未记录响应正文或凭据。',
+                     response.headers.get('Content-Type', ''), len(response.content))
+            raise LoginError('Apple 账号认证已完成，但商城会话交换被拒绝（HTTP 541）。'
+                             '这不是验证码错误；商城登录尚未完成。', status=541)
         data = self.expect(response, (200,))
         head = data.get("head", {}) if isinstance(data, dict) else {}
         target = head.get("data", {}).get("url")

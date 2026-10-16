@@ -87,15 +87,22 @@ export function ProductSelect({
 }) {
   const known = presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, ""));
   return (
-    <SelectField
-      label="预制商品"
-      value={known ? sku.replace(/\/A$/i, "") : ""}
-      onChange={onChange}
-      options={presetProducts.map((p) => ({
+    <>
+      <SelectField
+        label="预制商品"
+        value={known ? sku.replace(/\/A$/i, "") : ""}
+        onChange={onChange}
+        options={presetProducts.map((p) => ({
           value: p.sku,
           label: `${p.name} · ${p.sku}`,
         }))}
-    />
+      />
+      {sku.replace(/\/A$/i, "").toUpperCase() === "MJT84CH" && (
+        <p className="muted">
+          此预设只加购手机，不主动添加 AppleCare+。结算时会核对实际商品、数量、支付方式，以及当前账号已启用的金额上限。
+        </p>
+      )}
+    </>
   );
 }
 type PageProps = {
@@ -235,7 +242,7 @@ function PurchasePreset({
   refresh: () => Promise<void>;
 }) {
   const [sku, setSku] = useState(account.preset_sku || "MK2M4CH");
-  const [quantity, setQuantity] = useState(account.preset_quantity || 2);
+  const [quantity, setQuantity] = useState(account.preset_quantity || 1);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);

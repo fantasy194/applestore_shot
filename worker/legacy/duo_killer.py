@@ -1071,12 +1071,67 @@ def checkout_billing(flow):
     flow.action("checkout.billing", "continueFromBillingToReview", data)
 
 
+def selected_applecare(model):
+    """Inspect purchased rows and selected-plan state, not serialized field names."""
+    if isinstance(model, list):
+        return any(selected_applecare(item) for item in model)
+    if not isinstance(model, dict):
+        return False
+    data = model.get('d', model)
+    if isinstance(data, dict):
+        flags = ('hasAppleCare', 'hasAppleCareInstallment', 'isAppleCareSelected',
+                 'appleCareSelected', 'appleCareIncluded')
+        if any(data.get(flag) is True for flag in flags):
+            return True
+        names = [data.get(key) for key in ('name', 'productName', 'productTitle', 'title')]
+        named_plan = any(isinstance(name, str) and re.search(r'apple\s*care', name, re.I) for name in names)
+        if named_plan and (field(model, 'itemQuantity.d.quantity', 0) > 0
+                           or data.get('selected') is True or data.get('isSelected') is True):
+            return True
+    for key, child in model.items():
+        normalized = re.sub(r'[^a-z]', '', key.lower())
+        if normalized in ('applecare', 'applecareplus', 'serviceplan', 'coverageplan') and isinstance(child, dict):
+            plan = child.get('d', child)
+            if isinstance(plan, dict):
+                if any(plan.get(flag) is False for flag in ('selected', 'isSelected', 'included')):
+                    continue
+                if any(isinstance(plan.get(name), str) and re.search(r'apple\s*care', plan[name], re.I)
+                       for name in ('name', 'productName', 'productTitle', 'title')):
+                    return True
+        if selected_applecare(child):
+            return True
+    return False
+
+
 def pay_review(flow, expected, *, prepare_only=False):
     review = checkout_review(flow)
-    if (field(review, "placeOrder.d.enableContinue") is not True or
-            field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY" or
-            model_items(review.get("fulfillmentReview", {})) != expected):
-        raise ValueError("订单复核未通过：商品、数量、支付方式或下单状态不符合预期。")
+    if model_items(review.get("fulfillmentReview", {})) != expected:
+        raise ValueError("订单复核未通过：官网商品或数量与预期不一致；未提交订单。")
+    # A fresh Review HTML can omit the payment-specific child entirely. Use
+    # Apple's declared edit action to rebuild Billing, rather than assuming
+    # the previous selection survived. Never replay the final order action.
+    if field(review, "billingReview.alipayReview.d.alipayLabel") is None:
+        if not field(review, "billingReview.a.edit.url"):
+            raise ValueError("订单复核未通过：官网未返回支付方式且无法重新选择；未提交订单。")
+        log.info("[订单复核] 确认页缺少支付方式详情，返回付款步骤重新选择支付宝。")
+        flow.model['checkout'].pop('billing', None)
+        flow.action("checkout.review.billingReview", "edit")
+        # Do not retain an old review fragment if the server's partial response
+        # includes Billing without explicitly removing Review.
+        if not isinstance(field(flow.model, "checkout.billing.billingOptions"), dict):
+            raise ValueError("订单复核未通过：未能返回付款方式步骤；未提交订单。")
+        flow.model['checkout'].pop('review', None)
+        checkout_billing(flow)
+        review = checkout_review(flow)
+    if model_items(review.get("fulfillmentReview", {})) != expected:
+        raise ValueError("订单复核未通过：重新选择支付方式后商品或数量发生变化；未提交订单。")
+    if field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY":
+        raise ValueError("订单复核未通过：官网未确认支付方式为支付宝；未提交订单。")
+    if field(review, "placeOrder.d.enableContinue") is not True:
+        raise ValueError("订单复核未通过：官网当前不允许提交订单；未提交订单。")
+    if getattr(interaction.handler, 'automatic_checkout', False) is True:
+        if selected_applecare(review.get('fulfillmentReview', {})):
+            raise ValueError('订单复核显示已选择 AppleCare 服务，不符合仅购买裸机的预设；未提交订单。')
     if len(expected) == 1 and getattr(interaction.handler, 'automatic_checkout', False):
         config = ROOT / "checkout.json"
         write_private_json(ROOT / "prepared_checkout.json", {'sku': expected[0][0], 'quantity': expected[0][1],

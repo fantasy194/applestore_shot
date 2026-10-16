@@ -59,7 +59,7 @@ export const localDefaults: Account = {
   name: "通用预设",
   email: "",
   preset_sku: "MK2M4CH",
-  preset_quantity: 2,
+  preset_quantity: 1,
 };
 export const active = (task: Task) =>
   ["queued", "running", "waiting"].includes(task.status);

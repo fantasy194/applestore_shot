@@ -79,7 +79,7 @@ fn default_sku() -> String {
     "MK2U4CH".into()
 }
 fn default_quantity() -> u32 {
-    2
+    1
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Task {

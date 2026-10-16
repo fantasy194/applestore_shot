@@ -124,7 +124,7 @@ class OrderFailureMatrixTests(unittest.TestCase):
                     self.assertFalse((self.root / 'order_submission.json').exists())
                     qr.assert_not_called()
 
-    def test_server_creates_order_but_reply_is_lost_blocks_restart(self):
+    def test_lost_order_reply_is_not_replayed_but_allows_a_new_requested_task(self):
         flow = fixtures.AutoOrderFlow()
         original = flow.action
         def action(module, name, data=None):
@@ -139,9 +139,10 @@ class OrderFailureMatrixTests(unittest.TestCase):
         self.assertEqual(flow.submissions, 1)
         self.assertEqual(json.loads(self.service.submission_path().read_text())['state'], 'submission_unknown')
         restarted = Service(self.service.channel, self.root, self.root, 'fixture@example.test', Mock())
-        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaisesRegex(ValueError, '阻止重复锁单'):
-            restarted.run('purchase', {'sku': 'MK2M4CH', 'quantity': 1})
-        purchase.assert_not_called()
+        with patch.object(duo_killer, 'purchase_sku', side_effect=ValueError('server rejects new order')) as purchase:
+            with self.assertRaisesRegex(ValueError, 'server rejects new order'):
+                restarted.run('purchase', {'sku': 'MK2M4CH', 'quantity': 1})
+        purchase.assert_called_once()
 
     def test_poll_failure_or_missing_payment_link_never_resubmits(self):
         for error in [requests.Timeout(), ValueError('订单仍在处理中'), ValueError('unexpected payment link')]:

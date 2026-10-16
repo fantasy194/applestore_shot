@@ -5,6 +5,7 @@ export const duoProducts = [
 ];
 export const presetProducts = [
   ...duoProducts,
+  { sku: "MJT84CH", name: "iPhone 18 Pro 256GB 银色", price: 9999 },
   { sku: "MLH74FE", name: "抛光布", price: 69 },
 ];
 export const priceText = (value: unknown) =>

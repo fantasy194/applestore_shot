@@ -308,10 +308,89 @@ class CheckoutOptionsTests(unittest.TestCase):
                 region['d'].update(state=state, city=city,
                                    stateOptions=[{'value': state, 'label': state}])
                 region['d'].pop('cityOptions')
+                region['a'].pop('Selectstate')
                 flow = FakeFlow({'region': region})
                 with self.assertRaisesRegex(ValueError, '城市：没有可选项'):
                     options.region_data(flow, 'region', {'state': state, 'city': '上海'})
                 self.assertEqual(flow.calls, [])
+
+    def test_fresh_municipality_hydrates_districts_from_declared_state_action(self):
+        region = deepcopy(REGION)
+        region['d'].update(state='上海', city='上海', district='',
+                           stateOptions=[{'value': '上海', 'label': '上海'}],
+                           cityOptions=None, districtOptions=[])
+        flow = FakeFlow({'region': region})
+        original = flow.action
+        def action(module, name, data=None):
+            original(module, name, data)
+            if name == 'Selectstate':
+                flow.model['region']['d'].update(city='上海', cityOptions=None,
+                    districtOptions=[{'value': '闵行区', 'label': '闵行区'}])
+        flow.action = action
+        with patch('builtins.input', side_effect=AssertionError('本地地址不应要求选择地区')):
+            data = options.region_data(flow, 'region', {'state':'上海','city':'上海','district':'闵行区'})
+        self.assertEqual(data['region.district'], '闵行区')
+        self.assertEqual([name for _, name, _ in flow.calls], ['Selectstate', 'Selectdistrict'])
+        self.assertEqual(flow.calls[0][2]['region.city'], '')
+        self.assertEqual(flow.calls[0][2]['region.district'], '')
+
+    def test_post_login_municipality_response_does_not_echo_submitted_state(self):
+        region = deepcopy(REGION)
+        region['d'].update(state='', city='龙岩市', district='',
+                           stateOptions=[{'value': '上海', 'label': '上海'}],
+                           cityOptions=[], districtOptions=[])
+        flow = FakeFlow({'region': region})
+        def action(module, name, data=None):
+            flow.calls.append((module, name, deepcopy(data)))
+            if name == 'Selectstate':
+                # Actual Apple partial response: state is absent, so merge
+                # retains the empty state from the post-login checkout page.
+                flow.model['region']['d'].update(city='上海', cityOptions=[],
+                    districtOptions=[{'value': '闵行区', 'label': '闵行区'}])
+        flow.action = action
+        with patch('builtins.input', side_effect=AssertionError('不应询问固定城市')):
+            data = options.region_data(flow, 'region', {'state':'上海','city':'上海','district':'闵行区'})
+        self.assertEqual(data['region.state'], '上海')
+        self.assertEqual(data['region.city'], '上海')
+        self.assertEqual(data['region.district'], '闵行区')
+        self.assertEqual([name for _, name, _ in flow.calls], ['Selectstate', 'Selectdistrict'])
+        self.assertEqual(flow.calls[-1][2]['region.state'], '上海')
+
+    def test_municipality_city_cannot_override_a_conflicting_server_state(self):
+        region = deepcopy(REGION)
+        region['d'].update(state='', city='', district='',
+                           stateOptions=[{'value': '上海', 'label': '上海'}],
+                           cityOptions=[], districtOptions=[])
+        flow = FakeFlow({'region': region})
+        def action(module, name, data=None):
+            flow.calls.append((module, name, deepcopy(data)))
+            flow.model['region']['d'].update(state='四川', city='上海')
+        flow.action = action
+        with self.assertRaisesRegex(ValueError, '城市：没有可选项'):
+            options.region_data(flow, 'region', {'state':'上海','city':'上海','district':'闵行区'})
+        self.assertEqual([name for _, name, _ in flow.calls], ['Selectstate'])
+
+    def test_unchanged_city_hydrates_missing_districts_once(self):
+        region = deepcopy(REGION)
+        region['d'].update(district='', districtOptions=[])
+        flow = FakeFlow({'region': region})
+        original = flow.action
+        def action(module, name, data=None):
+            original(module, name, data)
+            if name == 'Selectcity':
+                flow.model['region']['d']['districtOptions'] = deepcopy(REGION['d']['districtOptions'])
+        flow.action = action
+        data = options.region_data(flow, 'region', CONFIG['delivery'])
+        self.assertEqual(data['region.district'], '锦江区')
+        self.assertEqual([name for _, name, _ in flow.calls], ['Selectcity', 'Selectdistrict'])
+
+    def test_hydration_with_no_returned_options_still_stops(self):
+        region = deepcopy(REGION)
+        region['d'].update(district='', districtOptions=[])
+        flow = FakeFlow({'region': region})
+        with self.assertRaisesRegex(ValueError, '区县：没有可选项'):
+            options.region_data(flow, 'region', CONFIG['delivery'])
+        self.assertEqual([name for _, name, _ in flow.calls], ['Selectcity'])
 
     def test_district_exact_match_wins_over_suffix_match(self):
         flow = FakeFlow({'region': deepcopy(REGION)})

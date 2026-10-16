@@ -19,6 +19,7 @@ payment*.json
 payment*.png
 automation.json
 order_submission.json
+order_history.json
 test_order_submission.json
 test_order_history.json
 order_cancellations.json
@@ -29,6 +30,10 @@ warm_empty_bag.json
 .chrome-profile/
 .env
 .env.*
+.tools/
+.pnpm-store/
+.local-data/
+.local-runtime/
 .dev-web.json
 .dev-web.json.*.tmp
 accounts/

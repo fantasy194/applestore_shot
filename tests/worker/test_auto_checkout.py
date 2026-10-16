@@ -16,12 +16,13 @@ from test_checkout_options import CONFIG, FakeFlow, fulfillment_model, shipping_
 
 
 class AutoOrderFlow(FakeFlow):
-    def __init__(self, fail_submission=False):
-        item = {'d': {'sku': 'MK2M4CH/A', 'name': 'Duo', 'totalPrice': 'RMB 15,999'},
+    def __init__(self, fail_submission=False, *, sku='MK2M4CH/A', total='RMB 15,999'):
+        item = {'d': {'sku': sku, 'name': 'Duo' if sku in ('MK2M4CH/A', 'MK2P4CH/A') else 'iPhone 18 Pro', 'totalPrice': total},
                 'itemQuantity': {'d': {'quantity': 1}}}
         super().__init__({'shoppingCart': {'items': {'item-0': item},
                          'actions': {'a': {'checkout': {'url': '/shop/checkoutx'}}}}})
         self.item = item
+        self.total = total
         self.headers = {'x-aos-stk': 'fixture'}
         self.fail_submission = fail_submission
         self.submissions = 0
@@ -34,7 +35,7 @@ class AutoOrderFlow(FakeFlow):
             elif name == 'continueFromBillingToReview':
                 self.model = {'checkout': {'review': {
                     'fulfillmentReview': {'item-0': deepcopy(self.item)},
-                    'summary': {'d': {'total': 'RMB 15,999'}},
+                    'summary': {'d': {'total': self.total}},
                     'placeOrder': {'d': {'enableContinue': True}},
                     'billingReview': {'alipayReview': {'d': {'alipayLabel': 'ALIPAY'}}}},
                     'companionBar': {'orderDetails': {'shippingCompanionBar': {'address': {'d': {'street': CONFIG['address']['street']}}}}}}}
@@ -44,7 +45,7 @@ class AutoOrderFlow(FakeFlow):
                     raise requests.Timeout()
                 self.url = 'https://secure.www.apple.com.cn/shop/checkout/interstitial'
                 self.model = {'externalPayAuth': {'d': {'externalUrl': 'https://openapi.alipay.com/gateway.do?fixture=only',
-                    'orderNumber': 'TEST-ONLY-001', 'amountDue': 'RMB 15,999'}}}
+                    'orderNumber': 'TEST-ONLY-001', 'amountDue': self.total}}}
         else:
             super().action(module, name, data)
             if name == 'continueFromShippingToBilling':
@@ -84,6 +85,22 @@ class AutoCheckoutTests(unittest.TestCase):
         self.assertEqual(flow.calls[-1][2]['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'HOME')
         self.service.channel.prompt.assert_not_called()
 
+    def test_prefill_uses_saved_delivery_but_still_requests_final_confirmation(self):
+        self.service.automatic_checkout = False
+        self.service.prefill_checkout = True
+        delivery = FakeFlow(fulfillment_model())
+        checkout_options.fulfillment(delivery, self.service.checkout)
+        shipping = FakeFlow(shipping_model(invoice=True))
+        checkout_options.shipping(shipping, self.service.checkout)
+        self.service.channel.prompt.assert_not_called()
+        self.assertEqual(delivery.calls[-1][2]['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'HOME')
+        self.assertEqual(shipping.calls[-1][2]['checkout.shipping.addressSelector.newAddress.address.street'], CONFIG['address']['street'])
+        self.service.channel.prompt.side_effect = None
+        self.service.channel.prompt.return_value = False
+        self.assertFalse(self.service.confirm(self.details()))
+        self.service.channel.prompt.assert_called_once()
+        self.assertEqual(self.service.channel.prompt.call_args.args[:2], ('confirm', '确认商品与金额，创建订单'))
+
     def test_local_address_wins_over_the_official_saved_address(self):
         flow = FakeFlow(shipping_model(invoice=True))
         checkout_options.shipping(flow, self.service.checkout)
@@ -117,6 +134,129 @@ class AutoCheckoutTests(unittest.TestCase):
         self.assertIs(self.service.confirm(self.details()), True)
         self.service.channel.prompt.assert_not_called()
 
+    def enable_both_phones(self):
+        self.service.order_policy = {'enabled': True, 'products': [
+            {'sku': 'MK2M4CH', 'quantity': 1, 'max_total': '15999.00'},
+            {'sku': 'MJT84CH', 'quantity': 1, 'max_total': '9999.00'}]}
+
+    def test_both_phone_policies_enforce_their_own_amount_limits(self):
+        self.enable_both_phones()
+        self.assertTrue(self.service.confirm(self.details()))
+        details = self.details()
+        details['items'][0]['sku'] = 'MJT84CH/A'
+        details['total'] = 'RMB 9,999'
+        self.assertTrue(self.service.confirm(details))
+        details['total'] = 'RMB 9,999.01'
+        with self.assertRaisesRegex(ValueError, '上限 9999.00'):
+            self.service.confirm(details)
+        self.service.channel.prompt.assert_not_called()
+
+    def test_phone_policy_rejects_unapproved_items_before_add_to_bag(self):
+        self.enable_both_phones()
+        with patch.object(duo_killer, 'purchase_sku') as purchase:
+            for sku, quantity in (('MLH74FE', 1), ('MJT74CH', 1), ('MJT84CH', 2)):
+                with self.subTest(sku=sku, quantity=quantity), self.assertRaises(ValueError):
+                    self.service.run('purchase', {'sku': sku, 'quantity': quantity})
+            purchase.assert_not_called()
+
+    def enable_duo_512(self):
+        self.enable_both_phones()
+        self.service.order_policy['products'].append({
+            'sku': 'MK2P4CH', 'quantity': 1, 'max_total': '17999.00'})
+
+    def test_duo_512_has_its_own_amount_cap_and_quantity_guard(self):
+        self.enable_duo_512()
+        details = self.details()
+        details['items'][0]['sku'] = 'MK2P4CH/A'
+        details['total'] = 'RMB 17,999'
+        self.assertTrue(self.service.confirm(details))
+        details['total'] = 'RMB 17,999.01'
+        with self.assertRaisesRegex(ValueError, '上限 17999.00'):
+            self.service.confirm(details)
+        details['total'] = 'RMB 17,999'
+        details['items'][0]['quantity'] = 2
+        with self.assertRaises(ValueError):
+            self.service.confirm(details)
+        self.service.channel.prompt.assert_not_called()
+
+    def test_duo_512_reaches_qr_with_single_order_submission_and_no_prompts(self):
+        self.enable_duo_512()
+        flow = AutoOrderFlow(sku='MK2P4CH/A', total='RMB 17,999')
+        image = self.root / 'payment-qr.png'
+        image.write_bytes(b'fixture-image')
+        with patch.object(duo_killer, 'purchase_sku', side_effect=lambda *a, **kw: duo_killer.pay_bag(flow=flow)), \
+                patch.object(duo_killer, 'save_auth'), \
+                patch.object(duo_killer, 'get_payment_qr', return_value={'qr_image': str(image)}):
+            result = self.service.run('purchase', {'sku': 'MK2P4CH', 'quantity': 1})
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual(result['items'][0]['sku'], 'MK2P4CH/A')
+        self.assertEqual(result['items'][0]['quantity'], 1)
+        self.assertTrue(result['qr_data'].startswith('data:image/png;base64,'))
+        self.service.channel.prompt.assert_not_called()
+
+    def test_duo_512_remains_opt_in_and_rejects_modified_cap(self):
+        self.enable_both_phones()
+        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaises(ValueError):
+            self.service.run('purchase', {'sku': 'MK2P4CH', 'quantity': 1})
+        purchase.assert_not_called()
+        self.enable_duo_512()
+        self.service.order_policy['products'][-1]['max_total'] = '18000.00'
+        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaises(ValueError):
+            self.service.run('purchase', {'sku': 'MK2P4CH', 'quantity': 1})
+        purchase.assert_not_called()
+
+    def test_phone_policy_requires_complete_local_address_before_purchase(self):
+        self.enable_both_phones()
+        checkout_options.save_config(self.service.checkout, {})
+        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaisesRegex(ValueError, '本地送货地址'):
+            self.service.run('purchase', {'sku': 'MJT84CH', 'quantity': 1})
+        purchase.assert_not_called()
+
+    def test_phone_with_attached_applecare_is_rejected_before_confirmation_or_submission(self):
+        self.enable_both_phones()
+        flow = AutoOrderFlow(sku='MJT84CH/A', total='RMB 9,999')
+        flow.action('checkout.billing', 'continueFromBillingToReview')
+        flow.model['checkout']['review']['fulfillmentReview']['item-0']['servicePlan'] = {'name': 'AppleCare+'}
+        with patch.object(duo_killer, 'confirm_order') as confirm, self.assertRaisesRegex(ValueError, 'AppleCare'):
+            duo_killer.pay_review(flow, [('MJT84CH/A', 1)])
+        confirm.assert_not_called()
+        self.assertEqual(flow.submissions, 0)
+
+    def test_unselected_applecare_flag_and_offer_do_not_block_phone_order(self):
+        self.enable_both_phones()
+        flow = AutoOrderFlow(sku='MJT84CH/A', total='RMB 9,999')
+        flow.item['d']['hasAppleCareInstallment'] = False
+        flow.item['appleCareOffer'] = {'title': '加购 AppleCare+ 服务计划'}
+        image = self.root / 'payment-qr.png'
+        image.write_bytes(b'fixture-image')
+        with patch.object(duo_killer, 'purchase_sku', side_effect=lambda *a, **kw: duo_killer.pay_bag(flow=flow)), \
+                patch.object(duo_killer, 'save_auth'), \
+                patch.object(duo_killer, 'get_payment_qr', return_value={'qr_image': str(image)}):
+            result = self.service.run('purchase', {'sku': 'MJT84CH', 'quantity': 1})
+        self.assertEqual(flow.submissions, 1)
+        self.assertTrue(result['qr_data'].startswith('data:image/png;base64,'))
+        self.service.channel.prompt.assert_not_called()
+
+    def test_selected_applecare_installment_is_still_rejected(self):
+        self.assertFalse(duo_killer.selected_applecare({'d': {'hasAppleCareInstallment': False}}))
+        self.assertTrue(duo_killer.selected_applecare({'d': {'hasAppleCareInstallment': True}}))
+        self.assertFalse(duo_killer.selected_applecare({'servicePlan': {'name': 'AppleCare+', 'selected': False}}))
+        self.assertTrue(duo_killer.selected_applecare({'servicePlan': {'name': 'AppleCare+', 'selected': True}}))
+
+    def test_iphone_18_pro_reaches_qr_with_single_order_submission_and_no_prompts(self):
+        self.enable_both_phones()
+        flow = AutoOrderFlow(sku='MJT84CH/A', total='RMB 9,999')
+        image = self.root / 'payment-qr.png'
+        image.write_bytes(b'fixture-image')
+        with patch.object(duo_killer, 'purchase_sku', side_effect=lambda *a, **kw: duo_killer.pay_bag(flow=flow)), \
+                patch.object(duo_killer, 'save_auth'), \
+                patch.object(duo_killer, 'get_payment_qr', return_value={'qr_image': str(image)}):
+            result = self.service.run('purchase', {'sku': 'MJT84CH', 'quantity': 1})
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual(result['items'][0]['sku'], 'MJT84CH/A')
+        self.assertTrue(result['qr_data'].startswith('data:image/png;base64,'))
+        self.service.channel.prompt.assert_not_called()
+
     def test_review_address_works_without_companion_bar_and_rejects_mismatch(self):
         flow = AutoOrderFlow()
         flow.action('checkout.billing', 'continueFromBillingToReview')
@@ -143,14 +283,36 @@ class AutoCheckoutTests(unittest.TestCase):
             with self.subTest(details=details), self.assertRaises(ValueError):
                 self.service.confirm(details)
 
-    def test_submission_marker_survives_restart_and_blocks_another_purchase(self):
-        self.service.confirm(self.details())
-        self.service.stage('正在提交订单', order_submitted=True)
-        self.assertEqual(json.loads((self.root / 'order_submission.json').read_text())['state'], 'submission_unknown')
-        restarted = Service(self.service.channel, self.root, self.root, 'fixture@example.test', Mock())
-        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaisesRegex(ValueError, '阻止重复锁单'):
-            restarted.run('purchase', {'sku': 'MK2M4CH', 'quantity': 1})
-        purchase.assert_not_called()
+    def test_old_order_state_does_not_block_a_new_explicit_checkout(self):
+        for state in ('submission_unknown', 'pending_payment', 'cancelled'):
+            for action in ('purchase', 'checkout'):
+                with self.subTest(state=state, action=action):
+                    marker = self.root / 'order_submission.json'
+                    previous = {'state': state, 'order_number': 'TEST-OLD'}
+                    marker.write_text(json.dumps(previous))
+                    restarted = Service(self.service.channel, self.root, self.root, 'fixture@example.test', Mock())
+                    with patch.object(duo_killer, 'purchase_sku', return_value={'success': True}) as purchase, \
+                            patch.object(duo_killer, 'pay_bag', return_value={'success': True}) as checkout:
+                        restarted.run(action, {'sku': 'MK2M4CH', 'quantity': 1})
+                    (purchase if action == 'purchase' else checkout).assert_called_once()
+                    self.assertEqual(json.loads(marker.read_text()), previous)
+
+    def test_apple_rejection_of_another_order_reaches_the_user(self):
+        (self.root / 'order_submission.json').write_text(json.dumps({'state': 'pending_payment'}))
+        with patch.object(duo_killer, 'purchase_sku', side_effect=ValueError('Apple checkout rejected')) as purchase:
+            with self.assertRaisesRegex(ValueError, 'Apple checkout rejected'):
+                self.service.run('purchase', {'sku': 'MK2M4CH', 'quantity': 1})
+        purchase.assert_called_once()
+
+    def test_new_submission_keeps_previous_order_record_in_history(self):
+        for state in ('pending_payment', 'submission_unknown'):
+            with self.subTest(state=state):
+                previous = {'state': state, 'task_id': 'old-task', 'order_number': 'TEST-OLD'}
+                (self.root / 'order_submission.json').write_text(json.dumps(previous))
+                history = self.root / 'order_history.json'
+                history.unlink(missing_ok=True)
+                self.service.stage('正在提交订单', order_submitted=True)
+                self.assertEqual(json.loads(history.read_text()), [previous])
 
     def test_safe_read_retries_but_order_writes_are_sent_once(self):
         session = Mock()
@@ -357,11 +519,11 @@ class AutoCheckoutTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / 'test_order_history.json').read_text()), [previous])
         self.assertEqual(json.loads(marker.read_text())['order_number'], 'TEST-NEW')
 
-    def test_unknown_cloth_submission_still_blocks_repeat(self):
+    def test_unknown_cloth_submission_allows_an_explicit_repeat(self):
         (self.root / 'test_order_submission.json').write_text(json.dumps({'state': 'submission_unknown'}))
-        with patch.object(duo_killer, 'purchase_sku') as purchase, self.assertRaisesRegex(ValueError, '阻止重复锁单'):
+        with patch.object(duo_killer, 'purchase_sku', return_value={'success': True}) as purchase:
             self.service.run('purchase', {'sku': 'MLH74FE', 'quantity': 1})
-        purchase.assert_not_called()
+        purchase.assert_called_once()
 
     def test_already_selected_alipay_skips_selection_request(self):
         flow = AutoOrderFlow()
@@ -420,6 +582,78 @@ class AutoCheckoutTests(unittest.TestCase):
         add.assert_not_called()
         self.assertEqual(flow.submissions, 1)
         self.assertFalse((self.root / 'prepared_checkout.json').exists())
+
+    def resumed_review_without_payment(self):
+        flow = AutoOrderFlow()
+        flow.action('checkout.billing', 'continueFromBillingToReview')
+        flow.calls.clear()
+        flow.model['checkout']['review']['billingReview'] = {
+            'a': {'edit': {'url': '/fixture/edit-billing'}}}
+        original = flow.action
+        def action(module, name, data=None):
+            if (module, name) == ('checkout.review.billingReview', 'edit'):
+                flow.calls.append((module, name, data))
+                # Reproduce a partial response that leaves the old Review node.
+                flow.model['checkout']['billing'] = {'billingOptions': {
+                    'd': {'options': [{'value': 'ALIPAY'}]}}}
+            else:
+                original(module, name, data)
+        flow.action = action
+        return flow
+
+    def test_resume_missing_payment_reselects_alipay_then_rechecks_and_submits_once(self):
+        flow = self.resumed_review_without_payment()
+        with patch.object(duo_killer, 'save_auth'), patch.object(duo_killer, 'payment_qr'):
+            result = duo_killer.continue_checkout(flow, [('MK2M4CH/A', 1)])
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual([name for _, name, _ in flow.calls], [
+            'edit', 'continueFromBillingToReview', 'continueFromReviewToProcess'])
+        self.assertEqual(flow.submissions, 1)
+
+    def test_resume_missing_payment_preparation_does_not_submit(self):
+        flow = self.resumed_review_without_payment()
+        result = duo_killer.continue_checkout(flow, [('MK2M4CH/A', 1)], prepare_only=True)
+        self.assertEqual(result['status'], 'prepared')
+        self.assertEqual(flow.submissions, 0)
+
+    def test_resume_missing_payment_without_edit_stops(self):
+        flow = self.resumed_review_without_payment()
+        flow.model['checkout']['review']['billingReview'].pop('a')
+        with self.assertRaisesRegex(ValueError, '无法重新选择'):
+            duo_killer.continue_checkout(flow, [('MK2M4CH/A', 1)])
+        self.assertEqual(flow.calls, [])
+        self.assertEqual(flow.submissions, 0)
+
+    def test_resume_missing_payment_does_not_trust_stale_billing(self):
+        flow = self.resumed_review_without_payment()
+        flow.model['checkout']['billing'] = {'billingOptions': {
+            'd': {'options': [{'value': 'ALIPAY'}]}}}
+        flow.action = Mock()
+        with self.assertRaisesRegex(ValueError, '未能返回付款方式'):
+            duo_killer.continue_checkout(flow, [('MK2M4CH/A', 1)])
+        flow.action.assert_called_once_with('checkout.review.billingReview', 'edit')
+        self.assertEqual(flow.submissions, 0)
+
+    def test_resume_payment_recovery_rejects_changed_quantity_and_unconfirmed_payment(self):
+        for changed in ('quantity', 'payment', 'disabled'):
+            with self.subTest(changed=changed):
+                flow = self.resumed_review_without_payment()
+                original = flow.action
+                def action(module, name, data=None):
+                    original(module, name, data)
+                    if name == 'continueFromBillingToReview':
+                        review = flow.model['checkout']['review']
+                        if changed == 'quantity':
+                            review['fulfillmentReview']['item-0']['itemQuantity']['d']['quantity'] = 2
+                        elif changed == 'payment':
+                            review['billingReview'] = {}
+                        else:
+                            review['placeOrder']['d']['enableContinue'] = False
+                flow.action = action
+                with self.assertRaisesRegex(ValueError, '订单复核未通过'):
+                    duo_killer.continue_checkout(flow, [('MK2M4CH/A', 1)])
+                self.assertEqual(flow.submissions, 0)
+                self.assertEqual(sum(name == 'edit' for _, name, _ in flow.calls), 1)
 
     def test_changed_address_or_expired_preparation_falls_back_to_bag(self):
         for changed in ('address', 'expired'):
