@@ -701,6 +701,22 @@ impl Engine {
         let mut runtime=self.queue_runtime.lock().unwrap();
         if runtime.coordinators.get(account).is_none_or(|coordinator|coordinator.task_id!=task) {return}
         let kind=event["type"].as_str().unwrap_or("");
+        // Stage text belongs to one assigned target, never the whole coordinator.
+        // Keep this presentation update separate from result/dispatch/stop handling.
+        if kind=="stage" {
+            let Some(id)=event["queue_job_id"].as_str() else {return};
+            let Some(assignment)=event["queue_assignment"].as_u64() else {return};
+            let Some(message)=event["message"].as_str().map(str::trim).filter(|message|!message.is_empty()) else {return};
+            let Some(job)=queue.jobs.iter_mut().find(|job|job.id==id&&job.account_id==account
+                &&job.task_id.as_deref()==Some(task)&&job.assignment==assignment
+                &&matches!(job.status.as_str(),"dispatched"|"running")) else {return};
+            let message:String=message.chars().take(2000).collect();
+            if job.message!=message {
+                job.message=message;
+                if queue.save(&self.root).is_err() {queue.paused=true;}
+            }
+            return;
+        }
         if kind=="queue_ready" {if let Some(coordinator)=runtime.coordinators.get_mut(account){coordinator.ready=true;}}
         if kind=="queue_idle" {if let Some(coordinator)=runtime.coordinators.get_mut(account){coordinator.idle=true;}}
         if let Some(id)=event["queue_job_id"].as_str() {
@@ -1107,6 +1123,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_stage_updates_only_the_matching_target_message() {
+        let (root,engine,host,account)=fixture();
+        engine.queue_command(host.clone(),"configure",&json!({"mode":"parallel","max_concurrency":2})).unwrap();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);engine.queue_pump_once();
+        let initial=jobs(&engine);assert_eq!(initial.len(),2);assert_eq!(initial[0].task_id,initial[1].task_id);
+        let job=&initial[0];let task=job.task_id.as_deref().unwrap();
+        let event=json!({"type":"stage","queue_job_id":job.id,"queue_assignment":job.assignment,
+            "message":"  正在核对取货时段  ","order_submitted":true,"result":{"status":"submission_unknown"}});
+        engine.queue_worker_event(&account,task,&event);
+        let mut expected=serde_json::to_value(&initial).unwrap();expected[0]["message"]=json!("正在核对取货时段");
+        assert_eq!(serde_json::to_value(jobs(&engine)).unwrap(),expected);
+        assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.is_empty());
+        let disk:Value=serde_json::from_slice(&fs::read(root.path().join("settings/purchase_queue.json")).unwrap()).unwrap();
+        assert_eq!(disk["jobs"][0]["message"],"正在核对取货时段");
+        // Both dispatched and running targets publish a step, independently.
+        ack(&engine,&initial[1],"queue_started",Value::Null);
+        engine.queue_worker_event(&account,task,&json!({"type":"stage","queue_job_id":initial[1].id,
+            "queue_assignment":initial[1].assignment,"message":"核".repeat(2100)}));
+        let updated=jobs(&engine);assert_eq!(updated[0].message,"正在核对取货时段");
+        assert_eq!(updated[1].message,"核".repeat(2000));assert_eq!(updated[1].status,"running");
+        assert!(updated[1].result.is_none());assert!(!updated[1].order_submitted);
+    }
+
+    #[tokio::test]
+    async fn queue_stage_rejects_stale_ownership_empty_and_inactive_updates() {
+        let (_root,engine,host,account)=fixture();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();
+        let job=jobs(&engine)[0].clone();let task=job.task_id.as_deref().unwrap();
+        let event=json!({"type":"stage","queue_job_id":job.id,"queue_assignment":job.assignment,"message":"正在确认金额"});
+        let before=serde_json::to_value(jobs(&engine)).unwrap();
+        engine.queue_worker_event("another-account",task,&event);
+        engine.queue_worker_event(&account,"another-task",&event);
+        for (key,value) in [("queue_job_id",json!("another-job")),("queue_assignment",json!(job.assignment+1)),
+            ("queue_assignment",Value::Null),("message",json!(" \n\t ")),("message",Value::Null)] {
+            let mut invalid=event.clone();invalid[key]=value;
+            engine.queue_worker_event(&account,task,&invalid);
+        }
+        assert_eq!(serde_json::to_value(jobs(&engine)).unwrap(),before);
+        // A late stage must preserve cancellation attention and every terminal result.
+        for status in ["queued","waiting_stock","cancelling","cancelled","succeeded","failed","interrupted","submission_unknown"] {
+            {
+                let mut queue=engine.purchase_queue.lock().unwrap();let current=&mut queue.jobs[0];
+                current.status=status.into();current.message="保留停止或处理结果".into();
+                current.result=Some(json!({"status":status}));current.order_submitted=true;
+            }
+            let before=serde_json::to_value(jobs(&engine)).unwrap();
+            engine.queue_worker_event(&account,task,&event);
+            assert_eq!(serde_json::to_value(jobs(&engine)).unwrap(),before,"{status}");
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_submission_blocks_only_its_account_and_never_replays_job() {
         let (_root,engine,host,account)=fixture();let at=now_ms();observe(&engine,&host,vec![target(&account,"R390",at),target(&account,"R391",at)]);engine.queue_pump_once();
         let first=jobs(&engine)[0].clone();ready(&engine,&first);
@@ -1250,6 +1318,11 @@ mod tests {
         assert_eq!(outcomes.len(),1);assert_eq!(outcomes[0]["status"],"queued");engine.queue_pump_once();
         assert!(bridge_wait(||bridge_audit(&audit.join("children.jsonl")).iter().any(|entry|entry["type"]=="start")).await,
             "priority child missing: {}",json!(bridge_audit(&audit.join("protocol.jsonl"))));
+        assert!(bridge_wait(|| {
+            let current=jobs(&engine);
+            bridge_audit(&audit.join("protocol.jsonl")).iter().any(|event|event["type"]=="stage"
+                &&event["queue_job_id"]==current[0].id&&event["message"]==current[0].message)
+        }).await,"assigned target stage was not routed from the real worker");
         let starts=bridge_audit(&audit.join("children.jsonl"));assert_eq!(starts.len(),1);assert_eq!(starts[0]["store_id"],"R002");
         assert_eq!(starts[0]["pickup_policy"]["stores"].as_array().unwrap().len(),2);
         assert_eq!(starts[0]["pickup_policy"]["stores"][0]["store_id"],"R002");

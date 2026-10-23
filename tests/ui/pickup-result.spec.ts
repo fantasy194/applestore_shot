@@ -118,7 +118,7 @@ test("候选池下单展示实际选店和时段，不把库存发现门店当�
   await expect(queue.locator(".queue-job-heading")).toContainText(
     "MLH74FE · 实际二店",
   );
-  await queue.getByText("任务详情", { exact: true }).click();
+  await queue.locator('summary[aria-label="任务详情"]').click();
   await expect(queue).toContainText("优先一店 (R001) → 实际二店 (R002)");
   await expect(queue).toContainText("取货时段：2026-10-24 10:00–10:30");
   await page.evaluate(() => {

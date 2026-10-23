@@ -1,9 +1,54 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { Download, RefreshCw, SlidersHorizontal } from "lucide-react";
 import type { Bridge } from "./api";
 import type { Account, Data } from "./types";
 import { useAccountPrivacy } from "./AccountPrivacy";
 import { SelectField } from "./SelectField";
+import { DisclosureSummary } from "./DisclosureSummary";
+
+const categoryNames: Record<string, string> = {
+  inventory: "库存监控",
+  stock: "有货事件",
+  queue: "执行队列",
+  authentication: "登录/会话",
+  proxy: "代理池",
+  purchase: "下单",
+  operation: "操作",
+};
+function logTime(entry: Data) {
+  const date = new Date(Number(entry.ts_ms ?? entry.ts));
+  if (!Number.isFinite(date.valueOf()))
+    return {
+      day: "日期未知",
+      time: "时间未知",
+      full: "时间未知",
+      iso: undefined,
+    };
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  const day = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+  return { day, time, full: `${day} ${time}`, iso: date.toISOString() };
+}
+function logLevel(entry: Data) {
+  const raw = String(entry.level || "info").toLowerCase();
+  if (raw === "warn" || raw === "warning")
+    return { tone: "warning", text: "WARN" };
+  if (["error", "fatal", "critical"].includes(raw))
+    return { tone: "error", text: "ERROR" };
+  if (raw === "debug") return { tone: "debug", text: "DEBUG" };
+  return { tone: "info", text: raw.toUpperCase() };
+}
+function logMessage(entry: Data) {
+  const message = String(entry.message || entry.event || "无说明");
+  const context = [
+    entry.details?.store_name || entry.details?.store_id,
+    entry.details?.sku,
+  ].filter(
+    (value): value is string =>
+      typeof value === "string" && !!value && !message.includes(value),
+  );
+  return [message, ...context].join(" · ");
+}
 
 const readFilters = () => {
   const query = new URLSearchParams(location.hash.split("?")[1] || "");
@@ -167,7 +212,7 @@ export function ActivityLogs({
       <header className="local-heading">
         <div>
           <h1>运行日志</h1>
-          <p>按需读取记录，后台保留完整历史</p>
+          <p>最新在前 · 点按记录展开完整内容</p>
         </div>
         <button
           disabled={loading}
@@ -214,7 +259,7 @@ export function ActivityLogs({
             open={filtersOpen}
             onToggle={(event) => setFiltersOpen(event.currentTarget.open)}
           >
-            <summary>
+            <DisclosureSummary>
               <span>
                 <SlidersHorizontal size={16} />
                 筛选日志
@@ -224,7 +269,7 @@ export function ActivityLogs({
                   ? `已选 ${Object.values(filters).filter(Boolean).length} 项条件`
                   : "全部记录"}
               </small>
-            </summary>
+            </DisclosureSummary>
             <div className="log-filters">
               <SelectField
                 label="日志账号"
@@ -263,18 +308,7 @@ export function ActivityLogs({
                   { value: "", label: "全部类别" },
                   ...categories.map((category) => ({
                     value: category,
-                    label:
-                      (
-                        {
-                          inventory: "库存监控",
-                          stock: "有货事件",
-                          queue: "执行队列",
-                          authentication: "登录/会话",
-                          proxy: "代理池",
-                          purchase: "下单",
-                          operation: "操作",
-                        } as Record<string, string>
-                      )[category] || category,
+                    label: categoryNames[category] || category,
                   })),
                 ]}
               />
@@ -317,41 +351,85 @@ export function ActivityLogs({
               {loading ? "正在读取日志…" : "没有符合筛选条件的日志。"}
             </p>
           )}
-          <div className="log-entries" aria-label="运行日志记录">
-            {entries.map((entry) => (
-              <article
-                className={`ui-panel log-entry ${entry.level || "info"}`}
-                key={entry.id}
-              >
-                <div>
-                  <time>
-                    {new Date(Number(entry.ts_ms ?? entry.ts)).toLocaleString(
-                      "zh-CN",
-                    )}
-                  </time>
-                  <span>
-                    {entry.level || "info"} · {entry.category || "task"}
-                  </span>
-                </div>
-                <p>{format(entry.message || entry.event || "无说明")}</p>
-                <small>
-                  {format(
-                    accounts.find((account) => account.id === entry.account_id)
-                      ?.name ||
-                      entry.account_id ||
-                      "通用工作空间",
+          <div className="log-entries" role="region" aria-label="运行日志记录">
+            {entries.map((entry, index) => {
+              const time = logTime(entry);
+              const level = logLevel(entry);
+              const message = format(logMessage(entry));
+              const account = format(
+                accounts.find((row) => row.id === entry.account_id)?.name ||
+                  entry.account_id ||
+                  "通用工作空间",
+              );
+              return (
+                <Fragment key={entry.id}>
+                  {(index === 0 ||
+                    logTime(entries[index - 1]).day !== time.day) && (
+                    <h2 className="log-date">{time.day}</h2>
                   )}
-                  {entry.task_id ? ` · ${entry.task_id}` : ""}
-                  {entry.action ? ` · ${entry.action}` : ""}
-                </small>
-                {entry.details && Object.keys(entry.details).length > 0 && (
-                  <details className="ui-disclosure log-details">
-                    <summary>查看日志详情</summary>
-                    <pre>{format(JSON.stringify(entry.details, null, 2))}</pre>
+                  <details
+                    className="log-entry"
+                    data-level={level.tone}
+                    data-log-id={entry.id}
+                  >
+                    <DisclosureSummary className="log-line">
+                      <time
+                        className="log-time"
+                        dateTime={time.iso}
+                        title={time.full}
+                      >
+                        {time.time}
+                      </time>
+                      <span className="log-level" data-level={level.tone}>
+                        {level.text}
+                      </span>
+                      <span className="log-message">
+                        {message.replace(/\s+/g, " ")}
+                      </span>
+                    </DisclosureSummary>
+                    <div className="log-body">
+                      <p className="log-full-message">{message}</p>
+                      <dl className="log-meta">
+                        <dt>时间</dt>
+                        <dd>{time.full}</dd>
+                        <dt>账号</dt>
+                        <dd>{account}</dd>
+                        <dt>类别</dt>
+                        <dd>
+                          {categoryNames[entry.category] ||
+                            entry.category ||
+                            "普通任务"}
+                        </dd>
+                        {entry.task_id && (
+                          <>
+                            <dt>任务</dt>
+                            <dd>{format(String(entry.task_id))}</dd>
+                          </>
+                        )}
+                        {entry.action && (
+                          <>
+                            <dt>操作</dt>
+                            <dd>{format(String(entry.action))}</dd>
+                          </>
+                        )}
+                        {entry.event && (
+                          <>
+                            <dt>事件</dt>
+                            <dd>{format(String(entry.event))}</dd>
+                          </>
+                        )}
+                      </dl>
+                      {entry.details &&
+                        Object.keys(entry.details).length > 0 && (
+                          <pre>
+                            {format(JSON.stringify(entry.details, null, 2))}
+                          </pre>
+                        )}
+                    </div>
                   </details>
-                )}
-              </article>
-            ))}
+                </Fragment>
+              );
+            })}
           </div>
           {entries.length >= 400 && (
             <p role="status" className="muted">

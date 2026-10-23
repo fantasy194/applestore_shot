@@ -1,3 +1,4 @@
+import { DisclosureSummary } from "./DisclosureSummary";
 import { useEffect, useState } from "react";
 import type { Account, Action, Data } from "./types";
 import { active, LOCAL_ID } from "./types";
@@ -455,7 +456,7 @@ export function PickupForm({
           ]}
         />
         <details open={contactMode === "local"}>
-          <summary>本地取货联系人（可选补充）</summary>
+          <DisclosureSummary>本地取货联系人（可选补充）</DisclosureSummary>
           <p className="muted">
             可先保存门店与时段偏好。使用官网联系人时优先读取本次结账已有资料，本地资料仅作补充。
           </p>

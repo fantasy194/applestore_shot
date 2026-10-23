@@ -915,7 +915,7 @@ impl Engine {
                             let outcomes = self.inventory_dispatch(&app, &event["result"]);
                             event["result"]["dispatches"] = json!(outcomes);
                         }
-                        if params["queue_stream"] == true && matches!(kind.as_str(), "queue_ready" | "queue_started" | "queue_progress" | "queue_finished" | "queue_idle") {
+                        if params["queue_stream"] == true && matches!(kind.as_str(), "queue_ready" | "queue_started" | "queue_progress" | "queue_finished" | "queue_idle" | "stage") {
                             self.queue_worker_event(&account.id, &id, &event);
                         }
                         if kind == "result" && matches!(action.as_str(), "enroll" | "me") {

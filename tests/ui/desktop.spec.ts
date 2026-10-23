@@ -1027,7 +1027,7 @@ test("created order is visible while QR is loading and remains after QR failure"
   await expect(
     page.getByRole("button", { name: "停止加载二维码", exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.locator(".task-detail").getByRole("status")).toContainText(
     "正在加载支付宝付款二维码",
   );
   await page.evaluate(() => {

@@ -17,6 +17,65 @@ fn revision(task: &Task) -> String {
     serde_json::to_writer(&mut digest, task).expect("task serialization");
     format!("{:016x}", digest.0.finish())
 }
+// Preserve only bounded order-attention evidence in the polling view.
+// Never copy nested payment/contact details into the workspace transport.
+fn purchase_attention(result: &Value) -> Value {
+    struct Attention {
+        pending: std::collections::BTreeSet<String>,
+        unknown: std::collections::BTreeSet<String>,
+        pending_unidentified: bool,
+        unknown_unidentified: bool,
+        remaining: usize,
+    }
+    fn number(value: &Value) -> Option<&str> {
+        value.as_str().map(str::trim).filter(|number| !number.is_empty() && number.len() <= 128
+            && number.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    }
+    impl Attention {
+        fn visit(&mut self, node: &Value, depth: usize, pending_entry: bool) {
+            if depth > 3 || self.remaining == 0 {
+                self.unknown_unidentified = true;
+                return;
+            }
+            self.remaining -= 1;
+            let order_number = number(&node["order_number"]).or_else(|| number(&node["result"]["order_number"]));
+            let pending = pending_entry || node["status"] == "pending_payment";
+            let known = order_number.is_some()
+                || node["pending_orders"].as_array().is_some_and(|rows| !rows.is_empty())
+                || node["result"]["pending_orders"].as_array().is_some_and(|rows| !rows.is_empty());
+            let has_children = ["queue_jobs", "attempts", "jobs"].iter()
+                .any(|key| node[*key].as_array().is_some_and(|rows| !rows.is_empty()));
+            let unknown = matches!(node["status"].as_str(), Some("submission_unknown" | "payment_unknown"))
+                || (node["order_submitted"] == true && !known && !has_children);
+            if pending {
+                if let Some(number) = order_number { self.pending.insert(number.into()); }
+                else { self.pending_unidentified = true; }
+            }
+            if unknown {
+                if let Some(number) = order_number { self.unknown.insert(number.into()); }
+                else { self.unknown_unidentified = true; }
+            }
+            for key in ["pending_orders", "queue_jobs", "attempts", "jobs"] {
+                if let Some(rows) = node[key].as_array() {
+                    if depth == 3 && !rows.is_empty() { self.unknown_unidentified = true; return; }
+                    for row in rows {
+                        if self.remaining == 0 { self.unknown_unidentified = true; return; }
+                        self.visit(row, depth + 1, key == "pending_orders");
+                    }
+                }
+            }
+            if let Some(nested) = node.get("result").filter(|nested| nested.is_object()) {
+                self.visit(nested, depth + 1, false);
+            }
+        }
+    }
+    let mut attention = Attention {pending:Default::default(), unknown:Default::default(),
+        pending_unidentified:false, unknown_unidentified:false, remaining:100};
+    attention.visit(result, 0, false);
+    json!({"pending_order_numbers":attention.pending,"unknown_order_numbers":attention.unknown,
+        "pending_unidentified":attention.pending_unidentified,"unknown_unidentified":attention.unknown_unidentified})
+}
+
 fn summary(task: &Task) -> Value {
     let result = task.result.as_ref().map(|result| {
         let mut reduced = serde_json::Map::new();
@@ -28,6 +87,9 @@ fn summary(task: &Task) -> Value {
                 };
                 reduced.insert(key.into(), bounded);
             }
+        }
+        if matches!(task.action.as_str(), "purchase" | "checkout") {
+            reduced.insert("purchase_attention".into(), purchase_attention(result));
         }
         // Older purchase cards need exact official terminal evidence even when
         // their historical order-query details have never been opened in this browser.
@@ -207,6 +269,61 @@ mod tests {
         assert_eq!(view["log_count"],1);
         assert!(serialized.len() < 2000);
         assert!(engine.snapshot().tasks[0].logs[0].contains("PRIVATE_LOG"));
+    }
+
+    #[test]
+    fn purchase_summary_keeps_queue_payment_and_unknown_attention_without_nested_details() {
+        let mut current = task(&Uuid::new_v4().to_string());
+        current.action = "purchase".into();
+        current.result = Some(json!({"success":true,"status":"queue_complete","message":"队列已完成",
+            "pending_orders":[{"order_number":"W123","payment_url":"PRIVATE_URL","contact":"PRIVATE_CONTACT"}],
+            "queue_jobs":[{"status":"succeeded","result":{"status":"pending_payment","order_number":"W123"}},
+                {"status":"submission_unknown","result":{"order_number":"W456","qr_data":"PRIVATE_QR"}}],
+            "attempts":[{"status":"payment_unknown","order_number":"W789"}]}));
+        let view = summary(&current);
+        assert_eq!(view["result"]["status"],"queue_complete");
+        assert_eq!(view["result"]["success"],true);
+        assert_eq!(view["result"]["message"],"队列已完成");
+        assert_eq!(view["result"]["purchase_attention"],json!({"pending_order_numbers":["W123"],
+            "unknown_order_numbers":["W456","W789"],"pending_unidentified":false,"unknown_unidentified":false}));
+        let serialized = view.to_string();
+        for private in ["PRIVATE_","pending_orders","queue_jobs","attempts","payment_url","contact","qr_data"] {
+            assert!(!serialized.contains(private),"{private}");
+        }
+        current.action = "checkout".into();assert_eq!(summary(&current)["result"]["purchase_attention"],view["result"]["purchase_attention"]);
+        current.action = "inventory_monitor".into();assert!(summary(&current)["result"].get("purchase_attention").is_none());
+    }
+
+    #[test]
+    fn purchase_summary_marks_missing_numbers_and_unconfirmed_submitted_leaves() {
+        let evidence = purchase_attention(&json!({"status":"queue_complete","order_submitted":true,
+            "pending_orders":[{"order_number":""}],"jobs":[{"status":"succeeded","order_submitted":true}],
+            "attempts":[{"status":"submission_unknown"},{"status":"payment_unknown","order_number":"W123"}]}));
+        assert_eq!(evidence,json!({"pending_order_numbers":[],"unknown_order_numbers":["W123"],
+            "pending_unidentified":true,"unknown_unidentified":true}));
+        assert_eq!(purchase_attention(&json!({"order_submitted":true}))["unknown_unidentified"],true);
+        assert_eq!(purchase_attention(&json!({"order_submitted":true,"order_number":"W123"}))["unknown_unidentified"],false);
+        assert_eq!(purchase_attention(&json!({"order_submitted":true,"jobs":[{"status":"pending_payment","order_number":"W123"}]})),
+            json!({"pending_order_numbers":["W123"],"unknown_order_numbers":[],"pending_unidentified":false,"unknown_unidentified":false}));
+    }
+
+    #[test]
+    fn purchase_attention_bounds_depth_entries_and_identifiers_without_hiding_uncertainty() {
+        let deepest = json!({"result":{"result":{"result":{"status":"pending_payment","order_number":"W123"}}}});
+        assert_eq!(purchase_attention(&deepest)["pending_order_numbers"],json!(["W123"]));
+        let truncated = json!({"result":deepest});
+        assert_eq!(purchase_attention(&truncated)["pending_order_numbers"],json!([]));
+        assert_eq!(purchase_attention(&truncated)["unknown_unidentified"],true);
+        let rows:Vec<_> = (0..150).map(|i|json!({"order_number":format!("W{i:03}"),"contact":"PRIVATE_CONTACT"})).collect();
+        let bounded = purchase_attention(&json!({"pending_orders":rows}));
+        assert_eq!(bounded["pending_order_numbers"].as_array().unwrap().len(),99);
+        assert_eq!(bounded["unknown_unidentified"],true);
+        let invalid = purchase_attention(&json!({"pending_orders":[{"order_number":"W".repeat(129)},
+            {"order_number":"https://PRIVATE_PAYMENT"},{"order_number":"  W123  "},{"order_number":"W123"}],
+            "jobs":[{"status":"submission_unknown","order_number":"private@example.test"}]}));
+        assert_eq!(invalid,json!({"pending_order_numbers":["W123"],"unknown_order_numbers":[],
+            "pending_unidentified":true,"unknown_unidentified":true}));
+        assert!(!invalid.to_string().contains("PRIVATE_"));assert!(!invalid.to_string().contains("example.test"));
     }
 
     #[test]

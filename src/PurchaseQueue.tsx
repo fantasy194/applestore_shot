@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Pause, Play, RefreshCw } from "lucide-react";
+import { ExternalLink, Pause, Play, RefreshCw, ScrollText } from "lucide-react";
 import type { Bridge } from "./api";
 import type { Account, Data } from "./types";
 import { useAccountPrivacy } from "./AccountPrivacy";
 import { SelectField } from "./SelectField";
 import { NumberField } from "./NumberField";
 import { presetProducts } from "./products";
+import { DisclosureSummary } from "./DisclosureSummary";
+import { purchaseEvidence } from "./purchaseEvidence";
+import { formatTaskStage } from "./taskStage";
 
 const states: Record<string, string> = {
   queued: "等待执行",
@@ -176,12 +179,12 @@ export function PurchaseQueue({
             </div>
           </div>
           <details className="ui-panel ui-disclosure queue-policy">
-            <summary>
+            <DisclosureSummary>
               执行策略 · {state?.paused ? "队列已暂停" : "队列运行中"} ·{" "}
               {state?.mode === "parallel"
                 ? `最多 ${state?.max_concurrency ?? 1} 个任务`
                 : "逐个执行"}
-            </summary>
+            </DisclosureSummary>
             <form
               onSubmit={async (event) => {
                 event.preventDefault();
@@ -326,12 +329,10 @@ export function PurchaseQueue({
               </p>
             )}
             {jobs.map((job) => {
-              const pending =
-                job.result?.status === "pending_payment" ||
-                job.result?.pending_orders?.length > 0;
+              const evidence = purchaseEvidence(job.result);
+              const pending = evidence.pending;
               const unknown =
-                job.status === "submission_unknown" ||
-                job.result?.status === "submission_unknown";
+                job.status === "submission_unknown" || evidence.unknown;
               const store =
                 job.result?.pickup_store ||
                 (job.pickup_policy?.selection_mode === "priority"
@@ -340,11 +341,27 @@ export function PurchaseQueue({
               const product = presetProducts.find(
                 (item) => item.sku === String(job.sku).replace(/\/A$/i, ""),
               );
+              const tone = unknown
+                ? "danger"
+                : pending
+                  ? "warning"
+                  : job.status === "failed"
+                    ? "danger"
+                    : ["interrupted", "expired", "blocked"].includes(job.status)
+                      ? "warning"
+                      : ["running", "dispatched", "cancelling"].includes(
+                            job.status,
+                          )
+                        ? "info"
+                        : job.status === "succeeded"
+                          ? "success"
+                          : "neutral";
               return (
                 <article
                   className="queue-job"
                   key={job.id}
                   data-job-id={job.id}
+                  data-tone={tone}
                 >
                   <div className="queue-job-heading">
                     <div className="queue-job-product">
@@ -354,7 +371,8 @@ export function PurchaseQueue({
                       </span>
                     </div>
                     <span
-                      className={`status ${unknown ? "submission_unknown" : job.status}`}
+                      className={`status ${unknown ? "submission_unknown" : pending ? "pending_payment" : job.status}`}
+                      data-tone={tone}
                     >
                       {unknown
                         ? "提交结果未知"
@@ -368,9 +386,6 @@ export function PurchaseQueue({
                       {accountName(job.account_id)} · 每路 {job.quantity} 件 ·{" "}
                       {job.concurrency ?? 1} 路
                     </span>
-                    <time dateTime={new Date(job.enqueued_at_ms).toISOString()}>
-                      入队 {timestamp(job.enqueued_at_ms)}
-                    </time>
                   </div>
                   {(pending || unknown) && (
                     <p
@@ -382,78 +397,107 @@ export function PurchaseQueue({
                         : "订单待付款，请及时打开关联任务完成支付。"}
                     </p>
                   )}
-                  {!terminal(job.status) && job.message && (
-                    <p className="muted">{format(job.message)}</p>
+                  {job.message && (
+                    <p className="queue-job-step">
+                      {format(
+                        ["running", "dispatched"].includes(job.status)
+                          ? formatTaskStage(job.message)
+                          : job.message,
+                      )}
+                    </p>
                   )}
                   <div className="queue-job-footer">
                     <details className="ui-disclosure queue-job-details">
-                      <summary>
-                        {job.status === "failed"
-                          ? "失败原因与任务详情"
-                          : "任务详情"}
-                      </summary>
-                      {job.pickup_policy?.selection_mode === "priority" && (
-                        <p className="muted">
-                          预选顺序：
-                          {job.pickup_policy.stores
-                            ?.map(
-                              (item: Data) =>
-                                `${item.store_name} (${item.store_id})`,
-                            )
-                            .join(" → ")}
-                        </p>
-                      )}
-                      {job.result?.pickup_store && (
-                        <p>
-                          实际取货门店：{job.result.pickup_store}
-                          {job.result.pickup_store_id
-                            ? ` (${job.result.pickup_store_id})`
-                            : ""}
-                        </p>
-                      )}
-                      {job.result?.pickup_time_slot?.date && (
-                        <p>
-                          取货时段：{job.result.pickup_time_slot.date}{" "}
-                          {job.result.pickup_time_slot.start}–
-                          {job.result.pickup_time_slot.end}
-                        </p>
-                      )}
-                      <p className="muted">
-                        #{job.sequence} ·{" "}
-                        {job.source === "manual"
-                          ? "手动"
-                          : job.source === "schedule"
-                            ? "定时"
-                            : "库存监控"}
-                        {job.target_id ? ` · 目标 ${job.target_id}` : ""} ·
-                        失败重试 {job.retry_count ?? 0} 次
-                      </p>
-                      {terminal(job.status) && job.message && (
-                        <p
-                          className={
-                            job.status === "failed" || unknown
-                              ? "error-text"
-                              : "muted"
-                          }
+                      <DisclosureSummary
+                        aria-label={
+                          job.status === "failed"
+                            ? "失败原因与任务详情"
+                            : "任务详情"
+                        }
+                      >
+                        详情
+                      </DisclosureSummary>
+                      <div className="queue-job-detail-body">
+                        <time
+                          dateTime={new Date(job.enqueued_at_ms).toISOString()}
                         >
-                          {format(job.message)}
+                          入队 {timestamp(job.enqueued_at_ms)}
+                        </time>
+                        {job.pickup_policy?.selection_mode === "priority" && (
+                          <p className="muted">
+                            预选顺序：
+                            {job.pickup_policy.stores
+                              ?.map(
+                                (item: Data) =>
+                                  `${item.store_name} (${item.store_id})`,
+                              )
+                              .join(" → ")}
+                          </p>
+                        )}
+                        {job.result?.pickup_store && (
+                          <p>
+                            实际取货门店：{job.result.pickup_store}
+                            {job.result.pickup_store_id
+                              ? ` (${job.result.pickup_store_id})`
+                              : ""}
+                          </p>
+                        )}
+                        {job.result?.pickup_time_slot?.date && (
+                          <p>
+                            取货时段：{job.result.pickup_time_slot.date}{" "}
+                            {job.result.pickup_time_slot.start}–
+                            {job.result.pickup_time_slot.end}
+                          </p>
+                        )}
+                        <p className="muted">
+                          #{job.sequence} ·{" "}
+                          {job.source === "manual"
+                            ? "手动"
+                            : job.source === "schedule"
+                              ? "定时"
+                              : "库存监控"}
+                          {job.target_id ? ` · 目标 ${job.target_id}` : ""} ·
+                          失败重试 {job.retry_count ?? 0} 次
                         </p>
-                      )}
+                      </div>
                     </details>
                     <div className="ui-toolbar queue-job-actions">
                       {job.task_id && (
                         <button
+                          className={
+                            pending || unknown
+                              ? "queue-task-action"
+                              : "queue-aux-action"
+                          }
+                          aria-label={
+                            unknown
+                              ? "查看订单任务"
+                              : pending
+                                ? "前往付款"
+                                : "查看关联任务"
+                          }
+                          title={
+                            unknown
+                              ? "查看订单任务"
+                              : pending
+                                ? "前往付款"
+                                : "查看关联任务"
+                          }
                           onClick={() => onTask(job.task_id, job.account_id)}
                         >
-                          {pending
-                            ? "前往付款"
-                            : unknown
-                              ? "查看订单任务"
-                              : "查看关联任务"}
+                          {unknown ? (
+                            "查看订单任务"
+                          ) : pending ? (
+                            "前往付款"
+                          ) : (
+                            <ExternalLink size={16} aria-hidden="true" />
+                          )}
                         </button>
                       )}
                       <a
-                        className="ui-action-link"
+                        className="ui-action-link queue-aux-action"
+                        aria-label="查看任务日志"
+                        title="查看任务日志"
                         href={logsHref(
                           job.task_id
                             ? {
@@ -463,14 +507,17 @@ export function PurchaseQueue({
                             : { account_id: job.account_id, category: "queue" },
                         )}
                       >
-                        查看任务日志
+                        <ScrollText size={15} aria-hidden="true" />
+                        日志
                       </a>
                       {!terminal(job.status) && (
                         <button
+                          className="queue-aux-action"
+                          aria-label="取消队列任务"
                           disabled={busy || job.status === "cancelling"}
                           onClick={() => command("cancel", { job_id: job.id })}
                         >
-                          取消队列任务
+                          取消
                         </button>
                       )}
                     </div>

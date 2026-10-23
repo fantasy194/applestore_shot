@@ -1,3 +1,4 @@
+import { DisclosureSummary } from "./DisclosureSummary";
 import { useEffect, useState } from "react";
 import {
   LoaderCircle,
@@ -499,14 +500,14 @@ export function DuoStatus({ snapshot, bridge, refresh }: PageProps) {
         <details
           onToggle={(event) => setShowInventory(event.currentTarget.open)}
         >
-          <summary>
+          <DisclosureSummary>
             门店库存监控与自动抢购
             {snapshot.tasks.some(
               (task) => task.action === "inventory_monitor" && active(task),
             )
               ? " · 运行中"
               : ""}
-          </summary>
+          </DisclosureSummary>
           {showInventory && (
             <InventoryMonitor
               snapshot={snapshot}

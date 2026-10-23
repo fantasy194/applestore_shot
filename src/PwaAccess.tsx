@@ -1,3 +1,4 @@
+import { DisclosureSummary } from "./DisclosureSummary";
 import { useEffect, useState, type ReactNode, type FormEvent } from "react";
 import { Bell, KeyRound, Smartphone } from "lucide-react";
 import { disablePush, enablePush, pwaCall, registerPwa } from "./pwa";
@@ -112,7 +113,7 @@ export function PwaSettingsPage() {
           </p>
         )}
         <details className="ui-disclosure access-help">
-          <summary>通知使用说明</summary>
+          <DisclosureSummary>通知使用说明</DisclosureSummary>
           <p>
             需要保持本机服务、隧道和电脑运行。实际投递由浏览器和系统决定；每台设备分别启用通知。
           </p>
@@ -182,7 +183,7 @@ export function PwaSettingsPage() {
         </div>
         <p className="access-copy">添加到主屏幕，方便查看监控和处理付款。</p>
         <details className="ui-disclosure access-help">
-          <summary>查看安装方法</summary>
+          <DisclosureSummary>查看安装方法</DisclosureSummary>
           <p>
             iPhone：使用 Safari
             打开，在分享菜单选择“添加到主屏幕”，再从图标启动。

@@ -1,3 +1,6 @@
+import { DisclosureSummary } from "./DisclosureSummary";
+import { OrderProgressBar } from "./OrderProgressBar";
+import { formatTaskStage } from "./taskStage";
 import {
   useEffect,
   useLayoutEffect,
@@ -264,10 +267,16 @@ function WorkspaceApp() {
     .sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
   const allActive = activeTasks.length;
   const resumingTask =
-    !account?.pending &&
+    !!account &&
+    !account.pending &&
     tasks.some(
-      (t) => t.id === taskTarget?.id && active(t) && t.action !== "enroll",
+      (t) =>
+        t.id === taskTarget?.id &&
+        t.action !== "enroll" &&
+        (active(t) || ["purchase", "checkout"].includes(t.action)),
     );
+  const readOnlyTaskView =
+    !sessionReady && resumingTask && !!task && !active(task);
   const viewingGate =
     (!sessionReady && !resumingTask) ||
     (adding && (!taskTarget || taskTarget.action === "enroll"));
@@ -531,6 +540,14 @@ function WorkspaceApp() {
             )}
           </div>
         </header>
+        {ready && bridge && (
+          <OrderProgressBar
+            tasks={snapshot.tasks}
+            accounts={snapshot.accounts}
+            onOpen={openTask}
+            onCancel={cancel}
+          />
+        )}
         {error && (
           <div className="error-banner" role="alert">
             {format(error)}
@@ -643,22 +660,42 @@ function WorkspaceApp() {
                 )}
               </div>
             </div>
-            <nav className="tabs" aria-label="功能">
-              {tabs.map(([id, label, Icon]) => (
+            {readOnlyTaskView && (
+              <div className="local-task">
+                <p>正在查看已保存的下单任务。</p>
                 <button
-                  key={id}
-                  aria-current={tab === id ? "page" : undefined}
-                  className={tab === id ? "active" : ""}
-                  onClick={() => setTab(id)}
+                  onClick={() => {
+                    setTaskTarget(null);
+                    setFocusTaskId("");
+                    navigate("workspace");
+                  }}
                 >
-                  <Icon size={16} />
-                  {label}
+                  选择账号
                 </button>
-              ))}
-            </nav>
+              </div>
+            )}
+            {!readOnlyTaskView && (
+              <nav className="tabs" aria-label="功能">
+                {tabs.map(([id, label, Icon]) => (
+                  <button
+                    key={id}
+                    aria-current={tab === id ? "page" : undefined}
+                    className={tab === id ? "active" : ""}
+                    onClick={() => setTab(id)}
+                  >
+                    <Icon size={16} />
+                    {label}
+                  </button>
+                ))}
+              </nav>
+            )}
             <div className="content-grid">
               <main>
-                <div className="view-content" key={tab}>
+                <div
+                  className="view-content"
+                  key={tab}
+                  hidden={readOnlyTaskView}
+                >
                   {tab === "home" && (
                     <>
                       <section className="section">
@@ -1135,7 +1172,11 @@ function WorkspaceApp() {
                             : task.action === "clear_bag" &&
                                 task.result?.success === false
                               ? "尚未清空"
-                              : format(task.stage)}
+                              : format(
+                                  ["purchase", "checkout"].includes(task.action)
+                                    ? formatTaskStage(task.stage)
+                                    : task.stage,
+                                )}
                         </p>
                         {active(task) && (
                           <button
@@ -1164,10 +1205,10 @@ function WorkspaceApp() {
                         setLogTaskId(event.currentTarget.open ? task.id : "")
                       }
                     >
-                      <summary>
+                      <DisclosureSummary>
                         当前任务日志（{task.log_count ?? task.logs?.length ?? 0}{" "}
                         条）
-                      </summary>
+                      </DisclosureSummary>
                       {task.logs?.length ? (
                         <pre>
                           {task.logs.map((line) => format(line)).join("\n")}
@@ -1225,7 +1266,7 @@ function WorkspaceApp() {
                               number,
                             )
                           }
-                          disabled={busy}
+                          disabled={busy || readOnlyTaskView}
                         />
                       )}
                     {task.order_submitted &&
@@ -1233,7 +1274,7 @@ function WorkspaceApp() {
                         task.status,
                       ) && (
                         <button
-                          disabled={busy}
+                          disabled={busy || readOnlyTaskView}
                           onClick={() => {
                             setTab("orders");
                             start("orders");
@@ -1626,7 +1667,7 @@ function SessionMaintenance({
         </p>
       )}
       <details className="ui-disclosure">
-        <summary>预热说明与会话日志</summary>
+        <DisclosureSummary>预热说明与会话日志</DisclosureSummary>
         <p>
           账号连续10分钟没有下单操作且空闲后，执行所选流程。切换流程重新计时，正在执行的预热按原流程完成。下单优先；账号忙碌或订单结果待确认时暂缓。
         </p>

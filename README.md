@@ -34,6 +34,8 @@ iPhone DUO launch assistant and Apple Store quick checkout tool for macOS, Windo
 
 **统一界面与手机操作：**全局下拉使用同一组件，数量、并发和重试使用可输入的加减步进器；手机触摸区域至少 44px。最近有货按“时间、型号、门店”列表展示，队列和日志减少嵌套卡片，商品及订单表格适配窄屏。设计与截图审查、验证范围见 [界面统一与手机适配](docs/UI-CONSISTENCY-REVIEW.md)。
 
+**下单进度与紧凑列表：**顶部固定显示当前下单步骤，可切换账号任务并前往处理；待付款和提交未知分别突出提醒。执行队列优先展示商品、当前步骤及失败原因；运行日志按毫秒时间、彩色级别和单行内容扫读，点按展开完整信息。展开器统一为 SVG 箭头，监控设置展开时保持标题和操作位置稳定。详见 [下单进度、日志与展开交互](docs/INTERACTION-REFINEMENT.md)。
+
 ## 视频演示
 
 [▶ 在 Bilibili 观看实际操作演示](https://www.bilibili.com/video/BV1v8HQ6FEYz/)

@@ -1,3 +1,4 @@
+import { DisclosureSummary } from "./DisclosureSummary";
 import { useEffect, useRef, useState } from "react";
 import {
   Activity,
@@ -643,7 +644,7 @@ export function InventoryMonitor({
                         : "仅监控"}
                     </p>
                     <details className="ui-disclosure monitor-target-settings">
-                      <summary>抢购设置</summary>
+                      <DisclosureSummary>抢购设置</DisclosureSummary>
                       <div className="inventory-purchase-fields">
                         <label className="checkbox-label">
                           <input
@@ -744,10 +745,9 @@ export function InventoryMonitor({
             className="ui-panel ui-disclosure monitor-add-stores"
             open={!config.targets.length}
           >
-            <summary className="ui-panel-heading">
+            <DisclosureSummary className="ui-panel-heading">
               <h2>添加门店与商品</h2>
-              <Plus size={16} />
-            </summary>
+            </DisclosureSummary>
             <div className="inventory-product-fields">
               <SelectField
                 label="监控商品"
@@ -813,7 +813,7 @@ export function InventoryMonitor({
           </details>
           <section className="ui-panel">
             <details className="ui-disclosure inventory-proxy-settings">
-              <summary>
+              <DisclosureSummary>
                 动态代理池{" "}
                 <span>
                   {config.proxy.enabled ? "已启用" : "未启用"}
@@ -821,7 +821,7 @@ export function InventoryMonitor({
                     ? ` · 可派发 ${result.proxy.dispatchable_count ?? 0}`
                     : ""}
                 </span>
-              </summary>
+              </DisclosureSummary>
               <p className="muted">
                 仅代理匿名库存和门店查询。登录、验证码、下单及支付使用账号原有连接。无可用代理时显示未知，失败连接会替换；1
                 秒为检查间隔，网络耗时会影响新结果到达。
@@ -994,7 +994,7 @@ export function InventoryMonitor({
             </details>
           </section>
           <details className="ui-panel ui-disclosure monitor-instructions">
-            <summary>运行说明</summary>
+            <DisclosureSummary>运行说明</DisclosureSummary>
             <p className="muted">
               监控期间目标配置锁定，官网门店查询仍可使用。请保持本地服务运行及电脑唤醒；服务重启后须重新开始监控。
             </p>
