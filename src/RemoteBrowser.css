@@ -39,7 +39,7 @@
   user-select: none;
 }
 .remote-browser-screen:disabled {
-  opacity: 0.7;
+  opacity: 1;
   cursor: wait;
 }
 .remote-browser-screen:enabled:active {

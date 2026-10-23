@@ -47,7 +47,12 @@ export function RemoteBrowser({
 }) {
   // Optional to keep older desktop bridges and preview fixtures compatible.
   const browser = (bridge as Bridge & { browser?: BrowserCall }).browser;
+  const contextKey = `${task.account_id}:${task.id}:${live(task) ? "live" : task.status}`;
   const [status, setStatus] = useState<Data>({ active: false });
+  const [displayed, setDisplayed] = useState<{
+    context: string;
+    frame: Frame;
+  }>();
   const [seen, setSeen] = useState(false);
   const [expanded, setExpanded] = useState(true);
   const [connectionError, setConnectionError] = useState("");
@@ -61,10 +66,21 @@ export function RemoteBrowser({
   const inputBusy = useRef(false);
   const pollNow = useRef<() => void>(() => {});
   const expandedRef = useRef(expanded);
+  const displayedRef = useRef<typeof displayed>(undefined);
+  const decoding = useRef<{ sequence: number; generation: number } | undefined>(
+    undefined,
+  );
+  const pendingDisplay = useRef<typeof displayed>(undefined);
+  const frameGeneration = useRef(0);
   const screen = useRef<HTMLButtonElement>(null);
-  const pointer = useRef<{ x: number; y: number; id: number } | null>(null);
+  const pointer = useRef<{
+    x: number;
+    y: number;
+    id: number;
+    sequence: number;
+    context: string;
+  } | null>(null);
   const input = useRef<HTMLInputElement>(null);
-  const contextKey = `${task.account_id}:${task.id}:${task.status}`;
   const currentContext = useRef(contextKey);
   currentContext.current = contextKey;
   const error = connectionError || inputError;
@@ -82,6 +98,12 @@ export function RemoteBrowser({
     let polling = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setStatus({ active: false });
+    setDisplayed(undefined);
+    displayedRef.current = undefined;
+    pendingDisplay.current = undefined;
+    decoding.current = undefined;
+    frameGeneration.current++;
+    pointer.current = null;
     setSeen(false);
     seenRef.current = false;
     setExpanded(true);
@@ -93,26 +115,78 @@ export function RemoteBrowser({
     inputBusy.current = false;
     if (!browser || !live(task)) return;
 
+    function prepareFrame(frame: Frame) {
+      const previous = displayedRef.current;
+      if (
+        (previous?.context === contextKey &&
+          previous.frame.sequence >= frame.sequence) ||
+        (decoding.current && decoding.current.sequence >= frame.sequence)
+      )
+        return;
+      const generation = frameGeneration.current;
+      const candidate = { sequence: frame.sequence, generation };
+      decoding.current = candidate;
+      const image = new Image();
+      image.src = frame.data_url;
+      void image
+        .decode()
+        .then(() => {
+          if (
+            disposed ||
+            currentContext.current !== contextKey ||
+            frameGeneration.current !== generation ||
+            (displayedRef.current &&
+              displayedRef.current.frame.sequence >= frame.sequence) ||
+            (pendingDisplay.current &&
+              pendingDisplay.current.frame.sequence >= frame.sequence)
+          )
+            return;
+          if (!image.naturalWidth || !image.naturalHeight) return;
+          const next = { context: contextKey, frame };
+          if (pointer.current) pendingDisplay.current = next;
+          else {
+            displayedRef.current = next;
+            setDisplayed(next);
+          }
+          setImageFailed(false);
+          setNow(Date.now());
+        })
+        .catch(() => {
+          if (
+            !disposed &&
+            frameGeneration.current === generation &&
+            decoding.current === candidate
+          )
+            setImageFailed(true);
+        });
+    }
+
     async function poll() {
       if (disposed || polling) return;
       polling = true;
       clearTimeout(timer);
       try {
         const next = await browser!(task.account_id, task.id, "status");
-        if (disposed) return;
+        if (disposed || currentContext.current !== contextKey) return;
         setNow(Date.now());
-        setStatus(next);
+        setStatus({ ...next, context_key: contextKey });
         setConnectionError("");
         if (next.active && !seenRef.current) {
           seenRef.current = true;
           setSeen(true);
           setExpanded(true);
         }
-        if (!next.active) setText("");
+        if (!next.active) {
+          frameGeneration.current++;
+          decoding.current = undefined;
+          displayedRef.current = undefined;
+          pendingDisplay.current = undefined;
+          setDisplayed(undefined);
+          pointer.current = null;
+          setText("");
+        } else if (validFrame(next.frame)) prepareFrame(next.frame);
       } catch {
         if (!disposed) {
-          setStatus({ active: false });
-          setText("");
           setConnectionError("远程窗口连接失败，请稍后重试。");
         }
       } finally {
@@ -135,12 +209,13 @@ export function RemoteBrowser({
     void poll();
     return () => {
       disposed = true;
+      frameGeneration.current++;
       clearTimeout(timer);
       pollNow.current = () => {};
       document.removeEventListener("visibilitychange", visible);
       window.removeEventListener("focus", visible);
     };
-  }, [browser, task.id, task.account_id, task.status]);
+  }, [browser, contextKey]);
 
   useEffect(() => {
     if (!status.active || !live(task)) return;
@@ -148,13 +223,20 @@ export function RemoteBrowser({
     return () => clearInterval(timer);
   }, [status.active, task.status]);
 
-  const frame = validFrame(status.frame) ? status.frame : undefined;
+  const active = status.context_key === contextKey && status.active === true;
+  const frame = displayed?.context === contextKey ? displayed.frame : undefined;
   const age = frame ? now - frame.captured_at_ms : Infinity;
   const fresh = !!frame && age >= -1000 && age <= 5000;
-  const enabled =
-    !!browser && live(task) && status.active === true && fresh && !imageFailed;
+  const enabled = !!browser && live(task) && active && fresh;
 
-  useEffect(() => setImageFailed(false), [frame?.sequence, frame?.data_url]);
+  function publishPendingFrame() {
+    const next = pendingDisplay.current;
+    pendingDisplay.current = undefined;
+    if (next?.context !== contextKey) return;
+    displayedRef.current = next;
+    setDisplayed(next);
+    setNow(Date.now());
+  }
 
   async function send(params: Data) {
     if (
@@ -162,6 +244,7 @@ export function RemoteBrowser({
       !enabled ||
       !frame ||
       Date.now() - frame.captured_at_ms > 5000 ||
+      Date.now() - frame.captured_at_ms < -1000 ||
       inputBusy.current
     ) {
       return;
@@ -224,10 +307,10 @@ export function RemoteBrowser({
         </button>
       </div>
       <p className="muted" role="status">
-        {!live(task) || !status.active
+        {!live(task) || !active
           ? error || "官网窗口已结束，不能继续输入。"
           : `${typeof status.url_host === "string" ? status.url_host : "Apple 官网"} · ${fresh ? "画面已连接" : "等待新画面"}`}
-        {live(task) && status.active && frame && (
+        {live(task) && active && frame && (
           <span>
             {" "}
             · 更新于 {new Date(frame.captured_at_ms).toLocaleTimeString()}
@@ -239,7 +322,7 @@ export function RemoteBrowser({
           {error}
         </p>
       )}
-      {expanded && live(task) && status.active && (
+      {expanded && live(task) && active && (
         <>
           {frame ? (
             <button
@@ -254,16 +337,26 @@ export function RemoteBrowser({
                   x: event.clientX,
                   y: event.clientY,
                   id: event.pointerId,
+                  sequence: frame.sequence,
+                  context: contextKey,
                 };
                 event.currentTarget.setPointerCapture(event.pointerId);
               }}
               onPointerCancel={() => {
                 pointer.current = null;
+                publishPendingFrame();
               }}
               onPointerUp={(event) => {
                 const start = pointer.current;
                 pointer.current = null;
-                if (!start || start.id !== event.pointerId) return;
+                publishPendingFrame();
+                if (
+                  !start ||
+                  start.id !== event.pointerId ||
+                  start.sequence !== frame.sequence ||
+                  start.context !== contextKey
+                )
+                  return;
                 const rect = event.currentTarget.getBoundingClientRect();
                 if (!rect.width || !rect.height) return;
                 const dx = start.x - event.clientX,
@@ -308,7 +401,6 @@ export function RemoteBrowser({
                 width={frame.width}
                 height={frame.height}
                 draggable={false}
-                onError={() => setImageFailed(true)}
               />
             </button>
           ) : (
@@ -324,6 +416,7 @@ export function RemoteBrowser({
             className="remote-browser-input"
             onSubmit={(event) => {
               event.preventDefault();
+              if (!enabled || sending || inputBusy.current) return;
               const value = text;
               setText("");
               if (value) void send({ type: "text", text: value });
@@ -339,7 +432,6 @@ export function RemoteBrowser({
                 spellCheck={false}
                 maxLength={4096}
                 value={text}
-                disabled={!enabled || sending}
                 onChange={(event) => setText(event.target.value)}
               />
             </label>
