@@ -74,7 +74,7 @@ pnpm dev:web
 
 **树莓派快捷部署与自动更新：**下载并执行 [`scripts/install-docker.sh`](scripts/install-docker.sh)。脚本显示六个部署阶段、下载进度及每五秒的等待提示；配置下载、镜像拉取和服务启动分别设置超时，失败会标明阶段和退出码。首次配置 Watchtower 每五分钟检查新版；重新运行保留非空配置文件、已有 Compose 项目和 `/data` 数据卷。已安装 Docker Compose 的 64 位树莓派可执行 `bash scripts/install-docker.sh`；自定义目录使用 `DUO_INSTALL_DIR`。安装器的离线回归覆盖下载中断、原配置保留及拉取 / 启动失败。
 
-**Docker 局域网访问：**可配置 `DUO_WEB_BIND=0.0.0.0` 和精确的 `DUO_WEB_ALLOWED_ORIGINS`，在局域网使用原 Web 密码登录；保留 Host/Origin 校验，HTTP 登录 Cookie 正常回传。Docker 默认停用 Quick Tunnel；配置示例及主机目录持久化说明见 [树莓派局域网访问](docker/README.md#树莓派局域网访问)。
+**Docker 局域网访问：**可配置 `DUO_WEB_BIND=0.0.0.0`，使用原 Web 密码登录。由网络或反向代理控制入口时，设置 `DUO_WEB_TRUST_NETWORK=1` 可关闭 Host/Origin 校验，允许任意访问域名；也可保留默认检查并使用精确的 `DUO_WEB_ALLOWED_ORIGINS`。Docker 默认停用 Quick Tunnel；配置示例及主机目录持久化说明见 [树莓派局域网访问](docker/README.md#树莓派局域网访问)。
 
 ## 最简单的购买流程：抛光布
 

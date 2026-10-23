@@ -1,4 +1,4 @@
-use axum::http::Uri;
+use axum::http::{header, HeaderMap, Uri};
 
 #[derive(Debug)]
 pub struct AllowedOrigin {
@@ -36,11 +36,32 @@ pub fn allowed_origins(value: &str) -> Result<Vec<AllowedOrigin>, String> {
 }
 
 pub fn tunnel_disabled(value: &str) -> Result<bool, String> {
+    switch(value, "DUO_WEB_DISABLE_TUNNEL")
+}
+
+pub fn trust_network(value: &str) -> Result<bool, String> {
+    switch(value, "DUO_WEB_TRUST_NETWORK")
+}
+
+fn switch(value: &str, name: &str) -> Result<bool, String> {
     match value.trim() {
         "1" | "true" => Ok(true),
         "" | "0" | "false" => Ok(false),
-        _ => Err("DUO_WEB_DISABLE_TUNNEL 需为 1、0、true 或 false".into()),
+        _ => Err(format!("{name} 需为 1、0、true 或 false")),
     }
+}
+
+// Only used after the operator explicitly delegates ingress checks to its network.
+pub fn forwarded_secure(headers: &HeaderMap) -> bool {
+    match headers.get("x-forwarded-proto").and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next()).map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("https") => return true,
+        Some(value) if value.eq_ignore_ascii_case("http") => return false,
+        _ => {},
+    }
+    headers.get(header::ORIGIN).and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Uri>().ok())
+        .is_some_and(|origin| origin.scheme_str() == Some("https"))
 }
 
 #[cfg(test)]
@@ -68,5 +89,20 @@ mod tests {
         assert!(tunnel_disabled("1").unwrap());
         assert!(!tunnel_disabled("").unwrap());
         assert!(tunnel_disabled("maybe").is_err());
+        assert!(trust_network("1").unwrap());
+        assert!(!trust_network("").unwrap());
+        assert!(trust_network("maybe").is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_scheme_controls_cookie_security() {
+        let mut headers = HeaderMap::new();
+        assert!(!forwarded_secure(&headers));
+        headers.insert(header::ORIGIN, "https://proxy.example.test".parse().unwrap());
+        assert!(forwarded_secure(&headers));
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!forwarded_secure(&headers));
+        headers.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert!(forwarded_secure(&headers));
     }
 }

@@ -21,7 +21,8 @@ HTTPS_ORIGIN = 'https://lan-fixture.example:17654'
 
 
 class FixtureServer:
-    def __init__(self, directory, *, origins='', disable_tunnel=False, password=PASSWORD):
+    def __init__(self, directory, *, origins='', disable_tunnel=False, password=PASSWORD,
+                 trust_network=False):
         self.directory = directory
         web = directory / 'www'
         if not web.exists():
@@ -34,10 +35,13 @@ class FixtureServer:
                'DUO_WEB_ALLOWED_ORIGINS': origins}
         env.pop('DUO_WEB_PASSWORD', None)
         env.pop('DUO_WEB_DISABLE_TUNNEL', None)
+        env.pop('DUO_WEB_TRUST_NETWORK', None)
         if password is not None:
             env['DUO_WEB_PASSWORD'] = password
         if disable_tunnel:
             env['DUO_WEB_DISABLE_TUNNEL'] = '1'
+        if trust_network:
+            env['DUO_WEB_TRUST_NETWORK'] = '1'
         self.process = subprocess.Popen([
             str(executable), '--no-open', '--source-worker', '--web-root', str(web),
             '--data-dir', str(directory / 'data'), '--port', '0'],
@@ -88,7 +92,7 @@ class FixtureServer:
         self.process.stdout.close()
 
     def request(self, path, body=None, *, target=None, origin=True, bearer=False,
-                cookie=None, expected=200):
+                cookie=None, expected=200, extra_headers=None):
         target = target or self.origin
         headers = {'Content-Type': 'application/json', 'Host': target.split('://', 1)[1]}
         if origin is not None:
@@ -97,6 +101,8 @@ class FixtureServer:
             headers['Authorization'] = 'Bearer ' + self.token
         if cookie:
             headers['Cookie'] = cookie
+        if extra_headers:
+            headers.update(extra_headers)
         request = urllib.request.Request(self.origin + path, headers=headers,
             data=None if body is None else json.dumps(body).encode())
         try:

@@ -63,6 +63,8 @@ DUO_WEB_DISABLE_TUNNEL=1
 
 Docker Compose 默认设置 `DUO_WEB_DISABLE_TUNNEL=1`，不启动 Cloudflare Quick Tunnel，并拒绝注册 Quick Tunnel 地址。独立桌面 / Web 启动保持原有默认；需要在 Docker 中明确启用时设置为 `0` 并自行管理隧道进程。
 
+由局域网、VPN 或反向代理控制入口时，可在 `.env` 设置 `DUO_WEB_TRUST_NETWORK=1`。此模式关闭 Host/Origin 白名单及写请求来源校验，任意域名或反向代理地址都可访问，无需逐个登记 `DUO_WEB_ALLOWED_ORIGINS`，Web 密码继续生效。HTTPS 反向代理可发送 `X-Forwarded-Proto: https`，服务据此设置登录 Cookie；没有该头时使用浏览器 Origin 的协议。默认值为 `0`。本 Pi 部署启用此模式，继续监听 `0.0.0.0:17654` 并停用 Quick Tunnel。
+
 本机的 `/data` 可以继续使用原命名卷，也可以在首次部署前使用主机目录挂载。例如本 Pi 的持久目录为 `/home/fantasy/applestore_shot/data`，挂到容器 `/data`，目录归 UID/GID `1000:1000` 所有且权限为 `700`。不要把已有命名卷直接换成空目录；先保留并迁移原数据。账号配置、Apple auth/Cookie、浏览器资料、队列及 Web 密码都在 `/data`，容器重建会保留。网页访问会话保存在内存，重建后需用原 Web 密码再次登录。
 
 ## 更新、停止与排查

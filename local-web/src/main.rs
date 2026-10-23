@@ -43,6 +43,7 @@ struct LocalState {
     public_origin: Arc<Mutex<Option<String>>>,
     allowed_origins: Arc<Vec<access::AllowedOrigin>>,
     tunnel_disabled: bool,
+    trust_network: bool,
     push: Arc<push::PushBridge>,
 }
 
@@ -52,7 +53,7 @@ fn bad_request(message: String) -> Response {
 
 async fn auth_status(State(s): State<LocalState>, headers: HeaderMap) -> Response {
     let local_host = headers.get(header::HOST).and_then(|x| x.to_str().ok()) == Some(s.authority.as_str());
-    let authenticated = if local_host { s.auth.authenticated(&headers, &s.token) } else { s.auth.authenticated_session(&headers) };
+    let authenticated = if local_host || s.trust_network { s.auth.authenticated(&headers, &s.token) } else { s.auth.authenticated_session(&headers) };
     Json(json!({"authenticated":authenticated})).into_response()
 }
 
@@ -64,8 +65,10 @@ async fn login(State(s): State<LocalState>, headers: HeaderMap, Json(body): Json
     let verified = tokio::task::spawn_blocking(move || auth::Auth::verify(&password, &hash)).await.unwrap_or(false);
     if !verified { return (StatusCode::UNAUTHORIZED, Json(json!({"error":"访问密码不正确"}))).into_response(); }
     let host = headers.get(header::HOST).and_then(|x| x.to_str().ok());
-    let secure = host != Some(s.authority.as_str())
-        && s.allowed_origins.iter().find(|origin| host == Some(origin.authority.as_str())).is_none_or(|origin| origin.secure);
+    let secure = if s.trust_network { access::forwarded_secure(&headers) } else {
+        host != Some(s.authority.as_str())
+            && s.allowed_origins.iter().find(|origin| host == Some(origin.authority.as_str())).is_none_or(|origin| origin.secure)
+    };
     let cookie = format!("duo_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}", s.auth.session(), if secure { "; Secure" } else { "" });
     ([(header::SET_COOKIE, cookie)], Json(json!({"authenticated":true}))).into_response()
 }
@@ -92,7 +95,7 @@ async fn tunnel(State(s): State<LocalState>, headers: HeaderMap, Json(body): Jso
         return (StatusCode::FORBIDDEN, Json(json!({"error":"当前部署已停用 Quick Tunnel"}))).into_response();
     }
     // Only a local launch-token holder may change the one trusted public Host.
-    if headers.get(header::HOST).and_then(|x| x.to_str().ok()) != Some(s.authority.as_str())
+    if (!s.trust_network && headers.get(header::HOST).and_then(|x| x.to_str().ok()) != Some(s.authority.as_str()))
         || headers.get(header::AUTHORIZATION).and_then(|x| x.to_str().ok()) != Some(s.token.as_str()) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -114,7 +117,7 @@ async fn tunnel(State(s): State<LocalState>, headers: HeaderMap, Json(body): Jso
 }
 
 async fn request_shutdown(State(s): State<LocalState>, headers: HeaderMap) -> Response {
-    if headers.get(header::HOST).and_then(|x| x.to_str().ok()) != Some(s.authority.as_str())
+    if (!s.trust_network && headers.get(header::HOST).and_then(|x| x.to_str().ok()) != Some(s.authority.as_str()))
         || headers.get(header::AUTHORIZATION).and_then(|x| x.to_str().ok()) != Some(s.token.as_str()) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -259,16 +262,16 @@ async fn guarded_request(State(s): State<LocalState>, request: Request, next: Ne
             || public_host && public_origin.as_deref().is_some_and(|origin| v == origin)
             || allowed_origin.is_some_and(|origin| v == origin.origin.as_str())
     });
-    if !host_ok || !origin_ok {
+    if !s.trust_network && (!host_ok || !origin_ok) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let path = request.uri().path();
     let public_auth = matches!(path, "/api/auth/status" | "/api/auth/login");
-    if !local_host && (matches!(path, "/api/shutdown" | "/api/tunnel/register")
+    if !s.trust_network && !local_host && (matches!(path, "/api/shutdown" | "/api/tunnel/register")
         || request.method() != axum::http::Method::GET && h.get(header::ORIGIN).is_none()) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let authenticated = if local_host { s.auth.authenticated(h, &s.token) } else { s.auth.authenticated_session(h) };
+    let authenticated = if local_host || s.trust_network { s.auth.authenticated(h, &s.token) } else { s.auth.authenticated_session(h) };
     if path.starts_with("/api/") && !public_auth && !authenticated
     {
         return (
@@ -422,7 +425,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Keep the local launch authority separate from explicitly allowed origins,
     // including when Docker publishes the non-loopback listener.
     let authority = format!("127.0.0.1:{}", listener.local_addr()?.port());
-    let allowed_origins = access::allowed_origins(&std::env::var("DUO_WEB_ALLOWED_ORIGINS").unwrap_or_default())?;
+    let trust_network = access::trust_network(&std::env::var("DUO_WEB_TRUST_NETWORK").unwrap_or_default())?;
+    let allowed_origins = if trust_network { Vec::new() } else {
+        access::allowed_origins(&std::env::var("DUO_WEB_ALLOWED_ORIGINS").unwrap_or_default())?
+    };
     if allowed_origins.iter().any(|origin| origin.authority == authority) {
         return Err("DUO_WEB_ALLOWED_ORIGINS 无需重复配置本机启动地址".into());
     }
@@ -431,6 +437,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("允许的访问入口：{}（使用访问密码登录）", origin.origin);
     }
     if tunnel_disabled { println!("Quick Tunnel 已停用。"); }
+    if trust_network { println!("已信任上游网络：Host/Origin 检查已关闭，访问密码继续生效。"); }
     let secret = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
@@ -494,6 +501,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         public_origin: Arc::new(Mutex::new(None)),
         allowed_origins: Arc::new(allowed_origins),
         tunnel_disabled,
+        trust_network,
         push: push.clone(),
     };
     activity::start(state.host.clone(), engine.root.clone());
