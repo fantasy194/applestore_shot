@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit
 import uuid
+from contextlib import nullcontext
 
 import requests
 from srp import _pysrp as srp
@@ -112,6 +113,31 @@ def apple_url(url):
     return url
 
 
+def storefront_api_key(html):
+    key = re.search(r'<meta\b(?=[^>]*\bname\s*=\s*["\']globalnav-store-key["\'])'
+                    r'(?=[^>]*\bcontent\s*=\s*["\']([^"\']+)["\'])[^>]*>',
+                    html, re.I)
+    if not key:
+        raise LoginError("官网首页未提供商城 API key，无法取得登录入口。")
+    return key[1]
+
+
+def storefront_signin_entry(home_url, links):
+    if not isinstance(links, list):
+        raise LoginError("首页菜单未提供唯一的登录链接，已停止，未改走账户页。")
+    entries = [link.get("url") for link in links if isinstance(link, dict) and link.get("type") == "signIn"]
+    if len(entries) != 1 or not isinstance(entries[0], str) or not entries[0]:
+        raise LoginError("首页菜单未提供唯一的登录链接，已停止，未改走账户页。")
+    try:
+        entry = apple_url(urljoin(home_url, entries[0]))
+        parsed = urlsplit(entry)
+        if parsed.hostname == "idmsa.apple.com.cn" or parsed.path != "/shop/signIn":
+            raise LoginError("首页菜单返回了非预期的商城登录入口。")
+    except ValueError:
+        raise LoginError("首页菜单返回了非预期的商城登录入口。") from None
+    return entry
+
+
 def json_scripts(html):
     for attrs, body in re.findall(r"<script\b([^>]*)>(.*?)</script>", html, re.S | re.I):
         if "application/json" in attrs:
@@ -205,7 +231,8 @@ class AppleStoreLogin:
 
     def initialize_browser_context(self):
         started = time.monotonic()
-        log.info("[浏览器上下文] 开始初始化")
+        headless = getattr(interaction.handler, 'headless_browser', False) is True
+        log.info("[浏览器上下文] 开始初始化（%s）", '后台无头' if headless else '可见窗口')
         profile_root = self.browser_profile.parent
         # 正常启动与旧自动化启动使用不同配置，保留旧目录但不继承其状态。
         try:
@@ -228,19 +255,26 @@ class AppleStoreLogin:
                 "--remote-debugging-port=" + str(port), "--remote-debugging-address=127.0.0.1",
                 "--restore-last-session", "--no-first-run", "--no-default-browser-check",
                 "--window-size=500,640"]
+        if headless:
+            args.append("--headless=new")
         if proxy_url:
             parsed = urlsplit(proxy_url)
             if parsed.username or parsed.password:
                 raise LoginError("自动获取上下文暂不支持需要账号密码的代理，请使用本机无认证代理。")
             args.append("--proxy-server=" + proxy_url)
-        print(f"正常启动 Chrome，使用专用配置：{profile}。自动获取上下文后关闭并保留浏览器数据。")
-        process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        interaction.report_stage("正在获取浏览器上下文", browser_pid=process.pid)
+        print(f"{'后台无头启动' if headless else '正常启动'} Chrome，使用专用配置：{profile}。自动获取上下文后关闭并保留浏览器数据。")
+        launch = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+        if headless and os.name == 'nt':
+            launch['creationflags'] = subprocess.CREATE_NO_WINDOW
+        process = subprocess.Popen(args, **launch)
+        browser = None
         try:
+            interaction.report_stage("正在后台获取浏览器上下文（无头）" if headless else "正在获取浏览器上下文", browser_pid=process.pid)
             with sync_playwright() as playwright:
-                browser = None
                 deadline = time.monotonic() + 30
                 while browser is None:
+                    if headless and interaction.handler is not None:
+                        interaction.handler.channel.checkpoint()
                     if process.poll() is not None or time.monotonic() >= deadline:
                         raise LoginError("未能连接脚本启动的 Chrome，请关闭占用专用配置的浏览器后重试。")
                     try:
@@ -249,27 +283,48 @@ class AppleStoreLogin:
                     except BrowserError:
                         time.sleep(0.2)
                 from browser_remote import remote_context
-                with remote_context(interaction.handler, port) as remote:
+                with (nullcontext(None) if headless else remote_context(interaction.handler, port)) as remote:
                     try:
                         context = browser.contexts[0]
-                        from browser_login import pending_auth_page, trust_browser_if_offered, observe_login_network
+                        from browser_login import pending_auth_page, trust_browser_if_offered, observe_login_network, headless_auth_required, BrowserSessionError
                         network = observe_login_network(context, interaction.handler)
                         # Do not navigate a restored verification/trust page away.
                         preserve_auth = any(pending_auth_page(opened) for opened in context.pages)
+                        if headless and preserve_auth:
+                            raise headless_auth_required()
                         page = context.new_page() if preserve_auth else context.pages[0] if context.pages else context.new_page()
                         # 两个页面仍完成正常加载；Cookie 就绪后立即继续，不固定等待十秒。
                         for url in (HOME, HOME + "shop/bag"):
+                            if headless and interaction.handler is not None:
+                                interaction.handler.channel.checkpoint()
                             reply = page.goto(url, wait_until="domcontentloaded", timeout=45000)
                             if reply is None or reply.status >= 400:
+                                if headless and reply is not None and reply.status in (403, 429, 541):
+                                    raise BrowserSessionError('APPLE_SESSION_BLOCKED',
+                                        '后台无头预热被官网限制，请在官网登录窗口恢复；未自动重试。',
+                                        status='blocked', requires_login=True, http_status=reply.status,
+                                        browser_started=True, browser_connected=True)
                                 raise LoginError("Chrome 未能正常打开官网页面，未更新上下文。")
+                            if headless and pending_auth_page(page):
+                                raise headless_auth_required()
                         attempts, maximum, auth_seen, settled = 0, 80, False, None
                         while attempts < maximum:
                             attempts += 1
+                            if headless and interaction.handler is not None:
+                                interaction.handler.channel.checkpoint()
                             if remote is not None:
                                 remote.pump(page)
                             opened = [p for owned in browser.contexts for p in owned.pages]
-                            trust_pending = any(trust_browser_if_offered(p) for p in opened)
+                            trust_pending = any(trust_browser_if_offered(p, accept=False) if headless
+                                                else trust_browser_if_offered(p) for p in opened)
                             auth_pending = any(pending_auth_page(p) for p in opened)
+                            if headless and network.get('blocked_status') in (403, 429, 541):
+                                raise BrowserSessionError('APPLE_SESSION_BLOCKED',
+                                    '后台无头预热被官网限制，请在官网登录窗口恢复；未自动重试。',
+                                    status='blocked', requires_login=True, http_status=network['blocked_status'],
+                                    browser_started=True, browser_connected=True)
+                            if headless and (trust_pending or auth_pending):
+                                raise headless_auth_required()
                             if trust_pending or auth_pending or network['pending'] or network['error']:
                                 auth_seen, maximum, settled = True, 600, None
                                 if network['error'] and network.get('blocked_status') != 541:
@@ -305,6 +360,8 @@ class AppleStoreLogin:
         except BrowserError:
             raise LoginError("Chrome 初始化失败，请检查网络/代理及专用浏览器配置。") from None
         finally:
+            if headless and browser is None and process.poll() is None:
+                process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -494,15 +551,8 @@ class AppleStoreLogin:
     def bootstrap(self, signin_url=None, *, signin_response=None):
         if signin_url is None:
             home = self.page(HOME)
-            key = re.search(r'<meta\b[^>]*\bname=["\']globalnav-store-key["\'][^>]*\bcontent=["\']([^"\']+)',
-                            home.text, re.I)
-            if not key:
-                raise LoginError("官网首页未提供商城 API key，无法取得登录入口。")
-            self.api_key = key[1]
-            links = [link.get("url") for link in self.flyout() if link.get("type") == "signIn"]
-            if len(links) != 1 or not isinstance(links[0], str) or not links[0]:
-                raise LoginError("首页菜单未提供唯一的登录链接，已停止，未改走账户页。")
-            entry = apple_url(urljoin(home.url, links[0]))
+            self.api_key = storefront_api_key(home.text)
+            entry = storefront_signin_entry(home.url, self.flyout())
         else:
             entry = apple_url(signin_url)
         allowed_paths = {"/shop/signIn", "/shop/signIn/account", "/shop/signIn/orders"} if signin_url else {"/shop/signIn"}

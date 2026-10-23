@@ -5,6 +5,43 @@ import browser_login
 
 
 class BrowserLoginTests(unittest.TestCase):
+    def test_background_trust_detection_never_clicks_the_official_choice(self):
+        frame = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        frame.locator.return_value.inner_text.return_value = '是否信任此浏览器？'
+        frame.get_by_role.return_value.count.return_value = 1
+        frame.get_by_role.return_value.is_visible.return_value = True
+        page = Mock(frames=[frame])
+        self.assertTrue(browser_login.trust_browser_if_offered(page, accept=False))
+        frame.get_by_role.assert_not_called()
+        self.assertTrue(browser_login.trust_browser_if_offered(page))
+        frame.get_by_role.return_value.click.assert_called_once_with(timeout=1000)
+
+    def test_headless_signin_requires_manual_recovery_without_hidden_wait(self):
+        page = Mock(url='https://secure9.www.apple.com.cn/shop/signIn/account', frames=[])
+        process = Mock()
+        process.poll.return_value = None
+        network = {'pending': {}, 'error': None, 'last_activity': 0}
+        with self.assertRaises(browser_login.BrowserSessionError) as raised:
+            browser_login.wait_for_account_page(Mock(contexts=[Mock(pages=[page])]),
+                process, Mock(), 30, network, headless=True)
+        self.assertEqual(raised.exception.code, 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
+        self.assertTrue(raised.exception.requires_login)
+        page.wait_for_timeout.assert_not_called()
+
+    def test_headless_blocked_response_stops_without_visible_browser_recovery(self):
+        for status in (403, 429, 541):
+            with self.subTest(status=status):
+                process = Mock()
+                process.poll.return_value = None
+                page = Mock()
+                network = {'pending': {}, 'error': 'HTTP ' + str(status), 'blocked_status': status}
+                with self.assertRaises(browser_login.BrowserSessionError) as raised:
+                    browser_login.wait_for_account_page(Mock(contexts=[Mock(pages=[page])]),
+                        process, Mock(), 30, network, headless=True)
+                self.assertEqual(raised.exception.http_status, status)
+                self.assertEqual(raised.exception.status, 'blocked')
+                page.wait_for_timeout.assert_not_called()
+
     def test_only_known_official_signin_pages_require_login(self):
         for url in ('https://secure6.www.apple.com.cn/shop/signIn/account?secret=fixture',
                     'https://secure.www.apple.com.cn/shop/signIn',
@@ -75,7 +112,10 @@ class BrowserLoginTests(unittest.TestCase):
         cookies = [{'name': 'as_ltn_cn', 'value': 'fixture', 'domain': '.apple.com.cn', 'expires': -1}]
         context.cookies.return_value = cookies
         network = {'pending': {}, 'error': None}
-        button.click.side_effect = lambda **_: setattr(trust.locator.return_value.inner_text, 'return_value', '')
+        def finish_trust(**_):
+            trust.locator.return_value.inner_text.return_value = ''
+            trust.url = 'about:blank'
+        button.click.side_effect = finish_trust
 
         def wait(_):
             clock[0] += .5

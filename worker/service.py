@@ -27,6 +27,8 @@ class Service:
         self.remember = False
         self.authentication_requested = False
         self.authentication_failed = False
+        self.idle_maintenance = False
+        self.headless_browser = False
         self.purchase_auth_interaction = False
         self.action = None
         self.submitted = False
@@ -105,7 +107,17 @@ class Service:
                 self.password = self.vault.get(self.channel.account_id)
             except Exception:
                 self.stage('系统凭据保险库不可用，请输入本次登录密码')
+        if self.idle_maintenance is True:
+            from browser_login import BrowserSessionError
+            raise BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
+                '空闲预热需要重新认证，请使用“官网登录恢复（保留账号）”完成；后台未提交密码或验证码。',
+                status='requires_login', requires_login=True)
         if not self.password:
+            if getattr(self, 'headless_browser', False) is True:
+                from browser_login import BrowserSessionError
+                raise BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
+                    '后台预热缺少已保存密码，请在账号工作台完成登录后继续。',
+                    status='requires_login', requires_login=True)
             value = self.channel.prompt('password', '输入 Apple 账号密码', account=self.account)
             if not isinstance(value, dict) or not isinstance(value.get('password'), str) or not value['password']:
                 raise ValueError('请输入密码。')
@@ -117,6 +129,11 @@ class Service:
         kind = 'code' if '验证码' in label else 'text'
         if kind == 'code':
             self.purchase_auth_interaction = True
+        if getattr(self, 'headless_browser', False) is True:
+            from browser_login import BrowserSessionError
+            raise BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
+                '后台预热需要人工验证，请在账号工作台完成官网登录后继续。',
+                status='requires_login', requires_login=True)
         if self._parallel_child and kind == 'code':
             raise ValueError('并发会话需要验证，请先在账号工作台完成登录，再重新发起。')
         if (self.automatic_checkout or self.prefill_checkout) and kind != 'code':
@@ -352,10 +369,23 @@ class Service:
                     duo_killer.save_auth(session)
 
     def warm_login(self):
-        """Reuse the explicit login preheat without any shopping-bag mutation."""
+        """Refresh idle browser sessions; retain explicit manual preheat behavior."""
         self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')
-        refreshed = self.warm_start_context()
-        result = self.check_account(enrolling=False)
+        if self.action == 'session_maintain':
+            from apple_login import browser_profile_path
+            from browser_login import BrowserSessionError, login_in_browser
+            if (browser_profile_path(self.auth) / '.authx-541').exists():
+                raise BrowserSessionError('APPLE_SESSION_BLOCKED',
+                    '浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。',
+                    status='blocked', requires_login=True, http_status=541)
+            result = login_in_browser(self, timeout=12, maintenance=True)
+            if (result.get('success') is not True or result.get('logged_in') is not True
+                    or result.get('status') not in (None, 'healthy')):
+                return result
+            refreshed = True
+        else:
+            refreshed = self.warm_start_context()
+            result = self.check_account(enrolling=False)
         empty_bag_ready = duo_killer.warm_empty_bag()
         result.update(warm_login=True, browser_context_refreshed=refreshed,
             empty_bag_ready=empty_bag_ready,
@@ -376,6 +406,17 @@ class Service:
             raise BrowserSessionError('APPLE_SESSION_BLOCKED',
                 '浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。',
                 status='blocked', requires_login=True, http_status=541)
+        if self.action == 'session_maintain':
+            from browser_login import BrowserSessionError, login_in_browser
+            checked = login_in_browser(self, timeout=12, maintenance=True)
+            if (checked.get('success') is not True or checked.get('logged_in') is not True
+                    or checked.get('status') not in (None, 'healthy')):
+                raise BrowserSessionError(checked.get('error_code', 'SESSION_CHECK_INCOMPLETE'),
+                    checked.get('message', '官网会话尚未验证，未继续自提准备。'),
+                    status=checked.get('status', 'failed'), requires_login=checked.get('requires_login') is True,
+                    http_status=checked.get('http_status'),
+                    browser_started=checked.get('browser_started') is True,
+                    browser_connected=checked.get('browser_connected') is True)
         self.stage('空闲自提预热：使用当前账号商品和自提偏好，不创建订单')
         try:
             return self.run('purchase', {'sku': sku, 'quantity': count, 'fulfillment': 'RETAIL',
@@ -513,9 +554,19 @@ class Service:
                     result = duo_killer.login(sms=params.get('sms') is True)
         elif action == 'session_maintain':
             from session_maintenance import maintain_session
-            result = maintain_session(self, warm_only=params.get('warm_only') is True,
-                                      preheat_flow=params.get('preheat_flow', 'login'),
-                                      sku=params.get('sku'), count=params.get('quantity'))
+            previous_idle_maintenance = self.idle_maintenance
+            self.idle_maintenance = True
+            previous_headless = self.headless_browser
+            self.headless_browser = True
+            try:
+                result = maintain_session(self, warm_only=params.get('warm_only') is True,
+                                          preheat_flow=params.get('preheat_flow', 'login'),
+                                          sku=params.get('sku'), count=params.get('quantity'))
+            finally:
+                self.idle_maintenance = previous_idle_maintenance
+                # Nested prepare-only purchases inherit this scope. Manual actions
+                # and any later use of this service retain their original policy.
+                self.headless_browser = previous_headless
         elif action == 'purchase':
             if params.get('prepare_only') is True:
                 if not self.automatic_checkout:

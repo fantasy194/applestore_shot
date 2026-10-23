@@ -15,6 +15,91 @@ class SessionMaintenanceTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.service = Mock(root=Path(self.directory.name))
 
+    def real_service(self):
+        import interaction
+        import duo_killer
+        import alipay_qr
+        previous = interaction.handler
+        originals = {key: getattr(duo_killer, key) for key in ('ROOT', 'AUTH_PATH', 'LOG_PATH', 'PAYMENT_ROOT')}
+        qr_root = alipay_qr.ROOT
+        def restore():
+            interaction.handler = previous
+            for key, value in originals.items():
+                setattr(duo_killer, key, value)
+            alipay_qr.ROOT = qr_root
+        self.addCleanup(restore)
+        channel = Mock(account_id='fixture-account', task_id='fixture-task')
+        vault = Mock()
+        vault.get.return_value = None
+        return Service(channel, self.service.root, self.service.root, 'fixture@example.test', vault)
+
+    def test_only_session_maintenance_scopes_headless_and_restores_after_error_or_cancellation(self):
+        import asyncio
+        service = self.real_service()
+        self.assertFalse(service.headless_browser)
+        def observed(*args, **kwargs):
+            self.assertTrue(service.headless_browser)
+            return {'success': True, 'status': 'healthy'}
+        with patch('session_maintenance.maintain_session', side_effect=observed):
+            service.run('session_maintain', {'warm_only': True})
+        self.assertFalse(service.headless_browser)
+        for failure in (RuntimeError('fixture'), asyncio.CancelledError(), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                with patch('session_maintenance.maintain_session', side_effect=failure):
+                    with self.assertRaises(type(failure)):
+                        service.run('session_maintain', {'warm_only': True})
+                self.assertFalse(service.headless_browser)
+        service.headless_browser = True
+        with patch('session_maintenance.maintain_session', side_effect=observed):
+            service.run('session_maintain', {'warm_only': True})
+        self.assertTrue(service.headless_browser)
+
+    def test_manual_login_and_recovery_keep_visible_mode(self):
+        service = self.real_service()
+        def visible(*args, **kwargs):
+            self.assertFalse(service.headless_browser)
+            return {'success': True, 'logged_in': True}
+        with patch.object(service, 'warm_login', side_effect=visible):
+            service.run('login', {'warm_only': True})
+        with patch('browser_login.login_in_browser', side_effect=visible):
+            service.run('login', {'browser_login': True})
+        self.assertFalse(service.headless_browser)
+
+    def test_headless_missing_password_returns_attention_without_prompt_and_enters_existing_cooldown(self):
+        service = self.real_service()
+        with patch.object(service, 'warm_login', side_effect=lambda: service.credentials(service.auth)):
+            first = service.run('session_maintain', {'warm_only': True})
+            second = service.run('session_maintain', {'warm_only': True})
+        service.vault.get.assert_called_once_with('fixture-account')
+        service.channel.prompt.assert_not_called()
+        self.assertEqual(first['status'], 'requires_login')
+        self.assertEqual(first['error_code'], 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
+        self.assertEqual(first['browser_mode'], 'headless')
+        self.assertEqual(second['cooldown_until_ms'], first['cooldown_until_ms'])
+        self.assertFalse(service.headless_browser)
+
+    def test_headless_saved_password_is_reused_but_verification_code_never_prompts(self):
+        from browser_login import BrowserSessionError
+        service = self.real_service()
+        service.vault.get.return_value = 'private-fixture-password'
+        service.headless_browser = True
+        self.assertEqual(service.credentials(service.auth), (service.account, 'private-fixture-password'))
+        for label in ('输入验证码', '其他人工认证'):
+            with self.assertRaises(BrowserSessionError) as raised:
+                service.text(label)
+            self.assertEqual(raised.exception.code, 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
+            self.assertTrue(raised.exception.requires_login)
+        service.channel.prompt.assert_not_called()
+        self.assertNotIn('private-fixture-password', str(raised.exception))
+
+    def test_visible_missing_password_and_code_still_use_manual_prompts(self):
+        service = self.real_service()
+        service.channel.prompt.return_value = {'password': 'fixture-manual', 'remember': False}
+        self.assertEqual(service.credentials(service.auth), (service.account, 'fixture-manual'))
+        service.channel.prompt.return_value = '123456'
+        self.assertEqual(service.text('输入验证码'), '123456')
+        self.assertEqual(service.channel.prompt.call_count, 2)
+
     def test_healthy_browser_read_is_saved_without_credentials(self):
         with patch('browser_login.login_in_browser', return_value={
                 'logged_in': True, 'status': 'healthy', 'message': 'fixture verified'}) as browser:
@@ -204,6 +289,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                 self.assertEqual(quantity, 2)
                 self.assertTrue(prepare_only)
                 self.assertTrue(service.preparing)
+                self.assertTrue(service.headless_browser)
                 self.assertTrue(service.automatic_checkout)
                 self.assertFalse(service.keep_prepared_pickup)
                 self.assertEqual(service.fulfillment_mode, 'RETAIL')
@@ -211,11 +297,16 @@ class SessionMaintenanceTests(unittest.TestCase):
                 return {'success': True, 'status': 'waiting_stock', 'preparation_stage': 'fulfillment',
                         'order_ready': False, 'review_verified': False}
             with patch('duo_killer.purchase_sku', side_effect=offline_prepare) as purchase, \
+                    patch('browser_login.login_in_browser', return_value={
+                        'success': True, 'logged_in': True, 'status': 'healthy'}) as browser, \
                     patch('requests.Session.request', side_effect=AssertionError('network forbidden')):
                 result = service.run('session_maintain', {'warm_only': True,
                     'preheat_flow': 'pickup_prepare', 'sku': 'MK2P4CH', 'quantity': 2})
+            browser.assert_called_once_with(service, timeout=12, maintenance=True)
             purchase.assert_called_once()
             self.assertEqual(result['status'], 'waiting_stock')
+            self.assertEqual(result['browser_mode'], 'headless')
+            self.assertFalse(service.headless_browser)
             self.assertFalse(result['order_ready'])
             self.assertEqual(service.action, 'session_maintain')
             self.assertFalse(service.submitted)

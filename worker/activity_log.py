@@ -23,7 +23,7 @@ DETAIL_FIELDS = frozenset((
     'provider_id', 'requested_count', 'accepted_count', 'slot', 'expires_at', 'remaining_seconds',
     'available_count', 'unavailable_count', 'unknown_count', 'returned_store_count', 'interval_seconds',
     'concurrency', 'retry_count', 'attempts_made', 'retries_used', 'stop_reason', 'order_submitted', 'fulfillment',
-    'success', 'prompt_kind', 'prepared', 'auto_purchase', 'operation', 'transport', 'configured',
+    'success', 'prompt_kind', 'prepared', 'auto_purchase', 'operation', 'transport', 'browser_mode', 'configured',
     'queue_job_id', 'queue_assignment', 'sequence', 'enqueued_at_ms', 'mode', 'max_concurrency', 'queued_count', 'running_count', 'source',
 ))
 IDENTIFIER = re.compile(r'[A-Za-z0-9_.:-]{1,100}')

@@ -10,9 +10,10 @@ import duo_killer
 def record_maintenance_result(service, result, *, cooling=False, warm_only=False):
     activity = getattr(getattr(service, 'channel', None), 'activity', None)
     if activity is not None:
-        details = {key: result[key] for key in ('status', 'error_code', 'http_status', 'checked_at_ms', 'preheat_flow', 'preparation_stage', 'order_ready', 'review_verified')
+        details = {key: result[key] for key in ('status', 'error_code', 'http_status', 'checked_at_ms', 'preheat_flow', 'preparation_stage', 'order_ready', 'review_verified', 'browser_mode')
                    if key in result}
-        details.update(operation='session_maintain', transport='shared_session' if warm_only else 'official_browser',
+        details.update(operation='session_maintain', transport='shared_session'
+                       if warm_only and result.get('preheat_flow') == 'pickup_prepare' else 'official_browser',
                        reason='cooldown' if cooling else 'checked')
         activity.record('session_maintenance_result', '官网会话维护结果已记录。',
                         category='authentication', details=details,
@@ -22,6 +23,7 @@ def record_maintenance_result(service, result, *, cooling=False, warm_only=False
 def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='login', sku=None, count=None):
     if preheat_flow not in ('login', 'pickup_prepare'):
         raise ValueError('预热流程无效。')
+    browser_mode = 'headless' if getattr(service, 'headless_browser', False) is True else 'visible'
     path = service.root / 'session-maintenance.json'
     stamp = int(now() * 1000)
     if path.exists():
@@ -30,7 +32,7 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
         except (ValueError, OSError):
             previous = {}
         if previous.get('cooldown_until_ms', 0) > stamp:
-            result = {**previous, 'preheat_flow': preheat_flow, 'message': '会话维护处于冷却期，请按提示处理官网登录；未重复请求。'}
+            result = {**previous, 'preheat_flow': preheat_flow, 'browser_mode': browser_mode, 'message': '会话维护处于冷却期，请按提示处理官网登录；未重复请求。'}
             record_maintenance_result(service, result, cooling=True, warm_only=warm_only)
             return result
     from browser_login import login_in_browser, BrowserSessionError
@@ -93,6 +95,7 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
                       'message': ('会话检查的网络请求未完成；请检查网络，未判定登录过期。' if network else
                                   '无法访问本地浏览器资料或文件；会话状态尚未检查。' if local_io else
                                   '会话检查未完成，请查看任务诊断；未判定登录过期或重置账号。')}
+    result['browser_mode'] = browser_mode
     result['preheat_flow'] = preheat_flow
     result['checked_at_ms'] = stamp
     result['cooldown_until_ms'] = (0 if result['status'] in ('healthy', 'prepared', 'waiting_stock') else stamp +

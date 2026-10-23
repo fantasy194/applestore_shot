@@ -9,7 +9,9 @@ docker compose logs app
 
 打开 **http://127.0.0.1:17654**，使用首次启动日志中的“首次 Web 访问密码”登录；也可直接使用日志中的 `#access=` 本机链接。已有源码服务默认使用 17653，Docker 默认使用 17654，可同时运行。
 
-镜像内置 Rust Web 服务、编译后的 React 页面、Python 及依赖、GUI 浏览器、Xvfb 和 Openbox。`linux/amd64`（x86-64）使用正式 Google Chrome，`linux/arm64`（ARM64）使用 Debian 的 Chromium 和 `chromium-sandbox` 包，两者均为原生架构。浏览器继续以 GUI 方式启动，由现有代码通过本机 CDP 连接；官网窗口通过页面现有的浏览器预览与控制区域操作。没有改为 headless，也没有更换登录、Cookie、浏览器资料或输入实现。Linux 浏览器发现优先保留 Chrome/Edge，再查找 `/usr/bin/chromium`；桌面版及源码启动仍默认只监听回环地址。
+镜像内置 Rust Web 服务、编译后的 React 页面、Python 及依赖、Chrome / Chromium、Xvfb 和 Openbox。`linux/amd64`（x86-64）使用正式 Google Chrome，`linux/arm64`（ARM64）使用 Debian 的 Chromium 和 `chromium-sandbox` 包，两者均为原生架构。自动空闲预热使用 `--headless=new`，不需要 `DISPLAY`，不注册远程窗口；手动登录、手动预热和官网登录恢复仍使用 Xvfb 内的 GUI 窗口，可通过页面现有的浏览器预览与控制区域操作。两种模式沿用该账号的专用浏览器资料、Cookie 和本机 CDP，不更换认证实现。Linux 浏览器发现优先保留 Chrome/Edge，再查找 `/usr/bin/chromium`；桌面版及源码启动仍默认只监听回环地址。
+
+空闲十分钟后，两种自动预热都会先用无头浏览器读取官网首页、购物袋和账户页，核验并同步当前会话；自提预热再继续原 `prepare_only` 流程。后台需要重新认证时停止，即使已保存密码也不提交密码或验证码；541 及冷却标记保留。手动官网恢复从当前首页菜单进入登录，详情和证据边界见 [官网恢复与空闲会话刷新](../docs/STOREFRONT-SESSION-RECOVERY.md)。无需另设无头环境变量，普通更新继续保留 `/data`，也保留 Xvfb 供人工恢复使用。
 
 Compose 不指定固定平台，由 Docker 自动选择主机架构；本地构建同样支持这两个平台。ARM64 的包来源见 [Debian Chromium](https://packages.debian.org/bookworm/chromium) 和 [Chromium 沙箱](https://packages.debian.org/bookworm/chromium-sandbox)。两个架构均使用非 root 用户及沙箱，Compose 加载 [`chrome-seccomp.json`](chrome-seccomp.json) 允许沙箱所需的用户命名空间，未使用 privileged 或 `--no-sandbox`。该 profile 来自 [Playwright 官方 Docker 配置](https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json)，相关说明见 [Playwright Docker 文档](https://playwright.dev/docs/docker)。
 
