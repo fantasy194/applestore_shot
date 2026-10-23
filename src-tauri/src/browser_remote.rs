@@ -361,6 +361,14 @@ mod tests {
             json!({"type":"click","x":12.0,"y":13.0,"sequence":7})
         );
         assert!(input(&json!({"type":"text","text":"fixture-password","sequence":7})).is_ok());
+        assert_eq!(
+            input(&json!({"type":"text","text":"   ","sequence":7})).unwrap(),
+            json!({"type":"text","text":"   ","sequence":7})
+        );
+        assert_eq!(
+            input(&json!({"type":"key","key":"Space","sequence":7})).unwrap(),
+            json!({"type":"key","key":"Space","sequence":7})
+        );
         for value in [
             json!({"type":"navigate","url":"https://apple.com"}),
             json!({"type":"click","x":12,"y":13,"sequence":7,"url":"https://apple.com"}),

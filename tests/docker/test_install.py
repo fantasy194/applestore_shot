@@ -61,7 +61,7 @@ if os.environ.get('MOCK_CURL_FAILURE'):
     sys.exit(28)
 url = next(value for value in args if value.startswith('https://'))
 assert url.startswith('https://raw.githubusercontent.com/fantasy194/applestore_shot/main/')
-relative = 'docker/chrome-seccomp.json' if url.endswith('chrome-seccomp.json') else 'compose.yaml'
+relative = url.split('/main/', 1)[1]
 destination.write_bytes((Path(os.environ['MOCK_ROOT']) / relative).read_bytes())
 print('fixture download 100%', file=sys.stderr)
 ''')
@@ -112,7 +112,60 @@ print('fixture download 100%', file=sys.stderr)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for relative, text in files.items():
             self.assertEqual((self.deploy / relative).read_text(), text)
-        self.assertIn('保留已有自动更新配置', result.stdout)
+        self.assertIn('保留已有自定义配置', result.stdout)
+
+    def seed_legacy_official_configuration(self):
+        for name in ['compose.yaml', 'compose.autoupdate.yaml']:
+            fixture = ROOT / 'tests/docker/fixtures' / name.replace('.yaml', '.legacy.yaml')
+            (self.deploy / name).write_bytes(fixture.read_bytes())
+        (self.deploy / '.env').write_text('DUO_WEB_PORT=18777\n')
+        data = self.deploy / 'data/browser-profile/cookie-fixture'
+        data.parent.mkdir(parents=True)
+        data.write_text('persistent synthetic cookie')
+
+    def test_previous_official_install_migrates_both_files_and_keeps_backups_and_data(self):
+        self.seed_legacy_official_configuration()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ['compose.yaml', 'compose.autoupdate.yaml']:
+            self.assertEqual((self.deploy / name).read_bytes(), (ROOT / name).read_bytes())
+            self.assertTrue((self.deploy / (name + '.duo-sha256')).exists())
+            backups = list(self.deploy.glob(name + '.backup.*'))
+            self.assertEqual(len(backups), 1)
+            fixture = ROOT / 'tests/docker/fixtures' / name.replace('.yaml', '.legacy.yaml')
+            self.assertEqual(backups[0].read_bytes(), fixture.read_bytes())
+        overlay = (self.deploy / 'compose.autoupdate.yaml').read_text()
+        self.assertIn('${BROWSER_IMAGE:-${APP_IMAGE:-', overlay)
+        self.assertIn('  browser:', overlay)
+        self.assertEqual(overlay.count('watchtower.enable: "true"'), 2)
+        self.assertEqual((self.deploy / '.env').read_text(), 'DUO_WEB_PORT=18777\n')
+        self.assertEqual((self.deploy / 'data/browser-profile/cookie-fixture').read_text(),
+                         'persistent synthetic cookie')
+        self.assertFalse(list(self.deploy.rglob('*.download.*')))
+
+    def test_failed_migration_validation_keeps_both_existing_files(self):
+        self.seed_legacy_official_configuration()
+        before = {name: (self.deploy / name).read_bytes()
+                  for name in ['compose.yaml', 'compose.autoupdate.yaml']}
+        result = self.run_installer(MOCK_CONFIG_FAILURE='1')
+        self.assertEqual(result.returncode, 15, result.stdout + result.stderr)
+        for name, original in before.items():
+            self.assertEqual((self.deploy / name).read_bytes(), original)
+            self.assertFalse(list(self.deploy.glob(name + '.backup.*')))
+        self.assertFalse(list(self.deploy.rglob('*.download.*')))
+        self.assertFalse(any('pull' in args or 'up' in args for args in self.docker_calls()))
+
+    def test_later_install_updates_managed_files_but_preserves_local_edits(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        original = (self.deploy / 'compose.yaml').read_bytes()
+        edited = original + b'\n# local deployment edit\n'
+        (self.deploy / 'compose.yaml').write_bytes(edited)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.deploy / 'compose.yaml').read_bytes(), edited)
+        self.assertIn('保留已有自定义配置：compose.yaml', result.stdout)
+        self.assertFalse(list(self.deploy.glob('compose.yaml.backup.*')))
 
     def test_zero_byte_files_from_interrupted_old_installer_are_downloaded_again(self):
         (self.deploy / 'compose.yaml').touch()

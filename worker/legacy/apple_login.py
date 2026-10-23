@@ -267,7 +267,8 @@ class AppleStoreLogin:
         launch = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
         if headless and os.name == 'nt':
             launch['creationflags'] = subprocess.CREATE_NO_WINDOW
-        process = subprocess.Popen(args, **launch)
+        from browser_process import launch_browser
+        process = launch_browser(args, **launch)
         browser = None
         try:
             interaction.report_stage("正在后台获取浏览器上下文（无头）" if headless else "正在获取浏览器上下文", browser_pid=process.pid)

@@ -156,6 +156,17 @@ class BrowserRemoteTests(unittest.TestCase):
             self.assertEqual(registry['task_id'], 'task-fixture')
             self.assertFalse((target_dir / 'browser-remote.json').exists())
 
+    def test_space_key_and_whitespace_text_reach_the_browser_unchanged(self):
+        with BrowserRemote(self.service) as broker:
+            broker.tick(self.page)
+            sequence = broker.sequence
+            code, _ = self.input_and_tick(broker, {'type': 'key', 'key': 'Space', 'sequence': sequence})
+            self.assertEqual(code, 200)
+            self.page.keyboard.press.assert_called_once_with('Space')
+            code, _ = self.input_and_tick(broker, {'type': 'text', 'text': '   ', 'sequence': sequence})
+            self.assertEqual(code, 200)
+            self.page.keyboard.insert_text.assert_called_once_with('   ')
+
     def test_inputs_execute_on_the_owner_tick_and_are_not_persisted(self):
         with BrowserRemote(self.service) as broker:
             broker.tick(self.page)

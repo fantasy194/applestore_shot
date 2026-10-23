@@ -298,6 +298,27 @@ test("输入只发送给当前窗口后立即清空且键盘滚动可用", async
   ).toBe(400);
 });
 
+test("官网空格键及纯空格输入保持原值", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  const space = page.getByRole("button", { name: "空格", exact: true });
+  await expect(space).toBeEnabled();
+  await space.click();
+  const field = page.getByLabel("输入到官网", { exact: true });
+  await field.fill("   ");
+  await page.getByRole("button", { name: "发送输入", exact: true }).click();
+  await expect(field).toHaveValue("");
+  const inputs = await page.evaluate(() => (window as any).remoteInputs);
+  expect(inputs).toHaveLength(2);
+  expect(inputs[0]).toMatchObject({ type: "key", key: "Space" });
+  expect(inputs[1]).toMatchObject({ type: "text", text: "   " });
+  expect(inputs.every((value: any) => value.sequence > 0)).toBe(true);
+  await page.evaluate(() => {
+    (window as any).remoteState.stale = true;
+  });
+  await expect(space).toBeDisabled();
+});
+
 test("过期画面与终态任务都不能继续输入", async ({ page }) => {
   await fixture(page);
   await page.goto("/");

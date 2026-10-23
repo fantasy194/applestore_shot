@@ -1,0 +1,19 @@
+services:
+  app:
+    image: ${APP_IMAGE:-ghcr.io/fantasy194/applestore_shot:latest}
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: applestore-shot
+  browser:
+    image: ${BROWSER_IMAGE:-${APP_IMAGE:-ghcr.io/fantasy194/applestore_shot:latest}-browser}
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: applestore-shot
+  watchtower:
+    image: ghcr.io/nicholas-fedor/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ['--interval=300', '--label-enable', '--scope=applestore-shot', '--stop-timeout=45s', '--cleanup']
+    labels:
+      com.centurylinklabs.watchtower.scope: applestore-shot

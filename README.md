@@ -10,7 +10,7 @@ iPhone DUO launch assistant and Apple Store quick checkout tool for macOS, Windo
 
 | 功能 | 说明 |
 | --- | --- |
-| iPhone DUO 发售状态与库存监控 | 无需 Apple 登录读取发售提示；可从接口选多家门店，每秒监控实际库存并联动自提抢购。未知状态不代表有货。 |
+| iPhone DUO 发售状态与库存监控 | 无需 Apple 登录读取发售提示；可从接口选多家门店，按 1–300 秒间隔监控实际库存（默认 1 秒）并联动自提抢购。未知状态不代表有货。 |
 | 商品与数量预设 | 内置 Duo 白色 256GB、512GB、iPhone 18 Pro 银色 256GB 与抛光布 SKU，默认数量为 1。 |
 | 快速下单 | 自动送货并使用本地地址和联系方式；核对商品、数量、地址、金额与支付宝后创建订单。 |
 | 临时失败恢复 | 送货、地址、支付方式失败后先读取当前结算状态，已完成则继续，仍在原步骤且允许继续时有限重试。 |
@@ -21,7 +21,7 @@ iPhone DUO launch assistant and Apple Store quick checkout tool for macOS, Windo
 | 支付与订单查询 | 确认下单后立即展示订单信息，随后加载支付宝二维码；支持查询及取消官网允许取消的未付款订单。 |
 | 手机 PWA 与后台通知 | 默认密码保护的 HTTPS Quick Tunnel；库存变化通知及每分钟待付款提醒，最长 30 分钟。 |
 | 并发自提 | 默认 1 路，可配 1–10 路；下单失败支持配置 0–10 次额外串行重试，已有订单或提交未知即停止。 |
-| 自动执行队列 | 监控有货目标按 FIFO 保存，默认逐个执行，也可固定并发；账号忙时保留排队，队列共用 10 个下单子路名额。 |
+| 自动执行队列 | 监控有货目标按 FIFO 保存，默认逐个执行，也可固定并发；可设置执行前库存样本时效检查（默认开启），等待项保留位置且不占执行名额，后续可执行目标继续派发。队列共用 10 个下单子路名额。 |
 | 运行日志与会话恢复 | 按账号、任务、类别查看结构化日志；保留原账号和浏览器资料恢复官网会话，PWA 可操作当前任务的官方浏览器窗口。 |
 
 **DUO 使用流程：**提前配置账号与地址、预热登录 → 刷新发售状态 → 选择商品 → 立即下单 → 自动核对并创建订单 → 扫码支付 → 查询订单。
@@ -30,7 +30,7 @@ iPhone DUO launch assistant and Apple Store quick checkout tool for macOS, Windo
 
 **手机远程入口：**安装官方 `cloudflared` 后运行 `pnpm pwa` 或双击 `start-pwa.cmd`，启动器保留已有 Web 账号数据并显示 HTTPS 地址与默认密码。手机添加到主屏幕后启用通知。参见 [自动监控、并发自提与 PWA](docs/MONITOR-PWA.md)。
 
-**官网登录远程画面：**新画面在后台读取、解码后替换，短暂无画面或网络抖动时保留上一帧和未发送输入，连续刷新期间可继续操作。画面过期时暂停发送，窗口结束或切换账号任务时清除输入。详见 [官网远程画面后台刷新](docs/REMOTE-BROWSER-PREVIEW.md)。
+**官网登录远程画面：**新画面在后台读取、解码后替换，短暂无画面或网络抖动时保留上一帧和未发送输入，连续刷新期间可继续操作。支持点击“空格”向当前官网输入框发送空格键，也保留文本中的空格。画面过期时暂停发送，窗口结束或切换账号任务时清除输入。详见 [官网远程画面后台刷新](docs/REMOTE-BROWSER-PREVIEW.md)。
 
 **队列与账号会话：**队列按最新倒序显示、实际保持 FIFO；无货或关闭授权后保留未执行任务，手动取消仍有效。账号下单空闲 10 分钟后执行“预热登录（不加购）”，手动、定时和监控下单优先。通知、密码及安装入口统一放在“应用设置”，自动监控提供最近有货事件列表。使用流程、持久化 ACK 和恢复边界见 [执行队列、结构化日志与官网会话恢复](docs/QUEUE-LOGS-SESSION.md)。
 
@@ -76,9 +76,9 @@ pnpm dev:web
 
 **使用构建好的 Web 版：**macOS 双击 `local-web-release/启动.command`，Windows 双击 `local-web-release/start.cmd`。保留整个目录，无需安装开发环境。
 
-**Docker Compose：**在项目目录执行 `docker compose up -d --build --wait`，打开 `http://127.0.0.1:17654`，从 `docker compose logs app` 获取首次访问密码。镜像支持 `linux/amd64` 和 `linux/arm64`，分别内置 GUI Google Chrome 和 Chromium，以及虚拟显示器；账号和浏览器资料保存在独立数据卷。GitHub Actions 在推送 `main` 或 `v*` 标签时构建、验证两种架构，并发布到 `ghcr.io/fantasy194/applestore_shot`。直接拉取镜像、详细配置和数据保留说明见 [Docker 本地部署](docker/README.md)。
+**Docker Compose：**在项目目录执行 `docker compose up -d --build --wait`，打开 `http://127.0.0.1:17654`，从 `docker compose logs app` 获取首次访问密码。自 0.1.3 起，Compose 同时启动应用和基于 [jlesage/chromium](https://github.com/jlesage/docker-chromium) 的浏览器容器；添加账号、官网登录及预热通过私有 CDP 通道操作独立账号浏览器，沿用 `/data` 中的资料。两种镜像均支持 `linux/amd64` 和 `linux/arm64`，不向主机发布 CDP 或 VNC。GitHub Actions 在推送 `main` 或 `v*` 标签时分别验证两种架构，发布应用的 `latest` 和配套的 `latest-browser` 镜像。旧单容器部署需先更新 Compose 配置，单独更新应用镜像仍沿用原内置浏览器。升级和数据保留说明见 [Docker 本地部署](docker/README.md)。
 
-**树莓派快捷部署与自动更新：**下载并执行 [`scripts/install-docker.sh`](scripts/install-docker.sh)。脚本显示六个部署阶段、下载进度及每五秒的等待提示；配置下载、镜像拉取和服务启动分别设置超时，失败会标明阶段和退出码。首次配置 Watchtower 每五分钟检查新版；重新运行保留非空配置文件、已有 Compose 项目和 `/data` 数据卷。已安装 Docker Compose 的 64 位树莓派可执行 `bash scripts/install-docker.sh`；自定义目录使用 `DUO_INSTALL_DIR`。安装器的离线回归覆盖下载中断、原配置保留及拉取 / 启动失败。
+**树莓派快捷部署与自动更新：**下载并执行 [`scripts/install-docker.sh`](scripts/install-docker.sh)。脚本显示六个部署阶段、下载进度及每五秒的等待提示；配置下载、镜像拉取和服务启动分别设置超时，失败会标明阶段和退出码。首次配置 Watchtower 每五分钟检查应用与浏览器新版。重新运行会备份并升级未修改的官方 Compose 配置，保留自定义配置、已有项目及 `/data` 数据卷；自定义部署按 Docker 文档合并浏览器服务后再更新。已安装 Docker Compose 的 64 位树莓派可执行 `bash scripts/install-docker.sh`；自定义目录使用 `DUO_INSTALL_DIR`。安装器的离线回归覆盖旧配置升级、自定义配置保留、下载中断及拉取 / 启动失败。
 
 **浏览器上下文连接：**添加账号、官网登录恢复和预览共用有界的分阶段 CDP 连接，等待端口就绪后再完整连接，避免树莓派慢启动被旧的 1 秒超时误判为配置占用。连接失败会区分原因并保留账号资料；双架构镜像新增真实浏览器的慢握手、预览输入和资料重启回归。说明见 [浏览器连接诊断与验证](docs/BROWSER-CDP-STARTUP.md)。
 

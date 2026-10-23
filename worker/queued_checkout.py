@@ -43,7 +43,8 @@ def validate_target(value):
     target = {key: child for key, child in value.items() if key in (
         'queue_job_id', 'id', 'queue_assignment', 'sku', 'quantity', 'fulfillment',
         'pickup_store_id', 'pickup_store_name', 'pickup_location', 'concurrency',
-        'retry_count', 'checked_at_ms', 'inventory_trigger', 'target_id', 'pickup_policy')}
+        'retry_count', 'checked_at_ms', 'inventory_trigger', 'target_id', 'pickup_policy',
+        'check_inventory_freshness')}
     identity = target.get('queue_job_id', target.get('id'))
     if not isinstance(identity, str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,100}', identity):
         raise ValueError('队列任务标识无效。')
@@ -66,6 +67,10 @@ def validate_target(value):
         if not isinstance(text, str) or not text.strip() or len(text) > 200:
             raise ValueError('队列门店名称或城市邮编无效。')
         target[key] = text.strip()
+    check_age = target.get('check_inventory_freshness', True)
+    if type(check_age) is not bool:
+        raise ValueError('库存样本时效检查开关必须为布尔值。')
+    target['check_inventory_freshness'] = check_age
     target['fulfillment'] = 'RETAIL'
     target['concurrency'] = concurrency(target)
     target['retry_count'] = retry_count(target)
@@ -409,7 +414,9 @@ class QueuedCheckout:
     def _launch(self, identity):
         job = self.jobs[identity]
         checked = job['target'].get('checked_at_ms')
-        if (type(checked) is not int or not -1000 <= int(time.time() * 1000) - checked <= 10_000):
+        age = int(time.time() * 1000) - checked if type(checked) is int else None
+        if (age is None or checked <= 0 or age < -1000
+                or job['target']['check_inventory_freshness'] and age > 10_000):
             self._finish(identity, {'status': 'paused', 'success': False, 'started': False,
                                     'order_submitted': False, 'pause_reason': 'inventory_stale',
                                     'retryable': False})

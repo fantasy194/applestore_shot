@@ -136,6 +136,7 @@ export function PurchaseQueue({
   const [state, setState] = useState<Data | null>(null);
   const [mode, setMode] = useState("sequential");
   const [maximum, setMaximum] = useState(1);
+  const [checkFreshness, setCheckFreshness] = useState(true);
   const [maximumValid, setMaximumValid] = useState(true);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState("");
@@ -159,6 +160,7 @@ export function PurchaseQueue({
             if (!initialized.current) {
               setMode(result.mode || "sequential");
               setMaximum(result.max_concurrency ?? 1);
+              setCheckFreshness(result.check_inventory_freshness !== false);
               initialized.current = true;
             }
           }
@@ -273,7 +275,11 @@ export function PurchaseQueue({
               onSubmit={async (event) => {
                 event.preventDefault();
                 if (
-                  await command("configure", { mode, max_concurrency: maximum })
+                  await command("configure", {
+                    mode,
+                    max_concurrency: maximum,
+                    check_inventory_freshness: checkFreshness,
+                  })
                 )
                   setDirty(false);
               }}
@@ -306,6 +312,23 @@ export function PurchaseQueue({
                   }}
                 />
               </div>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={checkFreshness}
+                  disabled={busy}
+                  onChange={(event) => {
+                    setCheckFreshness(event.target.checked);
+                    setDirty(true);
+                  }}
+                />
+                下单前检查库存样本时效
+              </label>
+              <p className="muted">
+                默认开启：超过 10
+                秒则保留位置并等待新确认，后续符合条件的任务继续执行。
+                关闭后允许使用最近一次有货确认，官网结账仍重新核对；未知库存、无货及授权限制继续生效。
+              </p>
               <p className="muted">
                 默认逐个执行，可同时执行 1–10
                 个任务。修改策略前，请暂停队列并等待执行中的任务结束。

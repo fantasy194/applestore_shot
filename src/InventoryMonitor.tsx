@@ -112,6 +112,7 @@ export function InventoryMonitor({
   const invalidConfig = invalidNumbers.some(
     (key) =>
       key === "pool" ||
+      key === "interval" ||
       config.targets.some((target) => key.startsWith(`${target.id}:`)) ||
       config.proxy.providers.some(
         (provider) => key === `provider:${provider.id}`,
@@ -359,7 +360,7 @@ export function InventoryMonitor({
       <header className="local-heading monitor-header">
         <div>
           <h1>{compact ? "门店库存监控" : "自动监控"}</h1>
-          <p>每秒检查门店库存</p>
+          <p>按设定间隔检查门店库存</p>
         </div>
         <span
           className={`inventory-run-state ${running ? "is-running" : ""}`}
@@ -412,6 +413,23 @@ export function InventoryMonitor({
               </strong>
             </div>
           </div>
+          <div className="schedule-fields">
+            <NumberField
+              label="监控检查间隔（秒）"
+              min={1}
+              max={300}
+              required
+              disabled={busy || running}
+              value={config.interval_seconds}
+              onValidityChange={(valid) => numberValidity("interval", valid)}
+              onChange={(value) =>
+                change({ ...config, interval_seconds: value })
+              }
+            />
+          </div>
+          <p className="ui-caption">
+            每 1–300 秒检查一次，修改间隔前请先停止监控。
+          </p>
           <div className="ui-toolbar monitor-controls button-row inventory-actions">
             <button
               className="primary"

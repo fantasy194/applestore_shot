@@ -290,6 +290,52 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(events[1]['result']['started'])
         self.assertEqual(result['queue_jobs'][0]['queue_assignment'],2)
 
+    def test_stale_head_ack_keeps_same_account_fresh_later_target_running(self):
+        called=[]
+        def executor(context,item):
+            called.append(item['queue_job_id'])
+            return {'success':False,'status':'failed'}
+        self.execute([target('old',queue_assignment=3,checked_at_ms=int(time.time()*1000)-20_000),
+                      target('fresh','R002',queue_assignment=4)],executor)
+        self.assertEqual(called,['fresh'])
+        finished=self.finished()
+        self.assertEqual([row['queue_job_id'] for row in finished],['old','fresh'])
+        self.assertEqual(finished[0]['result']['pause_reason'],'inventory_stale')
+        self.assertFalse(finished[0]['result']['started'])
+        self.assertTrue(finished[1]['result']['started'])
+        self.assertEqual(finished[1]['queue_assignment'],4)
+
+    def test_disabled_freshness_starts_old_confirmation_and_acknowledges_assignment(self):
+        called=[]
+        def executor(context,item):
+            called.append(item['queue_assignment'])
+            self.assertFalse(item['check_inventory_freshness'])
+            return {'success':False,'status':'failed'}
+        result,_=self.execute([target('a',queue_assignment=7,
+            checked_at_ms=int(time.time()*1000)-60_000,check_inventory_freshness=False)],executor)
+        self.assertEqual(called,[7])
+        finished=self.finished()
+        self.assertEqual(len(finished),1)
+        self.assertEqual(finished[0]['queue_assignment'],7)
+        self.assertTrue(finished[0]['result']['started'])
+        self.assertFalse(finished[0]['result']['order_submitted'])
+
+    def test_disabled_freshness_still_rejects_missing_and_future_samples(self):
+        called=[]
+        def executor(context,item):
+            called.append(item['queue_job_id'])
+            return {'success':False,'status':'failed'}
+        self.execute([target('missing',checked_at_ms=None,check_inventory_freshness=False),
+                      target('future','R002',checked_at_ms=int(time.time()*1000)+60_000,
+                             check_inventory_freshness=False),
+                      target('fresh','R003')],executor)
+        self.assertEqual(called,['fresh'])
+        self.assertEqual([row['result']['started'] for row in self.finished()],[False,False,True])
+        self.assertTrue(validate_target(target('default'))['check_inventory_freshness'])
+        for invalid in (None,0,1,'false'):
+            with self.assertRaises(ValueError):
+                validate_target(target('invalid',check_inventory_freshness=invalid))
+
     def test_cancel_running_prompt_finishes_target_without_waiting_for_user(self):
         self.channel.auto_reply=False
         def callback(kind,payload):

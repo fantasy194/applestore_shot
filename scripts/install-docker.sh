@@ -5,6 +5,7 @@ set -Eeuo pipefail
 duo_stage='准备'
 duo_child_pid=''
 duo_download_temp=''
+duo_config_temps=()
 duo_install_dir="${DUO_INSTALL_DIR:-$HOME/applestore_shot}"
 duo_download_base='https://raw.githubusercontent.com/fantasy194/applestore_shot/main'
 
@@ -13,6 +14,10 @@ duo_message() {
 }
 
 duo_cleanup() {
+  local duo_temp
+  for duo_temp in "${duo_config_temps[@]}"; do
+    rm -f -- "$duo_temp"
+  done
   if [[ -n "$duo_child_pid" ]]; then
     kill -TERM "$duo_child_pid" 2>/dev/null || true
     wait "$duo_child_pid" 2>/dev/null || true
@@ -78,9 +83,53 @@ duo_download() {
   duo_download_temp=''
 }
 
+# Update only a byte-identical official configuration or the last installed
+# version recorded locally. Local edits are never overwritten by the installer.
+duo_config_candidate() {
+  local duo_relative=$1
+  local duo_legacy_hash=$2
+  local duo_current_hash=''
+  local duo_saved_hash=''
+  if [[ -s "$duo_relative" ]]; then
+    duo_current_hash=$(sha256sum "$duo_relative")
+    duo_current_hash=${duo_current_hash%% *}
+    if [[ -s "${duo_relative}.duo-sha256" ]]; then
+      read -r duo_saved_hash < "${duo_relative}.duo-sha256"
+    fi
+    if [[ "$duo_current_hash" != "$duo_legacy_hash" && "$duo_current_hash" != "$duo_saved_hash" ]]; then
+      duo_message "保留已有自定义配置：$duo_relative；如需浏览器容器，请按 Docker 文档手动合并。"
+      duo_candidate=$duo_relative
+      return
+    fi
+  fi
+  duo_candidate=$(mktemp "${duo_relative}.download.XXXXXX")
+  duo_config_temps+=("$duo_candidate")
+  duo_message "下载并校验项目托管配置：$duo_relative"
+  duo_run timeout --kill-after=5s 130s curl \
+    --fail --location --show-error --progress-bar \
+    --connect-timeout 10 --max-time 60 --retry 1 \
+    "$duo_download_base/$duo_relative" --output "$duo_candidate"
+  [[ -s "$duo_candidate" ]]
+}
+
+duo_config_commit() {
+  local duo_relative=$1
+  local duo_source=$2
+  if [[ "$duo_source" == "$duo_relative" ]]; then
+    return
+  fi
+  if [[ -s "$duo_relative" ]]; then
+    cp -p -- "$duo_relative" "${duo_relative}.backup.$(date '+%Y%m%d%H%M%S').$$"
+  fi
+  mv -- "$duo_source" "$duo_relative"
+  local duo_hash
+  duo_hash=$(sha256sum "$duo_relative")
+  printf '%s\n' "${duo_hash%% *}" > "${duo_relative}.duo-sha256"
+}
+
 duo_stage='1/6 检查系统和 Docker'
 duo_message "$duo_stage"
-for duo_command in docker curl timeout mktemp; do
+for duo_command in docker curl timeout mktemp sha256sum; do
   if ! command -v "$duo_command" >/dev/null 2>&1; then
     printf '缺少命令：%s。请先安装 Docker Compose、curl 及 coreutils。\n' "$duo_command" >&2
     exit 1
@@ -99,43 +148,22 @@ duo_message "部署目录：$PWD；沿用已有 Compose 项目和数据卷。"
 
 duo_stage='2/6 下载配置文件'
 duo_message "$duo_stage"
-duo_download compose.yaml
+duo_config_candidate compose.yaml 54ad9625e35ed9dcdc8170a6f81a8aef3a2e44d06b20d2f84e9576fd0b75cf2d
+duo_compose_input=$duo_candidate
 duo_download docker/chrome-seccomp.json
 
 duo_stage='3/6 配置自动更新并检查 Compose'
 duo_message "$duo_stage"
-duo_overlay_input='compose.autoupdate.yaml'
-if [[ -s "$duo_overlay_input" ]]; then
-  duo_message "保留已有自动更新配置：$duo_overlay_input"
-else
-  duo_download_temp=$(mktemp 'compose.autoupdate.yaml.download.XXXXXX')
-  duo_overlay_input=$duo_download_temp
-  cat > "$duo_overlay_input" <<'YAML'
-services:
-  app:
-    image: ghcr.io/fantasy194/applestore_shot:latest
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
-      com.centurylinklabs.watchtower.scope: applestore-shot
-  watchtower:
-    image: ghcr.io/nicholas-fedor/watchtower:latest
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: ['--interval=300', '--label-enable', '--scope=applestore-shot', '--stop-timeout=45s', '--cleanup']
-    labels:
-      com.centurylinklabs.watchtower.scope: applestore-shot
-YAML
-fi
-duo_compose=(docker compose --progress plain -f compose.yaml -f "$duo_overlay_input")
+duo_config_candidate compose.autoupdate.yaml 58820b5d79f5f382564529460af92566bd3ec35d5c9469c75d573c77e3b0d986
+duo_overlay_input=$duo_candidate
+
+duo_compose=(docker compose --progress plain -f "$duo_compose_input" -f "$duo_overlay_input")
 duo_run timeout --kill-after=5s 20s "${duo_compose[@]}" config --quiet
-if [[ -n "$duo_download_temp" ]]; then
-  mv -- "$duo_download_temp" compose.autoupdate.yaml
-  duo_download_temp=''
-fi
+duo_config_commit compose.yaml "$duo_compose_input"
+duo_config_commit compose.autoupdate.yaml "$duo_overlay_input"
 duo_compose=(docker compose --progress plain -f compose.yaml -f compose.autoupdate.yaml)
 
-duo_stage='4/6 拉取应用及 Watchtower 镜像（最多 20 分钟）'
+duo_stage='4/6 拉取应用、浏览器及 Watchtower 镜像（最多 20 分钟）'
 duo_message "$duo_stage"
 duo_run timeout --kill-after=10s 20m "${duo_compose[@]}" pull
 

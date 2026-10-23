@@ -19,6 +19,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 sys.path[:0] = ['/app/worker', '/app/worker/legacy']
 from browser_cdp import connect_browser
+from browser_process import launch_browser
 from browser_remote import BrowserRemote
 from platform_support import find_browser
 from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
@@ -116,15 +117,16 @@ def broker_request(remote, path, payload=None):
 
 def main():
     assert os.geteuid() != 0
-    fixture = ThreadingHTTPServer(('127.0.0.1', 0), FixtureHandler)
+    sidecar = bool(os.environ.get('DUO_BROWSER_SOCKET'))
+    fixture = ThreadingHTTPServer(('0.0.0.0' if sidecar else '127.0.0.1', 0), FixtureHandler)
     fixture.daemon_threads = True
     fixture_thread = threading.Thread(target=fixture.serve_forever, daemon=True)
     fixture_thread.start()
-    origin = f'http://127.0.0.1:{fixture.server_port}/'
+    origin = f'http://{"duo-app" if sidecar else "127.0.0.1"}:{fixture.server_port}/'
     report = {'apple_requests': False, 'account_profiles_accessed': False,
               'websocket_delay_ms': 1600, 'non_root': True, 'passes': []}
     try:
-        with tempfile.TemporaryDirectory(prefix='duo-cdp-startup-') as directory, sync_playwright() as pw:
+        with tempfile.TemporaryDirectory(prefix='duo-cdp-startup-', dir='/data' if sidecar else None) as directory, sync_playwright() as pw:
             profile = Path(directory) / 'profile'
             for attempt in range(2):
                 with socket.socket() as sock:
@@ -135,7 +137,9 @@ def main():
                     '--no-first-run', '--no-default-browser-check', '--restore-last-session',
                     '--window-size=1000,800', '--proxy-server=http://127.0.0.1:9',
                     '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1']
-                process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if sidecar:
+                    args = args[:-2] + ['--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE duo-app, EXCLUDE 127.0.0.1']
+                process = launch_browser(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 browser, proxy = None, None
                 try:
                     deadline = time.monotonic() + 45

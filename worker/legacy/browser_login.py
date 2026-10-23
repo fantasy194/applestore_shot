@@ -471,7 +471,8 @@ def login_in_browser(service, timeout=300, *, maintenance=False):
         launch = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
         if headless and os.name == 'nt':
             launch['creationflags'] = subprocess.CREATE_NO_WINDOW
-        process = subprocess.Popen(args, **launch)
+        from browser_process import launch_browser
+        process = launch_browser(args, **launch)
     except OSError:
         raise BrowserSessionError('BROWSER_LAUNCH_FAILED', '无法启动该账号的官方浏览器窗口；会话状态尚未检查。') from None
     browser = None

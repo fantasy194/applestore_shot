@@ -443,6 +443,7 @@ export function RemoteBrowser({
             {[
               ["Tab", "切换输入框"],
               ["Enter", "回车"],
+              ["Space", "空格"],
               ["Backspace", "退格"],
               ["Control+A", "全选"],
               ["Escape", "关闭弹层"],

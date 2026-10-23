@@ -1,0 +1,28 @@
+name: iphoneduo
+
+services:
+  app:
+    image: ${APP_IMAGE:-iphoneduo:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+    shm_size: 1gb
+    security_opt:
+      - seccomp=./docker/chrome-seccomp.json
+    ports:
+      - "${DUO_WEB_BIND:-127.0.0.1}:${DUO_WEB_PORT:-17654}:${DUO_WEB_PORT:-17654}"
+    environment:
+      DUO_WEB_PORT: ${DUO_WEB_PORT:-17654}
+      DUO_WEB_PASSWORD: ${DUO_WEB_PASSWORD:-}
+      DUO_WEB_ALLOWED_ORIGINS: ${DUO_WEB_ALLOWED_ORIGINS:-}
+      DUO_WEB_TRUST_NETWORK: ${DUO_WEB_TRUST_NETWORK:-0}
+      DUO_WEB_DISABLE_TUNNEL: ${DUO_WEB_DISABLE_TUNNEL:-1}
+      TZ: Asia/Shanghai
+    volumes:
+      - app-data:/data
+
+volumes:
+  app-data:
