@@ -45,6 +45,7 @@ GitHub README 不支持内嵌 B 站播放器，点击上方链接观看完整视
 | macOS   | 打开 `.app` 应用                                  |
 | Windows | 打开便携目录中的 `.exe`                           |
 | Web     | 在 macOS / Windows 本机启动服务，用默认浏览器操作 |
+| Docker  | Linux x86-64 / ARM64，浏览器与本地 Web 服务运行在容器内 |
 
 Web 版在本机运行，可通过带密码的 Quick Tunnel 供手机使用。首次登录获取浏览器上下文时，需要安装 Chrome 或 Edge。已构建版本内置 Python 和依赖；Windows 桌面版还需要 WebView2。
 
@@ -173,6 +174,48 @@ pnpm build:web
 ```
 
 输出：`local-web-release/`，复制整个目录给相同系统和架构的电脑使用。项目也提供 [桌面构建 CI](.github/workflows/build.yml)、[Web 构建 CI](.github/workflows/local-web.yml) 和 [GHCR 双架构镜像 CI](.github/workflows/ghcr.yml)。
+
+## 开发与验证
+
+项目使用 React / TypeScript 共用界面、Rust 任务引擎和 Python worker。Apple 交互采用专用浏览器获取或恢复会话、Python 推进官网网页 HTTP 结账协议的方式；自动化可推进到待付款订单，支付由本人扫码完成。源码具备这些流程不代表每次真实登录、库存查询或下单都成功。
+
+| 目录 | 开发职责 |
+| --- | --- |
+| `src/` | 桌面与 Web 共用界面、桥接及状态展示。 |
+| `src-tauri/src/` | 共享任务引擎、账号隔离、队列及桌面宿主。 |
+| `local-web/` | 复用共享引擎的本地 HTTP 服务。 |
+| `worker/` | Python 任务、库存与会话；`legacy/` 保存官网协议实现。 |
+| `scripts/`、`tests/` | 开发启动、打包、离线回归与浏览器验证。 |
+| `docker/`、`.github/workflows/` | 容器、桌面 / Web 构建及双架构发布。 |
+
+日常开发使用 `pnpm dev:web`，默认端口为 1421。需要隔离环境时使用 `pnpm dev:web --no-open --port 1439 --data-dir artifacts/dev-isolated`，避免占用实际账号数据；`pnpm dev` 只启动前端。Windows PowerShell 如遇执行策略限制，可使用 `pnpm.cmd`。
+
+| 验证目标 | 命令 |
+| --- | --- |
+| 前端类型与构建 | `pnpm build` |
+| Python worker | 首次 `pnpm worker:setup`，随后 `pnpm test:worker` |
+| Web 与共享 Rust 引擎 | `cargo test --locked --manifest-path local-web/Cargo.toml` |
+| 桌面 Rust | `cargo test --locked --manifest-path src-tauri/Cargo.toml`，需目标平台构建依赖 |
+| 界面回归 | 首次 `pnpm exec playwright install chromium`，随后 `pnpm test:ui` |
+| Web 开发启动 | `pnpm test:dev:web`，仅 `dev.spec.ts` |
+| Web 分发包 | `pnpm build:web` 后 `pnpm test:web`；Web 浏览器测试另用 `pnpm test:web:ui` |
+| 既定格式检查 | `pnpm check:format`，范围以 `package.json` 中的脚本为准 |
+
+`pnpm test` 只执行前端构建和界面回归，不包含 worker 与 Rust 测试。按改动范围运行相应检查；文档变更检查链接、命令和事实即可。两套 Cargo 清单和锁文件需一起维护，当前 `uuid = "=1.26.0"` 保留 Rust 1.88 兼容。离线 fixture、容器健康和只读查询均不能代替真实登录、订单创建或付款验证，历史验收记录也不代表当前版本已复测。
+
+## 开发约定与文档导航
+
+开始修改前阅读根目录 [AGENTS.md](AGENTS.md)。**每次开发完成都更新本 README，并将本次相关变更 add、commit、push 到当前分支的 `origin`，随后核对远端提交。**保留其他会话未提交的工作，按文件或补丁暂存，不混入无关改动。代理还应遵循其中的 Context7 文档查询和子代理协作约定。
+
+| 修改主题 | 先读文档 |
+| --- | --- |
+| 共享引擎、任务协议与账号生命周期 | [架构](docs/ARCHITECTURE.md) |
+| 自动监控、库存代理、并发、PWA 与通知 | [监控与 PWA](docs/MONITOR-PWA.md) |
+| 执行队列、结构化日志、空闲预热与官网恢复 | [队列、日志与会话](docs/QUEUE-LOGS-SESSION.md) |
+| 摘要同步、按需任务详情与日志传输 | [工作区传输](docs/WORKSPACE-TRANSPORT.md) |
+| 多门店与时段规则、联系人复核 | [自提偏好](docs/PICKUP-PREFERENCES.md)、[联系人复核](docs/PICKUP-CONTACT-FIX.md) |
+| Docker、GHCR 与数据保留 | [Docker 部署](docker/README.md) |
+| 敏感数据与分发边界 | [隐私记录](docs/PRIVACY.md) |
 
 ## 隐私与免责声明
 
