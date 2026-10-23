@@ -10,6 +10,7 @@
 4. 发布目标为 `origin`：`https://github.com/fantasy194/applestore_shot.git`；`upstream` 的 `zengyh-dev/iPhoneDuo` 仅供上游对照。沿用当前任务分支及其跟踪关系，不切换别人的分支。提交署名沿用本仓库配置的 `fantasy194`，不要改全局 Git 身份。
 5. 推送后用 `git ls-remote` 核对目标远端分支 SHA 与本地提交。正常开发不强推、不改写历史；历史会话中修正署名的单次授权不是长期授权。认证、权限或远端分歧阻止推送时保留成果并说明具体阻塞，不宣称完成。
 6. 最终报告写明变更、实际运行的检查、证据边界、提交 SHA 和推送结果。镜像发布任务还需核实对应 Actions 运行及双架构 manifest，不能仅凭工作流文件或 push 成功声称镜像已发布。
+7. **每次更新都必须递增应用版本号，包括 Web 页面最下面显示的版本号。** 用户未指定版本时默认递增 SemVer 补丁号。同步 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`local-web/Cargo.toml`、对应 `Cargo.lock` 中本项目包的版本，以及 `src/App.tsx` 中 `workspace-footer` 的显示版本；锁文件只同步本项目版本，保持依赖版本不变。提交前核对版本声明、Web 页脚和构建产物一致，并在最终报告中写明新版本号。
 
 ## 项目结构与修改入口
 
