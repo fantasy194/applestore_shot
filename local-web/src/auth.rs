@@ -46,6 +46,9 @@ impl Auth {
     }
     pub fn authenticated(&self, headers: &HeaderMap, local_bearer: &str) -> bool {
         if headers.get(header::AUTHORIZATION).and_then(|x| x.to_str().ok()) == Some(local_bearer) { return true; }
+        self.authenticated_session(headers)
+    }
+    pub fn authenticated_session(&self, headers: &HeaderMap) -> bool {
         let session = headers.get(header::COOKIE).and_then(|x| x.to_str().ok()).and_then(|cookies| cookies.split(';').find_map(|x| x.trim().strip_prefix("duo_session=")));
         let Some(session) = session else { return false };
         self.inner.lock().unwrap().sessions.get(session).is_some_and(|expires| *expires > now())

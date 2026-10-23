@@ -5,6 +5,7 @@ import { active, LOCAL_ID } from "./types";
 import type { Bridge } from "./api";
 import { StoreSearch } from "./StoreSearch";
 import { SelectField } from "./SelectField";
+import { randomUUID } from "./uuid";
 import {
   inventoryCall,
   inventoryError,
@@ -202,7 +203,7 @@ export function PickupForm({
         else
           targets.push({
             ...details,
-            id: crypto.randomUUID(),
+            id: randomUUID(),
             concurrency: 1,
             retry_count: 0,
           });

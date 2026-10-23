@@ -28,6 +28,8 @@ jobs:
         with:
           node-version: '24'
       - run: npm install --global pnpm@11.9.0
+      - name: Test UUID generation for LAN HTTP
+        run: node --test tests/uuid.test.mjs
       - run: pnpm install --frozen-lockfile
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

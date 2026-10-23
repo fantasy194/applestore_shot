@@ -17,6 +17,7 @@ import { useAccountPrivacy } from "./AccountPrivacy";
 import { StoreSearch } from "./StoreSearch";
 import { SelectField } from "./SelectField";
 import { NumberField } from "./NumberField";
+import { randomUUID } from "./uuid";
 import {
   inventoryCall,
   inventoryError,
@@ -301,7 +302,7 @@ export function InventoryMonitor({
       )
         continue;
       targets.push({
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         sku: sku.toUpperCase().replace(/\/A$/, ""),
         quantity,
         store_id: store.store_id,
@@ -970,7 +971,7 @@ export function InventoryMonitor({
                       providers: [
                         ...config.proxy.providers,
                         {
-                          id: crypto.randomUUID(),
+                          id: randomUUID(),
                           kind: "xydaili",
                           enabled: true,
                           ttl_seconds: 180,

@@ -7,6 +7,7 @@ mod activity;
 #[path = "../../src-tauri/src/session_maintenance.rs"]
 mod session_maintenance;
 mod auth;
+mod access;
 mod push;
 
 use axum::{
@@ -40,6 +41,8 @@ struct LocalState {
     dev_origin: Option<String>,
     auth: Arc<auth::Auth>,
     public_origin: Arc<Mutex<Option<String>>>,
+    allowed_origins: Arc<Vec<access::AllowedOrigin>>,
+    tunnel_disabled: bool,
     push: Arc<push::PushBridge>,
 }
 
@@ -48,7 +51,9 @@ fn bad_request(message: String) -> Response {
 }
 
 async fn auth_status(State(s): State<LocalState>, headers: HeaderMap) -> Response {
-    Json(json!({"authenticated":s.auth.authenticated(&headers, &s.token)})).into_response()
+    let local_host = headers.get(header::HOST).and_then(|x| x.to_str().ok()) == Some(s.authority.as_str());
+    let authenticated = if local_host { s.auth.authenticated(&headers, &s.token) } else { s.auth.authenticated_session(&headers) };
+    Json(json!({"authenticated":authenticated})).into_response()
 }
 
 async fn login(State(s): State<LocalState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -58,7 +63,9 @@ async fn login(State(s): State<LocalState>, headers: HeaderMap, Json(body): Json
     let password = password.to_owned();
     let verified = tokio::task::spawn_blocking(move || auth::Auth::verify(&password, &hash)).await.unwrap_or(false);
     if !verified { return (StatusCode::UNAUTHORIZED, Json(json!({"error":"访问密码不正确"}))).into_response(); }
-    let secure = headers.get(header::HOST).and_then(|x| x.to_str().ok()) != Some(s.authority.as_str());
+    let host = headers.get(header::HOST).and_then(|x| x.to_str().ok());
+    let secure = host != Some(s.authority.as_str())
+        && s.allowed_origins.iter().find(|origin| host == Some(origin.authority.as_str())).is_none_or(|origin| origin.secure);
     let cookie = format!("duo_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}", s.auth.session(), if secure { "; Secure" } else { "" });
     ([(header::SET_COOKIE, cookie)], Json(json!({"authenticated":true}))).into_response()
 }
@@ -81,6 +88,9 @@ fn valid_public_origin(value: &str) -> bool {
 }
 
 async fn tunnel(State(s): State<LocalState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if s.tunnel_disabled {
+        return (StatusCode::FORBIDDEN, Json(json!({"error":"当前部署已停用 Quick Tunnel"}))).into_response();
+    }
     // Only a local launch-token holder may change the one trusted public Host.
     if headers.get(header::HOST).and_then(|x| x.to_str().ok()) != Some(s.authority.as_str())
         || headers.get(header::AUTHORIZATION).and_then(|x| x.to_str().ok()) != Some(s.token.as_str()) {
@@ -241,21 +251,25 @@ async fn guarded_request(State(s): State<LocalState>, request: Request, next: Ne
     let host = h.get(header::HOST).and_then(|v| v.to_str().ok());
     let local_host = host == Some(s.authority.as_str());
     let public_host = public_origin.as_deref().is_some_and(|origin| host == origin.strip_prefix("https://"));
-    let host_ok = local_host || public_host;
+    let allowed_origin = s.allowed_origins.iter().find(|origin| host == Some(origin.authority.as_str()));
+    let host_ok = local_host || public_host || allowed_origin.is_some();
     let origin_ok = h.get(header::ORIGIN).is_none_or(|v| {
         local_host && (v == format!("http://{}", s.authority).as_str()
             || s.dev_origin.as_deref().is_some_and(|origin| v == origin))
             || public_host && public_origin.as_deref().is_some_and(|origin| v == origin)
+            || allowed_origin.is_some_and(|origin| v == origin.origin.as_str())
     });
     if !host_ok || !origin_ok {
         return StatusCode::FORBIDDEN.into_response();
     }
     let path = request.uri().path();
     let public_auth = matches!(path, "/api/auth/status" | "/api/auth/login");
-    if public_host && request.method() != axum::http::Method::GET && h.get(header::ORIGIN).is_none() {
+    if !local_host && (matches!(path, "/api/shutdown" | "/api/tunnel/register")
+        || request.method() != axum::http::Method::GET && h.get(header::ORIGIN).is_none()) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if path.starts_with("/api/") && !public_auth && !s.auth.authenticated(h, &s.token)
+    let authenticated = if local_host { s.auth.authenticated(h, &s.token) } else { s.auth.authenticated_session(h) };
+    if path.starts_with("/api/") && !public_auth && !authenticated
     {
         return (
             StatusCode::UNAUTHORIZED,
@@ -405,9 +419,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind((listen_address, port))
         .await
         .map_err(|e| format!("无法启动本地服务，端口可能被占用：{e}"))?;
-    // Container publishing needs a non-loopback listener. The browser-facing
-    // Host and Origin contract stays loopback, including when binding 0.0.0.0.
+    // Keep the local launch authority separate from explicitly allowed origins,
+    // including when Docker publishes the non-loopback listener.
     let authority = format!("127.0.0.1:{}", listener.local_addr()?.port());
+    let allowed_origins = access::allowed_origins(&std::env::var("DUO_WEB_ALLOWED_ORIGINS").unwrap_or_default())?;
+    if allowed_origins.iter().any(|origin| origin.authority == authority) {
+        return Err("DUO_WEB_ALLOWED_ORIGINS 无需重复配置本机启动地址".into());
+    }
+    let tunnel_disabled = access::tunnel_disabled(&std::env::var("DUO_WEB_DISABLE_TUNNEL").unwrap_or_default())?;
+    for origin in &allowed_origins {
+        println!("允许的访问入口：{}（使用访问密码登录）", origin.origin);
+    }
+    if tunnel_disabled { println!("Quick Tunnel 已停用。"); }
     let secret = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
@@ -469,6 +492,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         dev_origin,
         auth,
         public_origin: Arc::new(Mutex::new(None)),
+        allowed_origins: Arc::new(allowed_origins),
+        tunnel_disabled,
         push: push.clone(),
     };
     activity::start(state.host.clone(), engine.root.clone());
@@ -491,7 +516,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state);
     println!(
-        "DUO Killer · 本地 Web\n{url}\n本机链接可直接打开；Quick Tunnel 入口使用访问密码。关闭网页后服务仍运行；在此终端按 Ctrl+C 退出。"
+        "DUO Killer · 本地 Web\n{url}\n本机链接可直接打开；其他允许的入口使用访问密码。关闭网页后服务仍运行；在此终端按 Ctrl+C 退出。"
     );
     if open && open_browser(&url).is_err() {
         eprintln!("无法自动打开默认浏览器，请打开上面的本机链接。");

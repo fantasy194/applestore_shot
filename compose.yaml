@@ -13,10 +13,12 @@ services:
     security_opt:
       - seccomp=./docker/chrome-seccomp.json
     ports:
-      - "127.0.0.1:${DUO_WEB_PORT:-17654}:${DUO_WEB_PORT:-17654}"
+      - "${DUO_WEB_BIND:-127.0.0.1}:${DUO_WEB_PORT:-17654}:${DUO_WEB_PORT:-17654}"
     environment:
       DUO_WEB_PORT: ${DUO_WEB_PORT:-17654}
       DUO_WEB_PASSWORD: ${DUO_WEB_PASSWORD:-}
+      DUO_WEB_ALLOWED_ORIGINS: ${DUO_WEB_ALLOWED_ORIGINS:-}
+      DUO_WEB_DISABLE_TUNNEL: ${DUO_WEB_DISABLE_TUNNEL:-1}
       TZ: Asia/Shanghai
     volumes:
       - app-data:/data

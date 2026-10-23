@@ -47,7 +47,23 @@ DUO_WEB_PORT=17654
 DUO_WEB_PASSWORD=replace-with-your-own-password
 ```
 
-密码需至少 8 个字符。设置 `DUO_WEB_PASSWORD` 时，每次启动都会重设 Web 访问密码；删除该配置后沿用数据卷中的密码。端口在容器内外保持一致，以保留原有严格的 Host/Origin 校验。请使用 `127.0.0.1` 链接；`localhost` 或其他主机名不在当前允许范围内。仅向本机发布 Web 端口，CDP 和虚拟显示器均未向主机发布。
+密码需至少 8 个字符。设置 `DUO_WEB_PASSWORD` 时，每次启动都会重设 Web 访问密码；删除该配置后沿用数据卷中的密码。端口在容器内外保持一致，以保留严格的 Host/Origin 校验。默认仅向本机发布 Web 端口，使用 `127.0.0.1` 链接；CDP 和虚拟显示器均未向主机发布。
+
+## 树莓派局域网访问
+
+在部署目录的 `.env` 配置宿主监听地址及允许的真实访问来源，例如树莓派地址为 `192.168.0.200`：
+
+```dotenv
+DUO_WEB_BIND=0.0.0.0
+DUO_WEB_ALLOWED_ORIGINS=http://192.168.0.200:17654
+DUO_WEB_DISABLE_TUNNEL=1
+```
+
+更新镜像后执行 `docker compose up -d --no-build --wait app`；使用自动更新覆盖文件时，沿用原来的 `-f compose.yaml -f compose.autoupdate.yaml` 参数。打开 `http://192.168.0.200:17654`，用原 Web 访问密码登录。`0.0.0.0` 只用于监听，不能用作允许来源。需要其他固定入口时，以逗号分隔完整的 `http://` 或 `https://` 来源；不接受通配符、用户信息及 URL 路径。Host 与 Origin 必须相互匹配，局域网入口不能用本机启动 token 代替密码。
+
+Docker Compose 默认设置 `DUO_WEB_DISABLE_TUNNEL=1`，不启动 Cloudflare Quick Tunnel，并拒绝注册 Quick Tunnel 地址。独立桌面 / Web 启动保持原有默认；需要在 Docker 中明确启用时设置为 `0` 并自行管理隧道进程。
+
+本机的 `/data` 可以继续使用原命名卷，也可以在首次部署前使用主机目录挂载。例如本 Pi 的持久目录为 `/home/fantasy/applestore_shot/data`，挂到容器 `/data`，目录归 UID/GID `1000:1000` 所有且权限为 `700`。不要把已有命名卷直接换成空目录；先保留并迁移原数据。账号配置、Apple auth/Cookie、浏览器资料、队列及 Web 密码都在 `/data`，容器重建会保留。网页访问会话保存在内存，重建后需用原 Web 密码再次登录。
 
 ## 更新、停止与排查
 
