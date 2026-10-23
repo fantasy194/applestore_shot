@@ -3,6 +3,7 @@ import type { Account, Action, Data } from "./types";
 import { active, LOCAL_ID } from "./types";
 import type { Bridge } from "./api";
 import { StoreSearch } from "./StoreSearch";
+import { SelectField } from "./SelectField";
 import {
   inventoryCall,
   inventoryError,
@@ -263,22 +264,21 @@ export function PickupForm({
       <p className="muted">
         固定单店保留原有下单方式；预选多店时，按下方顺序选择本次实际有货且符合时段规则的门店。官网要求的联系人字段和验证仍须完成。
       </p>
-      <label>
-        门店选择方式
-        <select
-          disabled={disabled}
-          value={selectionMode}
-          onChange={(event) => {
-            const next = event.target.value as "fixed" | "priority";
-            setSelectionMode(next);
-            if (next === "priority") setContactMode("official");
-            setNotice("");
-          }}
-        >
-          <option value="fixed">固定单店</option>
-          <option value="priority">预选多店，按顺序择一</option>
-        </select>
-      </label>
+      <SelectField
+        label="门店选择方式"
+        disabled={disabled}
+        value={selectionMode}
+        onChange={(value) => {
+          const next = value as "fixed" | "priority";
+          setSelectionMode(next);
+          if (next === "priority") setContactMode("official");
+          setNotice("");
+        }}
+        options={[
+          { value: "fixed", label: "固定单店" },
+          { value: "priority", label: "预选多店，按顺序择一" },
+        ]}
+      />
       <StoreSearch
         bridge={bridge}
         sku={sku}
@@ -387,23 +387,19 @@ export function PickupForm({
           </p>
         )}
         <div className="schedule-fields">
-          <label>
-            自提时段规则
-            <select
-              disabled={disabled}
-              value={rule.mode}
-              onChange={(event) =>
-                setRule({
-                  ...rule,
-                  mode: event.target.value as TimeRule["mode"],
-                })
-              }
-            >
-              <option value="earliest">最早可用日期与时段</option>
-              <option value="latest">最晚可用日期与时段</option>
-              <option value="window">指定时间窗口</option>
-            </select>
-          </label>
+          <SelectField
+            label="自提时段规则"
+            disabled={disabled}
+            value={rule.mode}
+            onChange={(value) =>
+              setRule({ ...rule, mode: value as TimeRule["mode"] })
+            }
+            options={[
+              { value: "earliest", label: "最早可用日期与时段" },
+              { value: "latest", label: "最晚可用日期与时段" },
+              { value: "window", label: "指定时间窗口" },
+            ]}
+          />
           {rule.mode === "window" && (
             <>
               <label>
@@ -430,40 +426,34 @@ export function PickupForm({
                   }
                 />
               </label>
-              <label>
-                无匹配时段
-                <select
-                  disabled={disabled}
-                  value={rule.fallback}
-                  onChange={(event) =>
-                    setRule({
-                      ...rule,
-                      fallback: event.target.value as TimeRule["fallback"],
-                    })
-                  }
-                >
-                  <option value="stop">
-                    尝试下一预选门店，全部无匹配时停止
-                  </option>
-                  <option value="earliest">接受当前优先门店窗外最早时段</option>
-                </select>
-              </label>
+              <SelectField
+                label="无匹配时段"
+                disabled={disabled}
+                value={rule.fallback}
+                onChange={(value) =>
+                  setRule({ ...rule, fallback: value as TimeRule["fallback"] })
+                }
+                options={[
+                  {
+                    value: "stop",
+                    label: "尝试下一预选门店，全部无匹配时停止",
+                  },
+                  { value: "earliest", label: "接受当前优先门店窗外最早时段" },
+                ]}
+              />
             </>
           )}
         </div>
-        <label>
-          取货联系人来源
-          <select
-            disabled={disabled}
-            value={contactMode}
-            onChange={(event) =>
-              setContactMode(event.target.value as "local" | "official")
-            }
-          >
-            <option value="official">优先使用本次官网保存的联系人</option>
-            <option value="local">使用本地取货联系人</option>
-          </select>
-        </label>
+        <SelectField
+          label="取货联系人来源"
+          disabled={disabled}
+          value={contactMode}
+          onChange={(value) => setContactMode(value as "local" | "official")}
+          options={[
+            { value: "official", label: "优先使用本次官网保存的联系人" },
+            { value: "local", label: "使用本地取货联系人" },
+          ]}
+        />
         <details open={contactMode === "local"}>
           <summary>本地取货联系人（可选补充）</summary>
           <p className="muted">

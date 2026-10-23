@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { chooseOption } from "./select-option";
 
 async function fixture(page: Page, busy = false, attention = false) {
   await page.addInitScript(
@@ -273,15 +274,22 @@ test("队列最新倒序展示，执行策略折叠且保留暂停取消", async
   ).toBeVisible();
   await expect(page.getByLabel("队列执行方式")).not.toBeVisible();
   await page.locator(".queue-policy > summary").click();
-  await expect(page.getByLabel("队列执行方式")).toHaveValue("sequential");
+  await expect(
+    page.getByRole("combobox", { name: "队列执行方式", exact: true }),
+  ).toHaveText("逐个执行");
   await expect(
     page.getByText(
       "下单执行名额：3 / 10；按每个任务的下单路数占用，名额不足时继续排队。",
       { exact: true },
     ),
   ).toBeVisible();
-  await page.getByLabel("队列执行方式").selectOption("parallel");
-  await page.getByLabel("同时执行任务上限").fill("3");
+  await chooseOption(
+    page.getByRole("combobox", { name: "队列执行方式", exact: true }),
+    "固定并发",
+  );
+  await page
+    .getByRole("spinbutton", { name: "同时执行任务上限", exact: true })
+    .fill("3");
   await page.getByRole("button", { name: "保存执行策略" }).click();
   await expect
     .poll(() =>
@@ -333,7 +341,12 @@ test("相同入队时间按序号倒序，付款和未知结果常显且保留�
       ),
   ).toEqual(["unknown", "payment", "job2", "job1"]);
   const payment = page.locator('[data-job-id="payment"]');
-  await expect(payment).toContainText("MLH74FE · 实际取货店");
+  await expect(payment.locator(".queue-job-heading strong")).toHaveText(
+    "抛光布",
+  );
+  await expect(payment.locator(".queue-job-heading")).toContainText(
+    "MLH74FE · 实际取货店",
+  );
   await expect(payment.getByText("待付款", { exact: true })).toBeVisible();
   await expect(payment.getByRole("button", { name: "前往付款" })).toBeVisible();
   await expect(
@@ -388,9 +401,18 @@ test("完整日志可分页和筛选，并从任务进入对应过滤记录", as
     ),
   ).toBe(true);
   await expect(page.getByLabel("日志类别")).toBeVisible();
-  await page.getByLabel("日志类别").selectOption("inventory");
-  await page.getByLabel("日志级别").selectOption("warning");
-  await page.getByLabel("日志账号").selectOption("a");
+  await chooseOption(
+    page.getByRole("combobox", { name: "日志类别", exact: true }),
+    "库存监控",
+  );
+  await chooseOption(
+    page.getByRole("combobox", { name: "日志级别", exact: true }),
+    "警告",
+  );
+  await chooseOption(
+    page.getByRole("combobox", { name: "日志账号", exact: true }),
+    "测试账号",
+  );
   await page.getByLabel("日志任务编号").fill("busy-task");
   await expect(page.locator(".log-entry")).toHaveCount(1);
   await expect(page.locator(".log-entry")).toContainText("门店库存尚未确认");
@@ -407,7 +429,9 @@ test("完整日志可分页和筛选，并从任务进入对应过滤记录", as
   await current.getByText("当前任务日志（2 条）", { exact: true }).click();
   await current.getByRole("link", { name: "查看此任务完整日志" }).click();
   await expect(page.getByLabel("日志任务编号")).toHaveValue("busy-task");
-  await expect(page.getByLabel("日志账号")).toHaveValue("a");
+  await expect(
+    page.getByRole("combobox", { name: "日志账号", exact: true }),
+  ).toHaveText("测试账号");
 });
 
 test("日志默认聚焦监控，以ID增量读取同一毫秒记录并保留旧页", async ({

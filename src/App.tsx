@@ -38,6 +38,7 @@ import { AccountPrivacyToggle, useAccountPrivacy } from "./AccountPrivacy";
 import { AccountGate } from "./AccountGate";
 import { RemoveAccountDialog } from "./RemoveAccountDialog";
 import { SelectField } from "./SelectField";
+import { NumberField } from "./NumberField";
 import { ActiveTaskNav } from "./ActiveTaskNav";
 import { SchedulePurchase } from "./SchedulePurchase";
 import { InventoryMonitor } from "./InventoryMonitor";
@@ -106,6 +107,21 @@ function WorkspaceApp() {
   const [quantity, setQuantity] = useState(1);
   const [concurrency, setConcurrency] = useState(1);
   const [retryCount, setRetryCount] = useState(0);
+  const [invalidPurchaseNumbers, setInvalidPurchaseNumbers] = useState<
+    string[]
+  >([]);
+  const purchaseNumbersValid = invalidPurchaseNumbers.length === 0;
+  function purchaseValidity(key: string, valid: boolean) {
+    setInvalidPurchaseNumbers((keys) =>
+      valid
+        ? keys.includes(key)
+          ? keys.filter((item) => item !== key)
+          : keys
+        : keys.includes(key)
+          ? keys
+          : [...keys, key],
+    );
+  }
   const [taskTarget, setTaskTarget] = useState<Task | null>(null);
   const [focusTaskId, setFocusTaskId] = useState("");
   const [removingAccount, setRemovingAccount] = useState<Account | null>(null);
@@ -727,7 +743,8 @@ function WorkspaceApp() {
                               !presetProducts.some(
                                 (p) => p.sku === sku.replace(/\/A$/i, ""),
                               ) ||
-                              quantity < 1
+                              quantity < 1 ||
+                              !purchaseNumbersValid
                             }
                             onClick={() =>
                               start("purchase", {
@@ -747,7 +764,8 @@ function WorkspaceApp() {
                               !presetProducts.some(
                                 (p) => p.sku === sku.replace(/\/A$/i, ""),
                               ) ||
-                              quantity < 1
+                              quantity < 1 ||
+                              !purchaseNumbersValid
                             }
                             onClick={() =>
                               start("purchase", {
@@ -808,61 +826,61 @@ function WorkspaceApp() {
                           }}
                         >
                           <ProductSelect sku={sku} onChange={setSku} />
-                          <div className="buy-fields">
-                            <label>
-                              数量
-                              <input
-                                type="number"
-                                required
-                                min={1}
-                                value={quantity}
-                                onChange={(e) =>
-                                  setQuantity(Number(e.target.value))
-                                }
-                              />
-                            </label>
-                          </div>
-                          <label className="pickup-concurrency">
-                            自提并发路数
-                            <input
-                              type="number"
+                          <div className="purchase-number-grid">
+                            <NumberField
+                              label="数量"
+                              min={1}
+                              required
+                              value={quantity}
+                              onChange={setQuantity}
+                              onValidityChange={(valid) =>
+                                purchaseValidity("quantity", valid)
+                              }
+                            />
+                            <NumberField
+                              label="自提并发路数"
                               min={1}
                               max={10}
                               required
                               disabled={busy}
                               value={concurrency}
-                              onChange={(e) =>
-                                setConcurrency(Number(e.target.value))
+                              onChange={setConcurrency}
+                              onValidityChange={(valid) =>
+                                purchaseValidity("concurrency", valid)
+                              }
+                              hint={
+                                <>
+                                  默认 1 路，每路购买 {quantity}{" "}
+                                  件，最多可能生成{" "}
+                                  {Number.isInteger(concurrency)
+                                    ? concurrency
+                                    : 0}{" "}
+                                  笔订单。送货使用单路。
+                                </>
                               }
                             />
-                            <span className="muted">
-                              默认 1 路，每路购买 {quantity} 件，最多可能生成{" "}
-                              {Number.isInteger(concurrency) ? concurrency : 0}{" "}
-                              笔订单。送货使用单路。
-                            </span>
-                          </label>
-                          <label className="pickup-concurrency">
-                            下单失败重试次数
-                            <input
-                              type="number"
+                            <NumberField
+                              label="下单失败重试次数"
                               min={0}
                               max={10}
-                              step={1}
                               required
                               disabled={busy}
                               value={retryCount}
-                              onChange={(e) =>
-                                setRetryCount(Number(e.target.value))
+                              onChange={setRetryCount}
+                              onValidityChange={(valid) =>
+                                purchaseValidity("retry", valid)
+                              }
+                              hint={
+                                <>
+                                  默认 0 次额外重试，最多共{" "}
+                                  {Number.isInteger(retryCount)
+                                    ? retryCount + 1
+                                    : 1}{" "}
+                                  轮。确认未提交的失败才串行重试，已有订单或提交未知时停止。
+                                </>
                               }
                             />
-                            <span className="muted">
-                              默认 0 次额外重试，最多共{" "}
-                              {Number.isInteger(retryCount)
-                                ? retryCount + 1
-                                : 1}{" "}
-                              轮。确认未提交的失败才串行重试，已有订单或提交未知时停止。
-                            </span>
-                          </label>
+                          </div>
                           <p className="muted">
                             {sku === "MLH74FE"
                               ? "抛光布测试：可选择送货或自提。核对商品、数量、金额及地址或门店后自动创建真实待付款订单，展示支付二维码。"
@@ -878,7 +896,8 @@ function WorkspaceApp() {
                                 !presetProducts.some(
                                   (p) => p.sku === sku.replace(/\/A$/i, ""),
                                 ) ||
-                                quantity < 1
+                                quantity < 1 ||
+                                !purchaseNumbersValid
                               }
                             >
                               立即下单
@@ -894,7 +913,8 @@ function WorkspaceApp() {
                                 !presetProducts.some(
                                   (p) => p.sku === sku.replace(/\/A$/i, ""),
                                 ) ||
-                                quantity < 1
+                                quantity < 1 ||
+                                !purchaseNumbersValid
                               }
                             >
                               立即下单（自提）
@@ -907,7 +927,7 @@ function WorkspaceApp() {
                         key={account.id}
                         sku={sku}
                         quantity={quantity}
-                        busy={busy}
+                        busy={busy || !purchaseNumbersValid}
                         concurrency={concurrency}
                         retryCount={retryCount}
                         task={scheduledTask}
@@ -1339,7 +1359,7 @@ function OrderTable({
 }) {
   return (
     <>
-      <div className="table-wrap">
+      <div className="table-wrap order-table">
         <table>
           <thead>
             <tr>
@@ -1572,18 +1592,17 @@ function SessionMaintenance({
         />
         下单空闲10分钟后自动预热
       </label>
-      <label className="session-warm-flow">
-        预热流程
-        <select
-          aria-label="预热流程"
-          value={flow}
-          disabled={saving || !state}
-          onChange={(event) => void configure({ flow: event.target.value })}
-        >
-          <option value="login">预热登录（不加购）</option>
-          <option value="pickup_prepare">提前准备自提（不下单）</option>
-        </select>
-      </label>
+      <SelectField
+        className="session-warm-flow"
+        label="预热流程"
+        value={flow}
+        disabled={saving || !state}
+        options={[
+          { value: "login", label: "预热登录（不加购）" },
+          { value: "pickup_prepare", label: "提前准备自提（不下单）" },
+        ]}
+        onChange={(value) => void configure({ flow: value })}
+      />
       <p className="ui-caption">
         {flow === "pickup_prepare"
           ? "按各账号的商品、数量和自提偏好准备结算；可能加购，不提交订单。"

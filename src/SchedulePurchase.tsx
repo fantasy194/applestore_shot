@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Clock3 } from "lucide-react";
+import { SelectField } from "./SelectField";
 import { presetProducts } from "./products";
 import type { Action, Data, Task } from "./types";
 
@@ -131,18 +132,16 @@ export function SchedulePurchase({
                 onChange={(e) => setTarget(e.target.value)}
               />
             </label>
-            <label>
-              定时收货方式
-              <select
-                aria-label="定时收货方式"
-                value={fulfillment}
-                disabled={busy}
-                onChange={(e) => setFulfillment(e.target.value)}
-              >
-                <option value="HOME">送货（本地地址）</option>
-                <option value="RETAIL">自提（本地预设门店）</option>
-              </select>
-            </label>
+            <SelectField
+              label="定时收货方式"
+              value={fulfillment}
+              disabled={busy}
+              onChange={setFulfillment}
+              options={[
+                { value: "HOME", label: "送货（本地地址）" },
+                { value: "RETAIL", label: "自提（本地预设门店）" },
+              ]}
+            />
           </div>
           {error && (
             <p className="error-text" role="alert">

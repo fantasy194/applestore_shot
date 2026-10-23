@@ -3,6 +3,9 @@ import { Pause, Play, RefreshCw } from "lucide-react";
 import type { Bridge } from "./api";
 import type { Account, Data } from "./types";
 import { useAccountPrivacy } from "./AccountPrivacy";
+import { SelectField } from "./SelectField";
+import { NumberField } from "./NumberField";
+import { presetProducts } from "./products";
 
 const states: Record<string, string> = {
   queued: "等待执行",
@@ -43,6 +46,7 @@ export function PurchaseQueue({
   const [state, setState] = useState<Data | null>(null);
   const [mode, setMode] = useState("sequential");
   const [maximum, setMaximum] = useState(1);
+  const [maximumValid, setMaximumValid] = useState(true);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState("");
   const [connectionError, setConnectionError] = useState("");
@@ -188,36 +192,32 @@ export function PurchaseQueue({
               }}
             >
               <div className="schedule-fields">
-                <label>
-                  队列执行方式
-                  <select
-                    value={mode}
-                    disabled={busy}
-                    onChange={(event) => {
-                      setMode(event.target.value);
-                      setDirty(true);
-                    }}
-                  >
-                    <option value="sequential">逐个执行</option>
-                    <option value="parallel">固定并发</option>
-                  </select>
-                </label>
-                <label>
-                  同时执行任务上限
-                  <input
-                    type="number"
-                    min={1}
-                    max={10}
-                    required
-                    step={1}
-                    disabled={busy || mode === "sequential"}
-                    value={maximum}
-                    onChange={(event) => {
-                      setMaximum(Number(event.target.value));
-                      setDirty(true);
-                    }}
-                  />
-                </label>
+                <SelectField
+                  label="队列执行方式"
+                  value={mode}
+                  disabled={busy}
+                  onChange={(value) => {
+                    setMode(value);
+                    setDirty(true);
+                  }}
+                  options={[
+                    { value: "sequential", label: "逐个执行" },
+                    { value: "parallel", label: "固定并发" },
+                  ]}
+                />
+                <NumberField
+                  label="同时执行任务上限"
+                  min={1}
+                  max={10}
+                  required
+                  disabled={busy || mode === "sequential"}
+                  value={maximum}
+                  onValidityChange={setMaximumValid}
+                  onChange={(value) => {
+                    setMaximum(value);
+                    setDirty(true);
+                  }}
+                />
               </div>
               <p className="muted">
                 默认逐个执行，可同时执行 1–10
@@ -235,6 +235,7 @@ export function PurchaseQueue({
                 disabled={
                   busy ||
                   !dirty ||
+                  !maximumValid ||
                   !Number.isInteger(maximum) ||
                   maximum < 1 ||
                   maximum > 10
@@ -336,6 +337,9 @@ export function PurchaseQueue({
                 (job.pickup_policy?.selection_mode === "priority"
                   ? "候选门店择一"
                   : job.store_name || job.store_id || "自提门店");
+              const product = presetProducts.find(
+                (item) => item.sku === String(job.sku).replace(/\/A$/i, ""),
+              );
               return (
                 <article
                   className="queue-job"
@@ -343,9 +347,12 @@ export function PurchaseQueue({
                   data-job-id={job.id}
                 >
                   <div className="queue-job-heading">
-                    <strong>
-                      {job.sku} · {store}
-                    </strong>
+                    <div className="queue-job-product">
+                      <strong>{product?.name || job.sku}</strong>
+                      <span>
+                        {job.sku} · {store}
+                      </span>
+                    </div>
                     <span
                       className={`status ${unknown ? "submission_unknown" : job.status}`}
                     >
@@ -378,90 +385,95 @@ export function PurchaseQueue({
                   {!terminal(job.status) && job.message && (
                     <p className="muted">{format(job.message)}</p>
                   )}
-                  <details className="ui-disclosure queue-job-details">
-                    <summary>
-                      {job.status === "failed"
-                        ? "失败原因与任务详情"
-                        : "任务详情"}
-                    </summary>
-                    {job.pickup_policy?.selection_mode === "priority" && (
-                      <p className="muted">
-                        预选顺序：
-                        {job.pickup_policy.stores
-                          ?.map(
-                            (item: Data) =>
-                              `${item.store_name} (${item.store_id})`,
-                          )
-                          .join(" → ")}
-                      </p>
-                    )}
-                    {job.result?.pickup_store && (
-                      <p>
-                        实际取货门店：{job.result.pickup_store}
-                        {job.result.pickup_store_id
-                          ? ` (${job.result.pickup_store_id})`
-                          : ""}
-                      </p>
-                    )}
-                    {job.result?.pickup_time_slot?.date && (
-                      <p>
-                        取货时段：{job.result.pickup_time_slot.date}{" "}
-                        {job.result.pickup_time_slot.start}–
-                        {job.result.pickup_time_slot.end}
-                      </p>
-                    )}
-                    <p className="muted">
-                      #{job.sequence} ·{" "}
-                      {job.source === "manual"
-                        ? "手动"
-                        : job.source === "schedule"
-                          ? "定时"
-                          : "库存监控"}
-                      {job.target_id ? ` · 目标 ${job.target_id}` : ""} ·
-                      失败重试 {job.retry_count ?? 0} 次
-                    </p>
-                    {terminal(job.status) && job.message && (
-                      <p
-                        className={
-                          job.status === "failed" || unknown
-                            ? "error-text"
-                            : "muted"
-                        }
-                      >
-                        {format(job.message)}
-                      </p>
-                    )}
-                  </details>
-                  <div className="ui-toolbar">
-                    {job.task_id && (
-                      <button
-                        onClick={() => onTask(job.task_id, job.account_id)}
-                      >
-                        {pending
-                          ? "前往付款"
-                          : unknown
-                            ? "查看订单任务"
-                            : "查看关联任务"}
-                      </button>
-                    )}
-                    <a
-                      className="ui-action-link"
-                      href={logsHref(
-                        job.task_id
-                          ? { account_id: job.account_id, task_id: job.task_id }
-                          : { account_id: job.account_id, category: "queue" },
+                  <div className="queue-job-footer">
+                    <details className="ui-disclosure queue-job-details">
+                      <summary>
+                        {job.status === "failed"
+                          ? "失败原因与任务详情"
+                          : "任务详情"}
+                      </summary>
+                      {job.pickup_policy?.selection_mode === "priority" && (
+                        <p className="muted">
+                          预选顺序：
+                          {job.pickup_policy.stores
+                            ?.map(
+                              (item: Data) =>
+                                `${item.store_name} (${item.store_id})`,
+                            )
+                            .join(" → ")}
+                        </p>
                       )}
-                    >
-                      查看任务日志
-                    </a>
-                    {!terminal(job.status) && (
-                      <button
-                        disabled={busy || job.status === "cancelling"}
-                        onClick={() => command("cancel", { job_id: job.id })}
+                      {job.result?.pickup_store && (
+                        <p>
+                          实际取货门店：{job.result.pickup_store}
+                          {job.result.pickup_store_id
+                            ? ` (${job.result.pickup_store_id})`
+                            : ""}
+                        </p>
+                      )}
+                      {job.result?.pickup_time_slot?.date && (
+                        <p>
+                          取货时段：{job.result.pickup_time_slot.date}{" "}
+                          {job.result.pickup_time_slot.start}–
+                          {job.result.pickup_time_slot.end}
+                        </p>
+                      )}
+                      <p className="muted">
+                        #{job.sequence} ·{" "}
+                        {job.source === "manual"
+                          ? "手动"
+                          : job.source === "schedule"
+                            ? "定时"
+                            : "库存监控"}
+                        {job.target_id ? ` · 目标 ${job.target_id}` : ""} ·
+                        失败重试 {job.retry_count ?? 0} 次
+                      </p>
+                      {terminal(job.status) && job.message && (
+                        <p
+                          className={
+                            job.status === "failed" || unknown
+                              ? "error-text"
+                              : "muted"
+                          }
+                        >
+                          {format(job.message)}
+                        </p>
+                      )}
+                    </details>
+                    <div className="ui-toolbar queue-job-actions">
+                      {job.task_id && (
+                        <button
+                          onClick={() => onTask(job.task_id, job.account_id)}
+                        >
+                          {pending
+                            ? "前往付款"
+                            : unknown
+                              ? "查看订单任务"
+                              : "查看关联任务"}
+                        </button>
+                      )}
+                      <a
+                        className="ui-action-link"
+                        href={logsHref(
+                          job.task_id
+                            ? {
+                                account_id: job.account_id,
+                                task_id: job.task_id,
+                              }
+                            : { account_id: job.account_id, category: "queue" },
+                        )}
                       >
-                        取消队列任务
-                      </button>
-                    )}
+                        查看任务日志
+                      </a>
+                      {!terminal(job.status) && (
+                        <button
+                          disabled={busy || job.status === "cancelling"}
+                          onClick={() => command("cancel", { job_id: job.id })}
+                        >
+                          取消队列任务
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </article>
               );

@@ -26,6 +26,7 @@ import { useAccountPrivacy } from "./AccountPrivacy";
 import { AddressForm } from "./AddressForm";
 import { PickupForm } from "./PickupForm";
 import { SelectField } from "./SelectField";
+import { NumberField } from "./NumberField";
 import { InventoryMonitor } from "./InventoryMonitor";
 
 export type Route =
@@ -311,20 +312,17 @@ function PurchasePreset({
       >
         <ProductSelect sku={sku} onChange={changeSku} />
         <div className="buy-fields">
-          <label>
-            数量
-            <input
-              required
-              type="number"
-              min={1}
-              max={999}
-              value={quantity}
-              onChange={(e) => {
-                setQuantity(Number(e.target.value));
-                setStatus("");
-              }}
-            />
-          </label>
+          <NumberField
+            label="数量"
+            required
+            min={1}
+            max={999}
+            value={quantity}
+            onChange={(value) => {
+              setQuantity(value);
+              setStatus("");
+            }}
+          />
         </div>
         <p className="muted">
           预制商品仅用于快捷选择，价格与可购买状态以官网实时结果及结账金额为准。

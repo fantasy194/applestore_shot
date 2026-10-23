@@ -3,6 +3,7 @@ import { Download, RefreshCw, SlidersHorizontal } from "lucide-react";
 import type { Bridge } from "./api";
 import type { Account, Data } from "./types";
 import { useAccountPrivacy } from "./AccountPrivacy";
+import { SelectField } from "./SelectField";
 
 const readFilters = () => {
   const query = new URLSearchParams(location.hash.split("?")[1] || "");
@@ -225,22 +226,20 @@ export function ActivityLogs({
               </small>
             </summary>
             <div className="log-filters">
-              <label>
-                日志账号
-                <select
-                  value={filters.account_id}
-                  onChange={(event) =>
-                    setFilters({ ...filters, account_id: event.target.value })
-                  }
-                >
-                  <option value="">全部账号</option>
-                  {accounts.map((account) => (
-                    <option key={account.id} value={account.id}>
-                      {format(account.name)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <SelectField
+                label="日志账号"
+                value={filters.account_id}
+                onChange={(value) =>
+                  setFilters({ ...filters, account_id: value })
+                }
+                options={[
+                  { value: "", label: "全部账号" },
+                  ...accounts.map((account) => ({
+                    value: account.id,
+                    label: format(account.name),
+                  })),
+                ]}
+              />
               <label>
                 日志任务编号
                 <input
@@ -254,49 +253,43 @@ export function ActivityLogs({
                   }
                 />
               </label>
-              <label>
-                日志类别
-                <select
-                  value={filters.category}
-                  onChange={(event) =>
-                    setFilters({ ...filters, category: event.target.value })
-                  }
-                >
-                  <option value="">全部类别</option>
-                  {categories.map((category) => (
-                    <option key={category} value={category}>
-                      {
-                        (
-                          {
-                            inventory: "库存监控",
-                            stock: "有货事件",
-                            queue: "执行队列",
-                            authentication: "登录/会话",
-                            proxy: "代理池",
-                            purchase: "下单",
-                            operation: "操作",
-                          } as Record<string, string>
-                        )[category]
-                      }
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                日志级别
-                <select
-                  value={filters.level}
-                  onChange={(event) =>
-                    setFilters({ ...filters, level: event.target.value })
-                  }
-                >
-                  <option value="">全部级别</option>
-                  <option value="info">信息</option>
-                  <option value="warning">警告</option>
-                  <option value="error">错误</option>
-                  <option value="debug">调试</option>
-                </select>
-              </label>
+              <SelectField
+                label="日志类别"
+                value={filters.category}
+                onChange={(value) =>
+                  setFilters({ ...filters, category: value })
+                }
+                options={[
+                  { value: "", label: "全部类别" },
+                  ...categories.map((category) => ({
+                    value: category,
+                    label:
+                      (
+                        {
+                          inventory: "库存监控",
+                          stock: "有货事件",
+                          queue: "执行队列",
+                          authentication: "登录/会话",
+                          proxy: "代理池",
+                          purchase: "下单",
+                          operation: "操作",
+                        } as Record<string, string>
+                      )[category] || category,
+                  })),
+                ]}
+              />
+              <SelectField
+                label="日志级别"
+                value={filters.level}
+                onChange={(value) => setFilters({ ...filters, level: value })}
+                options={[
+                  { value: "", label: "全部级别" },
+                  { value: "info", label: "信息" },
+                  { value: "warning", label: "警告" },
+                  { value: "error", label: "错误" },
+                  { value: "debug", label: "调试" },
+                ]}
+              />
             </div>
           </details>
           <div className="ui-toolbar log-toolbar">

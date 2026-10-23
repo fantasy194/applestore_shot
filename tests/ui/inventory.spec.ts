@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { chooseOption } from "./select-option";
 
 test("配置轮询只读取当前任务结果，不传输整个工作台与历史日志", async ({
   page,
@@ -367,9 +368,10 @@ test("监控运行时仍可查询官网门店，查询不会修改目标或中�
   const baseline = await page.evaluate(() => (window as any).started.length);
   await page.getByText("添加门店与商品", { exact: true }).click();
   const search = page.locator(".monitor-add-stores");
-  await search
-    .getByRole("combobox", { name: "监控商品", exact: true })
-    .selectOption("custom");
+  await chooseOption(
+    search.getByRole("combobox", { name: "监控商品", exact: true }),
+    "自定义 SKU",
+  );
   await search.getByLabel("商品 SKU", { exact: true }).fill("MQ9R3CH");
   await search.getByLabel("每路购买数量", { exact: true }).fill("2");
   await search.getByLabel("门店搜索城市 / 邮编").fill("上海");
@@ -419,22 +421,45 @@ test("读取官网门店后加入目标并保存账号与并发配置", async ({
   for (const card of await page.locator(".inventory-target").all())
     await card.getByText("抢购设置", { exact: true }).click();
   await expect(
-    page.locator(".inventory-target").first().getByLabel("并发路数"),
+    page
+      .locator(".inventory-target")
+      .first()
+      .getByRole("spinbutton", { name: "并发路数", exact: true }),
   ).toHaveValue("3");
   await expect(
-    page.locator(".inventory-target").nth(1).getByLabel("并发路数"),
+    page
+      .locator(".inventory-target")
+      .nth(1)
+      .getByRole("spinbutton", { name: "并发路数", exact: true }),
   ).toHaveValue("1");
-  await expect(target.getByLabel("并发路数")).toHaveValue("1");
-  await expect(target.getByLabel("下单失败重试次数")).toHaveValue("0");
   await expect(
-    page.locator(".inventory-target").nth(1).getByLabel("下单失败重试次数"),
+    target.getByRole("spinbutton", { name: "并发路数", exact: true }),
+  ).toHaveValue("1");
+  await expect(
+    target.getByRole("spinbutton", { name: "下单失败重试次数", exact: true }),
   ).toHaveValue("0");
   await expect(
-    page.locator(".inventory-target").first().getByLabel("下单失败重试次数"),
+    page
+      .locator(".inventory-target")
+      .nth(1)
+      .getByRole("spinbutton", { name: "下单失败重试次数", exact: true }),
+  ).toHaveValue("0");
+  await expect(
+    page
+      .locator(".inventory-target")
+      .first()
+      .getByRole("spinbutton", { name: "下单失败重试次数", exact: true }),
   ).toHaveValue("2");
-  await target.getByLabel("抢购账号").selectOption("a");
-  await target.getByLabel("并发路数").fill("2");
-  await target.getByLabel("下单失败重试次数").fill("2");
+  await chooseOption(
+    target.getByRole("combobox", { name: "抢购账号", exact: true }),
+    "测试账号 · own**@example.test",
+  );
+  await target
+    .getByRole("spinbutton", { name: "并发路数", exact: true })
+    .fill("2");
+  await target
+    .getByRole("spinbutton", { name: "下单失败重试次数", exact: true })
+    .fill("2");
   await target.getByRole("checkbox", { name: "有货立即自提抢购" }).check();
   await page.getByRole("button", { name: "保存配置", exact: true }).click();
   await expect(
@@ -464,8 +489,12 @@ test("读取官网门店后加入目标并保存账号与并发配置", async ({
 test("人工自提默认一路", async ({ page }) => {
   await fixture(page);
   await page.goto("/");
-  await expect(page.getByLabel("自提并发路数")).toHaveValue("1");
-  await expect(page.getByLabel("下单失败重试次数")).toHaveValue("0");
+  await expect(
+    page.getByRole("spinbutton", { name: "自提并发路数", exact: true }),
+  ).toHaveValue("1");
+  await expect(
+    page.getByRole("spinbutton", { name: "下单失败重试次数", exact: true }),
+  ).toHaveValue("0");
   await page
     .getByRole("button", { name: "立即下单（自提）", exact: true })
     .click();
@@ -488,7 +517,10 @@ test("人工自提默认一路", async ({ page }) => {
 test("自提定时默认一路", async ({ page }) => {
   await fixture(page);
   await page.goto("/");
-  await page.getByLabel("定时收货方式").selectOption("RETAIL");
+  await chooseOption(
+    page.getByRole("combobox", { name: "定时收货方式", exact: true }),
+    "自提（本地预设门店）",
+  );
   await page.getByRole("button", { name: "设定定时抢购" }).click();
   expect(
     await page.evaluate(
@@ -511,8 +543,12 @@ test("人工自提可显式设置三路，展示各路结果并使用对应付�
 }) => {
   await fixture(page);
   await page.goto("/");
-  await expect(page.getByLabel("自提并发路数")).toHaveValue("1");
-  await page.getByLabel("自提并发路数").fill("3");
+  await expect(
+    page.getByRole("spinbutton", { name: "自提并发路数", exact: true }),
+  ).toHaveValue("1");
+  await page
+    .getByRole("spinbutton", { name: "自提并发路数", exact: true })
+    .fill("3");
   await page
     .getByRole("button", { name: "立即下单（自提）", exact: true })
     .click();
@@ -541,8 +577,13 @@ test("人工自提可显式设置三路，展示各路结果并使用对应付�
 test("自提定时保留配置路数，送货不附加并发", async ({ page }) => {
   await fixture(page);
   await page.goto("/");
-  await page.getByLabel("自提并发路数").fill("2");
-  await page.getByLabel("定时收货方式").selectOption("RETAIL");
+  await page
+    .getByRole("spinbutton", { name: "自提并发路数", exact: true })
+    .fill("2");
+  await chooseOption(
+    page.getByRole("combobox", { name: "定时收货方式", exact: true }),
+    "自提（本地预设门店）",
+  );
   await page.getByRole("button", { name: "设定定时抢购" }).click();
   const purchase = await page.evaluate(() =>
     (window as any).started.find((row: any) => row.action === "purchase"),
@@ -558,7 +599,9 @@ for (const fulfillment of ["HOME", "RETAIL"] as const) {
   test(`手动${fulfillment}下单携带两次额外重试`, async ({ page }) => {
     await fixture(page);
     await page.goto("/");
-    await page.getByLabel("下单失败重试次数").fill("2");
+    await page
+      .getByRole("spinbutton", { name: "下单失败重试次数", exact: true })
+      .fill("2");
     await page
       .getByRole("button", {
         name: fulfillment === "RETAIL" ? "立即下单（自提）" : "立即下单",
@@ -577,8 +620,13 @@ for (const fulfillment of ["HOME", "RETAIL"] as const) {
   test(`定时${fulfillment}下单冻结两次额外重试`, async ({ page }) => {
     await fixture(page);
     await page.goto("/");
-    await page.getByLabel("下单失败重试次数").fill("2");
-    await page.getByLabel("定时收货方式").selectOption(fulfillment);
+    await page
+      .getByRole("spinbutton", { name: "下单失败重试次数", exact: true })
+      .fill("2");
+    await chooseOption(
+      page.getByRole("combobox", { name: "定时收货方式", exact: true }),
+      fulfillment === "RETAIL" ? "自提（本地预设门店）" : "送货（本地地址）",
+    );
     await page.getByRole("button", { name: "设定定时抢购" }).click();
     expect(
       await page.evaluate(
@@ -587,7 +635,9 @@ for (const fulfillment of ["HOME", "RETAIL"] as const) {
             .params,
       ),
     ).toMatchObject({ fulfillment, retry_count: 2 });
-    await page.getByLabel("下单失败重试次数").fill("0");
+    await page
+      .getByRole("spinbutton", { name: "下单失败重试次数", exact: true })
+      .fill("0");
     const schedule = page.locator("section").filter({
       has: page.getByRole("heading", { name: "定时抢购", exact: true }),
     });
@@ -737,7 +787,9 @@ for (const scenario of ["retrying", "succeeded", "failed"] as const) {
   test(`当前任务展示重试执行次数：${scenario}`, async ({ page }) => {
     await fixture(page);
     await page.goto("/");
-    await page.getByLabel("下单失败重试次数").fill("2");
+    await page
+      .getByRole("spinbutton", { name: "下单失败重试次数", exact: true })
+      .fill("2");
     await page
       .getByRole("button", { name: "立即下单（自提）", exact: true })
       .click();

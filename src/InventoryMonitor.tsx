@@ -14,6 +14,8 @@ import { active, LOCAL_ID, type Data, type Snapshot } from "./types";
 import { presetProducts } from "./products";
 import { useAccountPrivacy } from "./AccountPrivacy";
 import { StoreSearch } from "./StoreSearch";
+import { SelectField } from "./SelectField";
+import { NumberField } from "./NumberField";
 import {
   inventoryCall,
   inventoryError,
@@ -93,6 +95,26 @@ export function InventoryMonitor({
   const [stockEvents, setStockEvents] = useState<Data[]>([]);
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [historyError, setHistoryError] = useState(false);
+  const [invalidNumbers, setInvalidNumbers] = useState<string[]>([]);
+  function numberValidity(key: string, valid: boolean) {
+    setInvalidNumbers((keys) =>
+      valid
+        ? keys.includes(key)
+          ? keys.filter((item) => item !== key)
+          : keys
+        : keys.includes(key)
+          ? keys
+          : [...keys, key],
+    );
+  }
+  const invalidConfig = invalidNumbers.some(
+    (key) =>
+      key === "pool" ||
+      config.targets.some((target) => key.startsWith(`${target.id}:`)) ||
+      config.proxy.providers.some(
+        (provider) => key === `provider:${provider.id}`,
+      ),
+  );
   const [monitorDetail, setMonitorDetail] = useState<{
     id: string;
     result: Data | null;
@@ -293,6 +315,7 @@ export function InventoryMonitor({
     change({ ...config, targets });
   }
   async function save() {
+    if (invalidConfig) throw new Error("请先填写有效的数量和范围。");
     if (
       config.targets.some(
         (target) =>
@@ -383,7 +406,9 @@ export function InventoryMonitor({
           <div className="ui-toolbar monitor-controls button-row inventory-actions">
             <button
               className="primary"
-              disabled={busy || running || !config.targets.length}
+              disabled={
+                busy || running || invalidConfig || !config.targets.length
+              }
               onClick={() =>
                 perform(async () => {
                   if (dirty) await save();
@@ -408,7 +433,9 @@ export function InventoryMonitor({
               停止监控
             </button>
             <button
-              disabled={busy || running || !config.targets.length}
+              disabled={
+                busy || running || invalidConfig || !config.targets.length
+              }
               onClick={() =>
                 perform(async () => {
                   if (dirty) await save();
@@ -421,7 +448,7 @@ export function InventoryMonitor({
               检查一次
             </button>
             <button
-              disabled={busy || running || !dirty}
+              disabled={busy || running || invalidConfig || !dirty}
               onClick={() => perform(save)}
             >
               保存配置
@@ -475,31 +502,52 @@ export function InventoryMonitor({
             {!stockEvents.length ? (
               <p className="muted stock-event-empty">暂无有货记录</p>
             ) : (
-              <div className="stock-event-list">
+              <ol className="stock-event-list">
                 {stockEvents
                   .slice(0, historyExpanded ? 12 : 3)
                   .map((entry, index) => (
-                    <article
-                      className="stock-event-card"
+                    <li
+                      className="stock-event-row"
                       key={
                         entry.id ??
                         `${entry.details.store_id}-${entry.details.checked_at_ms}-${index}`
                       }
                     >
-                      <strong>{entry.details.store_name}</strong>
-                      <span>
-                        {entry.details.sku} · {entry.details.store_id}
-                      </span>
                       <time
                         dateTime={new Date(
                           Number(entry.details.checked_at_ms),
                         ).toISOString()}
+                        title={dateText(Number(entry.details.checked_at_ms))}
                       >
-                        {dateText(Number(entry.details.checked_at_ms))}
+                        <strong>
+                          {new Date(
+                            Number(entry.details.checked_at_ms),
+                          ).toLocaleTimeString("zh-CN", { hour12: false })}
+                        </strong>
+                        <span>
+                          {new Date(
+                            Number(entry.details.checked_at_ms),
+                          ).toLocaleDateString("zh-CN")}
+                        </span>
                       </time>
-                    </article>
+                      <div className="stock-event-product">
+                        <strong>
+                          {presetProducts.find(
+                            (product) =>
+                              product.sku ===
+                              String(entry.details.sku).replace(/\/A$/i, ""),
+                          )?.name || entry.details.sku}
+                        </strong>
+                        <span>
+                          {entry.details.sku} · {entry.details.store_id}
+                        </span>
+                      </div>
+                      <span className="stock-event-store">
+                        {entry.details.store_name}
+                      </span>
+                    </li>
                   ))}
-              </div>
+              </ol>
             )}
           </section>
           <section className="ui-panel inventory-targets">
@@ -610,62 +658,56 @@ export function InventoryMonitor({
                           />
                           有货立即自提抢购
                         </label>
-                        <label>
-                          抢购账号
-                          <select
-                            value={target.account_id}
-                            disabled={busy || running}
-                            onChange={(event) =>
-                              updateTarget(target.id, {
-                                account_id: event.target.value,
-                              })
-                            }
-                          >
-                            <option value="">
-                              仅监控，请选择账号后启用抢购
-                            </option>
-                            {snapshot.accounts
+                        <SelectField
+                          label="抢购账号"
+                          value={target.account_id}
+                          disabled={busy || running}
+                          options={[
+                            {
+                              value: "",
+                              label: "仅监控，请选择账号后启用抢购",
+                            },
+                            ...snapshot.accounts
                               .filter((account) => !account.pending)
-                              .map((account) => (
-                                <option value={account.id} key={account.id}>
-                                  {format(`${account.name} · ${account.email}`)}
-                                </option>
-                              ))}
-                          </select>
-                        </label>
-                        <label>
-                          并发路数
-                          <input
-                            type="number"
-                            min={1}
-                            max={10}
-                            required
-                            value={target.concurrency ?? 1}
-                            disabled={busy || running}
-                            onChange={(event) =>
-                              updateTarget(target.id, {
-                                concurrency: Number(event.target.value),
-                              })
-                            }
-                          />
-                        </label>
-                        <label>
-                          下单失败重试次数
-                          <input
-                            type="number"
-                            min={0}
-                            max={10}
-                            step={1}
-                            required
-                            value={target.retry_count ?? 0}
-                            disabled={busy || running}
-                            onChange={(event) =>
-                              updateTarget(target.id, {
-                                retry_count: Number(event.target.value),
-                              })
-                            }
-                          />
-                        </label>
+                              .map((account) => ({
+                                value: account.id,
+                                label: format(
+                                  `${account.name} · ${account.email}`,
+                                ),
+                              })),
+                          ]}
+                          onChange={(value) =>
+                            updateTarget(target.id, { account_id: value })
+                          }
+                        />
+                        <NumberField
+                          label="并发路数"
+                          min={1}
+                          max={10}
+                          required
+                          value={target.concurrency ?? 1}
+                          disabled={busy || running}
+                          onValidityChange={(valid) =>
+                            numberValidity(`${target.id}:concurrency`, valid)
+                          }
+                          onChange={(value) =>
+                            updateTarget(target.id, { concurrency: value })
+                          }
+                        />
+                        <NumberField
+                          label="下单失败重试次数"
+                          min={0}
+                          max={10}
+                          required
+                          value={target.retry_count ?? 0}
+                          disabled={busy || running}
+                          onValidityChange={(valid) =>
+                            numberValidity(`${target.id}:retry`, valid)
+                          }
+                          onChange={(value) =>
+                            updateTarget(target.id, { retry_count: value })
+                          }
+                        />
                         <button
                           className="icon-button"
                           aria-label={`移除监控 ${target.store_name} ${target.sku}`}
@@ -707,29 +749,23 @@ export function InventoryMonitor({
               <Plus size={16} />
             </summary>
             <div className="inventory-product-fields">
-              <label>
-                监控商品
-                <select
-                  value={
-                    presetProducts.some((product) => product.sku === sku)
-                      ? sku
-                      : "custom"
-                  }
-                  disabled={busy}
-                  onChange={(event) =>
-                    setSku(
-                      event.target.value === "custom" ? "" : event.target.value,
-                    )
-                  }
-                >
-                  {presetProducts.map((product) => (
-                    <option value={product.sku} key={product.sku}>
-                      {product.name} · {product.sku}
-                    </option>
-                  ))}
-                  <option value="custom">自定义 SKU</option>
-                </select>
-              </label>
+              <SelectField
+                label="监控商品"
+                value={
+                  presetProducts.some((product) => product.sku === sku)
+                    ? sku
+                    : "custom"
+                }
+                disabled={busy}
+                options={[
+                  ...presetProducts.map((product) => ({
+                    value: product.sku,
+                    label: `${product.name} · ${product.sku}`,
+                  })),
+                  { value: "custom", label: "自定义 SKU" },
+                ]}
+                onChange={(value) => setSku(value === "custom" ? "" : value)}
+              />
               <label>
                 商品 SKU
                 <input
@@ -740,18 +776,16 @@ export function InventoryMonitor({
                   placeholder="例如：MLH74FE"
                 />
               </label>
-              <label>
-                每路购买数量
-                <input
-                  type="number"
-                  min={1}
-                  max={99}
-                  required
-                  value={quantity}
-                  disabled={busy}
-                  onChange={(event) => setQuantity(Number(event.target.value))}
-                />
-              </label>
+              <NumberField
+                label="每路购买数量"
+                min={1}
+                max={99}
+                required
+                value={quantity}
+                disabled={busy}
+                onValidityChange={(valid) => numberValidity("quantity", valid)}
+                onChange={setQuantity}
+              />
             </div>
             <StoreSearch
               bridge={bridge}
@@ -761,6 +795,7 @@ export function InventoryMonitor({
               onChoose={addStores}
               disabled={
                 busy ||
+                invalidNumbers.includes("quantity") ||
                 !Number.isInteger(quantity) ||
                 quantity < 1 ||
                 quantity > 99
@@ -809,25 +844,20 @@ export function InventoryMonitor({
                   />
                   启用动态库存代理池
                 </label>
-                <label>
-                  连接池容量
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={config.proxy.pool_size}
-                    disabled={busy || running}
-                    onChange={(event) =>
-                      change({
-                        ...config,
-                        proxy: {
-                          ...config.proxy,
-                          pool_size: Number(event.target.value),
-                        },
-                      })
-                    }
-                  />
-                </label>
+                <NumberField
+                  label="连接池容量"
+                  min={1}
+                  max={100}
+                  value={config.proxy.pool_size}
+                  disabled={busy || running}
+                  onValidityChange={(valid) => numberValidity("pool", valid)}
+                  onChange={(value) =>
+                    change({
+                      ...config,
+                      proxy: { ...config.proxy, pool_size: value },
+                    })
+                  }
+                />
               </div>
               {config.proxy.providers.map((provider, index) => {
                 const update = (patch: Data) =>
@@ -844,33 +874,28 @@ export function InventoryMonitor({
                   <fieldset className="inventory-provider" key={provider.id}>
                     <legend>供应商 {index + 1}</legend>
                     <div className="inventory-proxy-fields">
-                      <label>
-                        供应商类型
-                        <select
-                          value={provider.kind}
-                          disabled={busy || running}
-                          onChange={(event) =>
-                            update({ kind: event.target.value })
-                          }
-                        >
-                          <option value="xydaili">星月 / XY</option>
-                          <option value="dmdaili">大漠 / DM</option>
-                          <option value="generic">通用提取接口</option>
-                        </select>
-                      </label>
-                      <label>
-                        代理有效期（秒）
-                        <input
-                          type="number"
-                          min={20}
-                          max={3600}
-                          value={provider.ttl_seconds || 180}
-                          disabled={busy || running}
-                          onChange={(event) =>
-                            update({ ttl_seconds: Number(event.target.value) })
-                          }
-                        />
-                      </label>
+                      <SelectField
+                        label="供应商类型"
+                        value={provider.kind}
+                        disabled={busy || running}
+                        options={[
+                          { value: "xydaili", label: "星月 / XY" },
+                          { value: "dmdaili", label: "大漠 / DM" },
+                          { value: "generic", label: "通用提取接口" },
+                        ]}
+                        onChange={(value) => update({ kind: value })}
+                      />
+                      <NumberField
+                        label="代理有效期（秒）"
+                        min={20}
+                        max={3600}
+                        value={provider.ttl_seconds || 180}
+                        disabled={busy || running}
+                        onValidityChange={(valid) =>
+                          numberValidity(`provider:${provider.id}`, valid)
+                        }
+                        onChange={(value) => update({ ttl_seconds: value })}
+                      />
                     </div>
                     {(
                       [

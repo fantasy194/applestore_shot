@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { chooseOption } from "./select-option";
 test.describe.configure({ timeout: 45000 });
 
 async function fixture(
@@ -296,15 +297,16 @@ test("空闲预热可选择自提准备，运行中仍显示原流程且不自�
   });
   await page.goto("/", { waitUntil: "domcontentloaded" });
   const panel = page.getByRole("region", { name: "空闲预热", exact: true });
-  await expect(panel.getByLabel("预热流程", { exact: true })).toHaveValue(
-    "login",
+  await expect(
+    panel.getByRole("combobox", { name: "预热流程", exact: true }),
+  ).toHaveText("预热登录（不加购）");
+  await chooseOption(
+    panel.getByRole("combobox", { name: "预热流程", exact: true }),
+    "提前准备自提（不下单）",
   );
-  await panel
-    .getByLabel("预热流程", { exact: true })
-    .selectOption("pickup_prepare");
-  await expect(panel.getByLabel("预热流程", { exact: true })).toHaveValue(
-    "pickup_prepare",
-  );
+  await expect(
+    panel.getByRole("combobox", { name: "预热流程", exact: true }),
+  ).toHaveText("提前准备自提（不下单）");
   await expect(panel.getByRole("status")).toHaveText("正在预热登录，不加购");
   await expect(panel).toContainText("可能加购，不提交订单");
   expect(

@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { chooseOption } from "./select-option";
 
 async function fixture(
   page: Page,
@@ -180,7 +181,10 @@ async function fixture(
 }
 
 async function addStores(page: Page, names = ["Apple 第一店", "Apple 第二店"]) {
-  await page.getByLabel("门店选择方式").selectOption("priority");
+  await chooseOption(
+    page.getByRole("combobox", { name: "门店选择方式", exact: true }),
+    "预选多店，按顺序择一",
+  );
   await page.getByRole("button", { name: "从官网读取门店" }).click();
   for (const name of names)
     await page.getByRole("checkbox", { name: new RegExp(name) }).check();
@@ -209,11 +213,19 @@ test("多选门店按点击顺序加入并可重排删除，窗口规则可免�
   await list.getByRole("button", { name: "下移 Apple 第一店" }).click();
   await list.getByRole("button", { name: "删除预选 Apple 第三店" }).click();
   await expect(list.locator("article strong")).toHaveText(["1. Apple 第一店"]);
-  await page.getByLabel("自提时段规则").selectOption("window");
+  await chooseOption(
+    page.getByRole("combobox", { name: "自提时段规则", exact: true }),
+    "指定时间窗口",
+  );
   await page.getByLabel("可接受开始时间").fill("10:30");
   await page.getByLabel("可接受结束时间").fill("15:00");
-  await page.getByLabel("无匹配时段").selectOption("stop");
-  await expect(page.getByLabel("取货联系人来源")).toHaveValue("official");
+  await chooseOption(
+    page.getByRole("combobox", { name: "无匹配时段", exact: true }),
+    "尝试下一预选门店，全部无匹配时停止",
+  );
+  await expect(
+    page.getByRole("combobox", { name: "取货联系人来源", exact: true }),
+  ).toHaveText("优先使用本次官网保存的联系人");
   await expect(
     page.getByLabel("取货手机号", { exact: true }),
   ).not.toBeVisible();
@@ -243,7 +255,9 @@ test("多选门店按点击顺序加入并可重排删除，窗口规则可免�
   expect(params.contact).toBeUndefined();
   await page.getByRole("link", { name: "账号工作台", exact: true }).click();
   await page.getByRole("link", { name: "本地配置", exact: true }).click();
-  await expect(page.getByLabel("自提时段规则")).toHaveValue("window");
+  await expect(
+    page.getByRole("combobox", { name: "自提时段规则", exact: true }),
+  ).toHaveText("指定时间窗口");
   await expect(page.getByLabel("可接受开始时间")).toHaveValue("10:30");
   await expect(page.getByLabel("预选自提门店顺序")).toContainText("R001");
   expect(
@@ -262,7 +276,10 @@ for (const monitoring of [true, false]) {
     await fixture(page, { monitoring });
     await page.goto("/#/settings", { waitUntil: "domcontentloaded" });
     await addStores(page, ["Apple 第二店", "Apple 第一店"]);
-    await page.getByLabel("自提时段规则").selectOption("latest");
+    await chooseOption(
+      page.getByRole("combobox", { name: "自提时段规则", exact: true }),
+      "最晚可用日期与时段",
+    );
     await page
       .getByRole("button", { name: "监控预选门店，有货自动下单" })
       .click();
