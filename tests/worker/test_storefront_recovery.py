@@ -244,6 +244,7 @@ class StorefrontRecoveryTests(unittest.TestCase):
                 return ACCOUNT
 
             with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(playwright)), \
+                    patch('browser_cdp._debug_ready', return_value=True), \
                     patch('browser_login.find_browser', return_value=Path('fixture-chrome.exe')), \
                     patch('browser_login.subprocess.Popen', return_value=process) as launch, \
                     patch('browser_login.requests.utils.get_environ_proxies', return_value={}), \

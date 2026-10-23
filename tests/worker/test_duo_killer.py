@@ -534,6 +534,7 @@ class BrowserInitializationTests(unittest.TestCase):
             return {"name": name, "value": "test-context", "domain": domain,
                     "path": "/", "secure": True, "expires": -1, "httpOnly": True}
         with tempfile.TemporaryDirectory() as temp, \
+                patch('browser_cdp._debug_ready', return_value=True), \
                 patch("playwright.sync_api.sync_playwright") as factory, \
                 patch("apple_login.subprocess.Popen") as process_factory, \
                 patch("apple_login.Path.is_file", return_value=True), \
@@ -568,7 +569,7 @@ class BrowserInitializationTests(unittest.TestCase):
             self.assertNotIn("--enable-automation", args)
             self.assertNotIn("about:blank", args)
             self.assertIn("--restore-last-session", args)
-            self.assertEqual(launcher.connect_over_cdp.call_args.kwargs, {"timeout": 1000, "no_defaults": True})
+            self.assertEqual(launcher.connect_over_cdp.call_args.kwargs, {"timeout": 15000, "no_defaults": True})
             self.assertEqual([call.args[0] for call in page.goto.call_args_list],
                              ["https://www.apple.com.cn/", "https://www.apple.com.cn/shop/bag"])
             page.wait_for_timeout.assert_not_called()  # 已就绪时不额外等待两个五秒。
@@ -598,6 +599,7 @@ class BrowserInitializationTests(unittest.TestCase):
 
     def test_missing_context_closes_owned_browser_and_keeps_session(self):
         with tempfile.TemporaryDirectory() as temp, patch("playwright.sync_api.sync_playwright") as factory, \
+                patch('browser_cdp._debug_ready', return_value=True), \
                 patch("apple_login.subprocess.Popen") as process_factory, \
                 patch("apple_login.Path.is_file", return_value=True), \
                 patch("requests.utils.get_environ_proxies", return_value={}):

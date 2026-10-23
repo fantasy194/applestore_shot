@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from urllib.request import ProxyHandler, Request, build_opener
 
 sys.path[:0] = ['/app/worker', '/app/worker/legacy']
+from browser_cdp import connect_browser
 from browser_remote import BrowserRemote
 from platform_support import find_browser
 from protocol import Channel
@@ -74,17 +75,7 @@ def main():
                 process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors)
                 browser = None
                 try:
-                    deadline = time.monotonic() + 30
-                    while browser is None and time.monotonic() < deadline:
-                        if process.poll() is not None:
-                            raise AssertionError('GUI Chrome exited early: ' +
-                                (Path(directory) / 'chrome-errors.log').read_text()[-2500:])
-                        try:
-                            browser = playwright.chromium.connect_over_cdp(
-                                f'http://127.0.0.1:{port}', timeout=1000, no_defaults=True)
-                        except Exception:
-                            time.sleep(.2)
-                    assert browser is not None, 'No CDP connection to GUI Chrome'
+                    browser = connect_browser(playwright.chromium, process, port)
                     context = browser.contexts[0]
                     page = context.pages[-1]
                     if attempt == 1:

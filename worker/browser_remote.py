@@ -18,6 +18,7 @@ import time
 from urllib.parse import urlsplit
 from platform_support import private_fd
 from contextlib import contextmanager
+from browser_cdp import BrowserConnectError, connect_browser
 
 
 def official_page(page):
@@ -43,6 +44,9 @@ class BrowserRemote:
         self.frames = deque(maxlen=16)
         self.host = None
         self.active = True
+        self.closed = False
+        self.error_code = None
+        self.reason = None
         # Distinguish a replacement popup under the same engine task. Otherwise
         # an old frame #1 could target a new window's unrelated frame #1.
         self.sequence = int(time.time() * 1000) * 1000
@@ -68,7 +72,7 @@ class BrowserRemote:
 
             def authorized(self):
                 supplied = self.headers.get('Authorization', '')
-                if not broker.active or not hmac.compare_digest(supplied, 'Bearer ' + broker.token):
+                if broker.closed or not hmac.compare_digest(supplied, 'Bearer ' + broker.token):
                     self.reply(401, {'error': '浏览器预览授权无效。'})
                     return False
                 return True
@@ -84,10 +88,15 @@ class BrowserRemote:
                     if frame and int(time.time() * 1000) - frame['captured_at_ms'] > 10000:
                         frame = None
                     data = {'active': broker.active, 'frame': frame, 'url_host': broker.host}
+                    if broker.reason is not None:
+                        data.update(error_code=broker.error_code, reason=broker.reason)
                 self.reply(200, data)
 
             def do_POST(self):
                 if not self.authorized():
+                    return
+                if not broker.active:
+                    self.reply(409, {'error': broker.reason or '浏览器预览已结束。'})
                     return
                 if self.path != '/input':
                     self.reply(404, {'error': '浏览器操作不存在。'})
@@ -155,6 +164,7 @@ class BrowserRemote:
 
     def __exit__(self, *_args):
         self.active = False
+        self.closed = True
         self.token = secrets.token_hex(32)
         self.path.unlink(missing_ok=True)
         with self.lock:
@@ -171,7 +181,7 @@ class BrowserRemote:
         self.server.server_close()
         self.thread.join(timeout=2)
         if self.controller is not None:
-            self.controller.join(timeout=3)
+            self.controller.join(timeout=17)
 
     def attach_cdp(self, port):
         """A separate connection owns its own Playwright API and stays responsive
@@ -179,18 +189,31 @@ class BrowserRemote:
         def control():
             from playwright.sync_api import sync_playwright
             from protocol import Cancelled
+            def checkpoint():
+                if not self.active:
+                    raise Cancelled()
+                self.service.channel.checkpoint()
+
+            def failed(code, reason):
+                with self.lock:
+                    if self.closed:
+                        return
+                    self.active = False
+                    self.error_code, self.reason = code, reason
+                    self.frame, self.host = None, None
+                    self.frames.clear()
+                stage = getattr(self.service, 'stage', None)
+                if callable(stage):
+                    stage(reason)
+
             try:
                 with sync_playwright() as playwright:
-                    browser = None
-                    deadline = time.monotonic() + 30
-                    while self.active and time.monotonic() < deadline:
-                        try:
-                            browser = playwright.chromium.connect_over_cdp(
-                                f'http://127.0.0.1:{port}', timeout=1000, no_defaults=True)
+                    browser = connect_browser(playwright.chromium, None, port, checkpoint=checkpoint)
+                    while self.active:
+                        checkpoint()
+                        if not browser.is_connected():
+                            failed('BROWSER_PREVIEW_INTERRUPTED', '浏览器预览连接已中断，请等待官网窗口恢复；未发送等待中的输入。')
                             break
-                        except Exception:
-                            time.sleep(.2)
-                    while self.active and browser is not None:
                         pages = [page for context in browser.contexts for page in context.pages]
                         if pages:
                             from browser_login import pending_auth_page
@@ -199,8 +222,15 @@ class BrowserRemote:
                             chosen.wait_for_timeout(150)
                         else:
                             time.sleep(.15)
-            except (Exception, Cancelled):
-                pass
+            except BrowserConnectError as error:
+                failed(error.code, error.message)
+            except Cancelled:
+                with self.lock:
+                    self.active = False
+                    self.frame, self.host = None, None
+                    self.frames.clear()
+            except Exception:
+                failed('BROWSER_PREVIEW_INTERRUPTED', '浏览器预览连接已中断，请等待官网窗口恢复；未发送等待中的输入。')
         self.controller = threading.Thread(target=control, daemon=True)
         self.controller.start()
 
@@ -222,7 +252,7 @@ class BrowserRemote:
                 break
             payload = command['payload']
             try:
-                if not permitted or time.monotonic() >= command['deadline']:
+                if not self.active or not permitted or time.monotonic() >= command['deadline']:
                     continue
                 kind = payload['type']
                 with self.lock:
@@ -263,6 +293,8 @@ class BrowserRemote:
             frame = {**size, 'sequence': self.sequence, 'captured_at_ms': int(time.time() * 1000),
                      'data_url': 'data:image/jpeg;base64,' + base64.b64encode(image).decode('ascii')}
             with self.lock:
+                if not self.active or self.closed:
+                    return
                 self.frame = frame
                 self.frames.append({**{k: v for k, v in frame.items() if k != 'data_url'},
                                     '_page_url': page.url})

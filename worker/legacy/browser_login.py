@@ -432,6 +432,7 @@ def seed_missing_session(context, service):
 
 
 def login_in_browser(service, timeout=300, *, maintenance=False):
+    from browser_cdp import BrowserConnectError, connect_browser
     from playwright.sync_api import sync_playwright, Error as BrowserError, TimeoutError as BrowserTimeout
     from apple_login import HOME, browser_profile_path
     from browser_signin import BrowserSigninAssistant
@@ -481,20 +482,10 @@ def login_in_browser(service, timeout=300, *, maintenance=False):
                       browser_pid=process.pid)
         with sync_playwright() as p:
             try:
-                deadline = time.monotonic() + 30
-                while browser is None:
-                    service.channel.checkpoint()
-                    if process.poll() is not None:
-                        raise BrowserSessionError('BROWSER_EXITED_EARLY',
-                            '浏览器窗口启动后提前退出，可能正被其他窗口使用；会话状态尚未检查。', browser_started=True)
-                    if time.monotonic() >= deadline:
-                        raise BrowserSessionError('BROWSER_CONNECT_TIMEOUT',
-                            '连接官方浏览器窗口超时，请检查该账号的专用窗口；会话状态尚未检查。', browser_started=True)
-                    try:
-                        browser = p.chromium.connect_over_cdp(
-                            f'http://127.0.0.1:{port}', timeout=1000, no_defaults=True)
-                    except BrowserError:
-                        time.sleep(.2)
+                try:
+                    browser = connect_browser(p.chromium, process, port, checkpoint=service.channel.checkpoint)
+                except BrowserConnectError as error:
+                    raise BrowserSessionError(error.code, error.message, browser_started=True) from None
                 if not browser.contexts:
                     raise BrowserSessionError('BROWSER_CONTEXT_MISSING', '已连接浏览器但没有可用页面；会话状态尚未检查。',
                                               browser_started=True, browser_connected=True)

@@ -230,6 +230,7 @@ class AppleStoreLogin:
         return profile
 
     def initialize_browser_context(self):
+        from browser_cdp import BrowserConnectError, connect_browser
         started = time.monotonic()
         headless = getattr(interaction.handler, 'headless_browser', False) is True
         log.info("[浏览器上下文] 开始初始化（%s）", '后台无头' if headless else '可见窗口')
@@ -271,17 +272,13 @@ class AppleStoreLogin:
         try:
             interaction.report_stage("正在后台获取浏览器上下文（无头）" if headless else "正在获取浏览器上下文", browser_pid=process.pid)
             with sync_playwright() as playwright:
-                deadline = time.monotonic() + 30
-                while browser is None:
-                    if headless and interaction.handler is not None:
-                        interaction.handler.channel.checkpoint()
-                    if process.poll() is not None or time.monotonic() >= deadline:
-                        raise LoginError("未能连接脚本启动的 Chrome，请关闭占用专用配置的浏览器后重试。")
-                    try:
-                        browser = playwright.chromium.connect_over_cdp(
-                            f"http://127.0.0.1:{port}", timeout=1000, no_defaults=True)
-                    except BrowserError:
-                        time.sleep(0.2)
+                try:
+                    browser = connect_browser(playwright.chromium, process, port,
+                        checkpoint=interaction.handler.channel.checkpoint if interaction.handler is not None else None)
+                except BrowserConnectError as error:
+                    failure = LoginError(error.message)
+                    failure.code = error.code
+                    raise failure from None
                 from browser_remote import remote_context
                 with (nullcontext(None) if headless else remote_context(interaction.handler, port)) as remote:
                     try:

@@ -9,8 +9,12 @@ from unittest.mock import Mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from types import SimpleNamespace
+from contextlib import nullcontext
+from unittest.mock import patch
 
 from browser_remote import BrowserRemote
+from browser_cdp import BrowserConnectError
+from protocol import Cancelled
 from protocol import Channel
 
 
@@ -36,6 +40,78 @@ class BrowserRemoteTests(unittest.TestCase):
             response = error
         with response:
             return response.status, json.load(response)
+
+    def test_failed_cdp_attachment_returns_inactive_safe_reason_and_rejects_input(self):
+        with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \
+                patch('browser_remote.connect_browser', side_effect=BrowserConnectError(
+                    'BROWSER_CONNECT_TIMEOUT', '浏览器完整连接超时，已有资料已保留。')):
+            with BrowserRemote(self.service) as broker:
+                broker.attach_cdp(12345)
+                broker.controller.join(timeout=2)
+                self.assertFalse(broker.controller.is_alive())
+                code, status = self.request(broker, '/status')
+                self.assertEqual(code, 200)
+                self.assertFalse(status['active'])
+                self.assertEqual(status['error_code'], 'BROWSER_CONNECT_TIMEOUT')
+                self.assertIn('资料已保留', status['reason'])
+                self.assertIsNone(status['frame'])
+                code, _ = self.request(broker, '/input', {'type': 'text', 'text': 'private-fixture'})
+                self.assertEqual(code, 409)
+                self.assertTrue(broker.commands.empty())
+                self.service.stage.assert_called_once_with(status['reason'])
+
+    def test_disconnected_browser_with_no_pages_reports_inactive(self):
+        browser = Mock(contexts=[])
+        browser.is_connected.return_value = False
+        with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \
+                patch('browser_remote.connect_browser', return_value=browser):
+            with BrowserRemote(self.service) as broker:
+                broker.attach_cdp(12345)
+                broker.controller.join(timeout=2)
+                self.assertFalse(broker.controller.is_alive())
+                code, status = self.request(broker, '/status')
+                self.assertEqual(code, 200)
+                self.assertFalse(status['active'])
+                self.assertEqual(status['error_code'], 'BROWSER_PREVIEW_INTERRUPTED')
+                self.assertIsNone(status['frame'])
+
+    def test_empty_page_loop_honors_cancellation_and_clears_frame_without_stage(self):
+        browser = Mock(contexts=[])
+        browser.is_connected.return_value = True
+        # Force cancellation after one empty-page iteration, not at attachment.
+        self.service.channel.checkpoint = Mock(side_effect=[None, Cancelled()])
+        with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \
+                patch('browser_remote.connect_browser', return_value=browser):
+            with BrowserRemote(self.service) as broker:
+                with broker.lock:
+                    broker.frame = {'captured_at_ms': int(time.time() * 1000)}
+                    broker.frames.append({'synthetic': True})
+                    broker.host = 'fixture.invalid'
+                broker.attach_cdp(12345)
+                broker.controller.join(timeout=2)
+                self.assertFalse(broker.controller.is_alive())
+                code, status = self.request(broker, '/status')
+                self.assertEqual(code, 200)
+                self.assertFalse(status['active'])
+                self.assertIsNone(status['frame'])
+                self.assertIsNone(status['url_host'])
+                self.assertFalse(broker.frames)
+                self.service.stage.assert_not_called()
+                self.assertEqual(self.service.channel.checkpoint.call_count, 2)
+
+    def test_screenshot_finishing_after_close_does_not_repopulate_sensitive_frame(self):
+        with BrowserRemote(self.service) as broker:
+            def close_during_screenshot(**kwargs):
+                with broker.lock:
+                    broker.active = False
+                    broker.closed = True
+                    broker.frame = None
+                    broker.frames.clear()
+                return b'private-screenshot-fixture'
+            self.page.screenshot.side_effect = close_during_screenshot
+            broker.tick(self.page)
+            self.assertIsNone(broker.frame)
+            self.assertFalse(broker.frames)
 
     def input_and_tick(self, broker, payload, before_tick=None):
         result = []
