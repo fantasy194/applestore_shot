@@ -97,6 +97,35 @@ class Service:
         duo_killer.write_private_json(self.auth, empty_auth(self.account))
         return True
 
+    def browser_password(self, *, allow_prompt=False):
+        """Provide only this task's password to the official browser UI.
+
+        This does not enable legacy HTTP/SRP reauthentication during idle work.
+        Linux/Docker still has no plaintext credential-store fallback.
+        """
+        from browser_login import BrowserSessionError
+        self.channel.checkpoint()
+        if self._parallel_child:
+            raise BrowserSessionError('BROWSER_LOGIN_REQUIRES_ATTENTION',
+                '并发子任务需要重新认证，请先完成当前账号的官网登录。',
+                status='requires_login', requires_login=True)
+        self.authentication_requested = True
+        if not self.password:
+            try:
+                stored = self.vault.get(self.channel.account_id)
+                self.password = stored if isinstance(stored, str) and stored else None
+            except Exception:
+                self.password = None
+        if (not self.password and allow_prompt and self.headless_browser is not True
+                and self.idle_maintenance is not True):
+            value = self.channel.prompt('password', '输入 Apple 账号密码，将自动填入当前官网登录页面',
+                                        account=self.account)
+            if not isinstance(value, dict) or not isinstance(value.get('password'), str) or not value['password']:
+                raise ValueError('请输入密码。')
+            self.password = value['password']
+            self.remember = value.get('remember') is True
+        return self.password
+
     def credentials(self, path):
         self.purchase_auth_interaction = True
         if self._parallel_child:
