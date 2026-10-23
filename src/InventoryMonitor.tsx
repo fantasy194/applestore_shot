@@ -121,10 +121,17 @@ export function InventoryMonitor({
     id: string;
     result: Data | null;
   } | null>(null);
+  const [stoppedMonitorId, setStoppedMonitorId] = useState("");
   const monitorTasks = snapshot.tasks
     .filter((task) => task.action === "inventory_monitor")
     .sort((a, b) => b.created_at - a.created_at);
   const monitor = monitorTasks.find(active);
+  const stoppableMonitor =
+    monitor ||
+    (["failed", "interrupted"].includes(monitorTasks[0]?.status) &&
+    monitorTasks[0]?.id !== stoppedMonitorId
+      ? monitorTasks[0]
+      : undefined);
   const latestCheck = snapshot.tasks
     .filter((task) =>
       ["inventory_monitor", "inventory_check"].includes(task.action),
@@ -423,11 +430,18 @@ export function InventoryMonitor({
               保存并开始监控
             </button>
             <button
-              disabled={busy || !running}
+              disabled={busy || !stoppableMonitor}
               onClick={() =>
                 perform(async () => {
-                  if (monitor) await bridge.cancel(LOCAL_ID, monitor.id);
+                  if (stoppableMonitor) {
+                    await bridge.cancel(
+                      stoppableMonitor.account_id,
+                      stoppableMonitor.id,
+                    );
+                    setStoppedMonitorId(stoppableMonitor.id);
+                  }
                   await refresh();
+                  setNotice("监控已停止，应用重启后保持关闭。");
                 })
               }
             >
@@ -464,6 +478,9 @@ export function InventoryMonitor({
               监控日志
             </a>
           </div>
+          <p className="ui-caption">
+            运行中的监控会在应用重启后恢复，按原授权发现有货并下单；停止监控后保持关闭。
+          </p>
           {error && (
             <p role="alert" className="error-text">
               {error}

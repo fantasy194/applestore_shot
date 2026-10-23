@@ -99,6 +99,14 @@ async function fixture(page: Page) {
       task.result = result;
       update(structuredClone(task));
     };
+    root.failMonitor = () => {
+      const task = tasks.find((row) => row.action === "inventory_monitor");
+      Object.assign(task, {
+        status: "failed",
+        stage: "测试监控配置不可用",
+      });
+      update(structuredClone(task));
+    };
     root.__DUO_KILLER_TEST__ = {
       logs: async (params: any) => {
         root.historyCalls.push(params);
@@ -132,7 +140,8 @@ async function fixture(page: Page) {
       cancel: async (_accountId: string, id: string) => {
         root.cancelled.push(id);
         const task = tasks.find((row) => row.id === id);
-        Object.assign(task, { status: "cancelled", stage: "监控已停止" });
+        if (!["failed", "interrupted"].includes(task.status))
+          Object.assign(task, { status: "cancelled", stage: "监控已停止" });
         update(structuredClone(task));
       },
       start: async (accountId: string, action: string, params: any) => {
@@ -354,6 +363,35 @@ test("多门店监控区分有货与未知，并保留停止入口", async ({ pa
   await page.getByRole("button", { name: "停止监控", exact: true }).click();
   await expect(page.locator(".inventory-run-state")).toHaveText("监控已停止");
   expect(await page.evaluate(() => (window as any).cancelled.length)).toBe(1);
+});
+
+test("监控失败后仍可主动停止重启恢复，不需要重新开启", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/#/monitor", { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "保存并开始监控" }).click();
+  await expect(page.locator(".inventory-run-state")).toHaveText("监控运行中");
+  await page.evaluate(() => (window as any).failMonitor());
+  await expect(page.getByRole("alert")).toContainText("测试监控配置不可用");
+  const starts = await page.evaluate(() => (window as any).started.length);
+  const monitorId = await page.evaluate(
+    () =>
+      (window as any).started.find(
+        (call: any) => call.action === "inventory_monitor",
+      ).id,
+  );
+  const stop = page.getByRole("button", { name: "停止监控", exact: true });
+  await expect(stop).toBeEnabled();
+  await stop.click();
+  await expect(
+    page.getByText("监控已停止，应用重启后保持关闭。"),
+  ).toBeVisible();
+  await expect(stop).toBeDisabled();
+  expect(await page.evaluate(() => (window as any).cancelled)).toEqual([
+    monitorId,
+  ]);
+  expect(await page.evaluate(() => (window as any).started.length)).toBe(
+    starts,
+  );
 });
 
 test("监控运行时仍可查询官网门店，查询不会修改目标或中断监控", async ({

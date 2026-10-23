@@ -35,6 +35,29 @@ def validate_time_rule(rule=None):
     return result
 
 
+def _validate_stores(stores, *, required):
+    if not isinstance(stores, list) or not (1 if required else 0) <= len(stores) <= 30:
+        raise ValueError('请预选 1–30 家自提门店并设置优先顺序。' if required
+                         else '备用自提门店列表须为 0–30 家有效门店。')
+    rows, seen = [], set()
+    for row in stores:
+        if not isinstance(row, dict) or set(row) - {'store_id', 'store_name', 'search'}:
+            raise ValueError('预选自提门店格式无效。')
+        if not isinstance(row.get('store_id'), str) or not re.fullmatch(r'R\d{1,8}', row['store_id']):
+            raise ValueError('预选自提门店编号无效。')
+        if row['store_id'] in seen:
+            raise ValueError('预选自提门店不能重复。')
+        seen.add(row['store_id'])
+        clean = {'store_id': row['store_id']}
+        for key in ('store_name', 'search'):
+            text = row.get(key)
+            if not isinstance(text, str) or not text.strip() or len(text) > 200:
+                raise ValueError('请填写预选门店的名称与城市或邮编。')
+            clean[key] = text.strip()
+        rows.append(clean)
+    return rows
+
+
 def validate_preset(data, *, require_contact=True):
     pickup = data.get('pickup')
     if not isinstance(pickup, dict):
@@ -44,25 +67,7 @@ def validate_preset(data, *, require_contact=True):
         raise ValueError('自提门店或联系人模式无效。')
     result = {'pickup': {}, 'contact': {}}
     if mode == 'priority':
-        stores = pickup.get('stores')
-        if not isinstance(stores, list) or not 1 <= len(stores) <= 30:
-            raise ValueError('请预选 1–30 家自提门店并设置优先顺序。')
-        rows, seen = [], set()
-        for row in stores:
-            if not isinstance(row, dict) or set(row) - {'store_id', 'store_name', 'search'}:
-                raise ValueError('预选自提门店格式无效。')
-            if not isinstance(row.get('store_id'), str) or not re.fullmatch(r'R\d{1,8}', row['store_id']):
-                raise ValueError('预选自提门店编号无效。')
-            if row['store_id'] in seen:
-                raise ValueError('预选自提门店不能重复。')
-            seen.add(row['store_id'])
-            clean = {'store_id': row['store_id']}
-            for key in ('store_name', 'search'):
-                text = row.get(key)
-                if not isinstance(text, str) or not text.strip() or len(text) > 200:
-                    raise ValueError('请填写预选门店的名称与城市或邮编。')
-                clean[key] = text.strip()
-            rows.append(clean)
+        rows = _validate_stores(pickup.get('stores'), required=True)
         result['pickup'].update(selection_mode='priority', stores=rows,
                                 search=rows[0]['search'], store_name=rows[0]['store_name'])
     else:
@@ -71,6 +76,8 @@ def validate_preset(data, *, require_contact=True):
             if not isinstance(text, str) or not text.strip() or len(text) > 200:
                 raise ValueError('请先完整保存自提城市、门店和取货联系人。')
             result['pickup'][key] = text.strip()
+        if 'stores' in pickup:
+            result['pickup']['stores'] = _validate_stores(pickup['stores'], required=False)
         if 'selection_mode' in pickup:
             result['pickup']['selection_mode'] = mode
     if 'contact_mode' in pickup:

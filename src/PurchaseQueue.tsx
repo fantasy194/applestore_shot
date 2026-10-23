@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Pause, Play, RefreshCw, ScrollText } from "lucide-react";
 import type { Bridge } from "./api";
-import type { Account, Data } from "./types";
+import type { Account, Data, Task } from "./types";
 import { useAccountPrivacy } from "./AccountPrivacy";
 import { SelectField } from "./SelectField";
 import { NumberField } from "./NumberField";
@@ -9,6 +9,7 @@ import { presetProducts } from "./products";
 import { DisclosureSummary } from "./DisclosureSummary";
 import { purchaseEvidence } from "./purchaseEvidence";
 import { formatTaskStage } from "./taskStage";
+import { QueueEnqueuePolicy } from "./QueueEnqueuePolicy";
 
 const states: Record<string, string> = {
   queued: "等待执行",
@@ -36,14 +37,100 @@ const terminal = (status: string) =>
 export const logsHref = (filters: Record<string, string> = {}) =>
   `#/logs${Object.keys(filters).length ? `?${new URLSearchParams(filters)}` : ""}`;
 
+function queueTime(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+    return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.valueOf())) return null;
+  const pad = (number: number, width = 2) =>
+    String(number).padStart(width, "0");
+  const day = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+  return {
+    day,
+    clock,
+    full: `${date.getFullYear()}-${day} ${clock}`,
+    iso: date.toISOString(),
+  };
+}
+
+function QueueJobTimes({ job }: { job: Data }) {
+  const enqueued = queueTime(job.queued_at_ms) || queueTime(job.enqueued_at_ms);
+  const events = [
+    {
+      kind: "enqueued",
+      label: "入队",
+      value: queueTime(job.queued_at_ms)
+        ? job.queued_at_ms
+        : job.enqueued_at_ms,
+    },
+    ...(!["manual", "schedule"].includes(job.source)
+      ? [
+          {
+            kind: "stock-detected",
+            label: "发现有货",
+            value: job.stock_detected_at_ms,
+          },
+        ]
+      : []),
+    { kind: "started", label: "开始下单", value: job.started_at_ms },
+    {
+      kind: "order-confirmed",
+      label: "收到订单号",
+      value: job.order_confirmed_at_ms,
+    },
+  ];
+  return (
+    <div className="queue-job-times" aria-label="任务时间">
+      {events.map(({ kind, label, value }) => {
+        const time = queueTime(value);
+        if (!time)
+          return ["enqueued", "stock-detected"].includes(kind) ? (
+            <span className="queue-time-missing" key={kind}>
+              {label}时间未记录
+            </span>
+          ) : null;
+        return (
+          <span className="queue-job-time" key={kind}>
+            <time
+              data-kind={kind}
+              data-same-day={time.day === enqueued?.day || undefined}
+              dateTime={time.iso}
+              title={`${label} · ${time.full}（本机记录）`}
+              aria-label={`${label} ${time.full}`}
+            >
+              <span className="queue-time-context">
+                <span>{label}</span>{" "}
+                <span className="queue-time-date">{time.day}</span>
+              </span>{" "}
+              <strong>
+                {time.clock.slice(0, 8)}
+                <span className="queue-time-fraction">
+                  {time.clock.slice(8)}
+                </span>
+              </strong>
+            </time>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 export function PurchaseQueue({
   bridge,
   accounts,
+  tasks,
+  initialAccountId,
   onTask,
+  onConfigure,
 }: {
   bridge: Bridge;
   accounts: Account[];
+  tasks: Task[];
+  initialAccountId?: string;
   onTask: (taskId: string, accountId: string) => void;
+  onConfigure: (accountId: string) => void;
 }) {
   const { format } = useAccountPrivacy();
   const [state, setState] = useState<Data | null>(null);
@@ -124,16 +211,6 @@ export function PurchaseQueue({
   const accountName = (id: string) =>
     format(accounts.find((account) => account.id === id)?.name || id);
   const completed = jobs.filter((job) => terminal(job.status)).length;
-  const timestamp = (value: number) =>
-    new Date(value).toLocaleString("zh-CN", {
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
-      fractionalSecondDigits: 3,
-    });
   return (
     <main className="local-page purchase-queue">
       <header className="local-heading">
@@ -178,6 +255,13 @@ export function PurchaseQueue({
               <strong>{completed}</strong>
             </div>
           </div>
+          <QueueEnqueuePolicy
+            bridge={bridge}
+            accounts={accounts}
+            tasks={tasks}
+            initialAccountId={initialAccountId}
+            onConfigure={onConfigure}
+          />
           <details className="ui-panel ui-disclosure queue-policy">
             <DisclosureSummary>
               执行策略 · {state?.paused ? "队列已暂停" : "队列运行中"} ·{" "}
@@ -333,6 +417,20 @@ export function PurchaseQueue({
               const pending = evidence.pending;
               const unknown =
                 job.status === "submission_unknown" || evidence.unknown;
+              const modePaused =
+                ["queued", "waiting_stock"].includes(job.status) &&
+                /候选门店模式已关闭|已切换候选门店模式|下单方式已变更/.test(
+                  job.message || "",
+                );
+              const hasAccount = accounts.some(
+                (account) => account.id === job.account_id && !account.pending,
+              );
+              const priority = job.pickup_policy?.selection_mode === "priority";
+              const modeMessage = !hasAccount
+                ? "原账号已移除，任务无法继续。请取消此任务，再使用现有账号配置抢购。"
+                : priority
+                  ? "当前配置与入队时的「预选多店」不一致。恢复该模式和自动抢购授权后，有货时继续；改用固定单店请取消此任务。"
+                  : "当前配置与入队时的「固定单店」不一致。恢复该模式和自动抢购授权后，有货时继续；改用预选多店请取消此任务。";
               const store =
                 job.result?.pickup_store ||
                 (job.pickup_policy?.selection_mode === "priority"
@@ -362,6 +460,7 @@ export function PurchaseQueue({
                   key={job.id}
                   data-job-id={job.id}
                   data-tone={tone}
+                  data-mode-paused={modePaused || undefined}
                 >
                   <div className="queue-job-heading">
                     <div className="queue-job-product">
@@ -378,9 +477,12 @@ export function PurchaseQueue({
                         ? "提交结果未知"
                         : pending
                           ? "待付款"
-                          : states[job.status] || job.status}
+                          : modePaused
+                            ? "等待恢复配置"
+                            : states[job.status] || job.status}
                     </span>
                   </div>
+                  <QueueJobTimes job={job} />
                   <div className="queue-job-meta">
                     <span>
                       {accountName(job.account_id)} · 每路 {job.quantity} 件 ·{" "}
@@ -400,9 +502,11 @@ export function PurchaseQueue({
                   {job.message && (
                     <p className="queue-job-step">
                       {format(
-                        ["running", "dispatched"].includes(job.status)
-                          ? formatTaskStage(job.message)
-                          : job.message,
+                        modePaused
+                          ? modeMessage
+                          : ["running", "dispatched"].includes(job.status)
+                            ? formatTaskStage(job.message)
+                            : job.message,
                       )}
                     </p>
                   )}
@@ -418,11 +522,15 @@ export function PurchaseQueue({
                         详情
                       </DisclosureSummary>
                       <div className="queue-job-detail-body">
-                        <time
-                          dateTime={new Date(job.enqueued_at_ms).toISOString()}
-                        >
-                          入队 {timestamp(job.enqueued_at_ms)}
-                        </time>
+                        {!queueTime(job.started_at_ms) && (
+                          <p className="muted">
+                            {["queued", "waiting_stock", "dispatched"].includes(
+                              job.status,
+                            )
+                              ? "尚未开始下单。"
+                              : "此记录没有开始下单时间；入队时间仅表示进入队列。"}
+                          </p>
+                        )}
                         {job.pickup_policy?.selection_mode === "priority" && (
                           <p className="muted">
                             预选顺序：
@@ -462,6 +570,14 @@ export function PurchaseQueue({
                       </div>
                     </details>
                     <div className="ui-toolbar queue-job-actions">
+                      {modePaused && hasAccount && (
+                        <button
+                          className="queue-aux-action"
+                          onClick={() => onConfigure(job.account_id)}
+                        >
+                          查看自提配置
+                        </button>
+                      )}
                       {job.task_id && (
                         <button
                           className={

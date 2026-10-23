@@ -1,3 +1,4 @@
+import { usePurchaseDraft } from "./usePurchaseDraft";
 import { DisclosureSummary } from "./DisclosureSummary";
 import { OrderProgressBar } from "./OrderProgressBar";
 import { formatTaskStage } from "./taskStage";
@@ -106,8 +107,6 @@ function WorkspaceApp() {
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState("");
   const [dispatching, setDispatching] = useState(false);
-  const [sku, setSku] = useState("MK2M4CH");
-  const [quantity, setQuantity] = useState(1);
   const [concurrency, setConcurrency] = useState(1);
   const [retryCount, setRetryCount] = useState(0);
   const [invalidPurchaseNumbers, setInvalidPurchaseNumbers] = useState<
@@ -242,10 +241,7 @@ function WorkspaceApp() {
   }, [bridge]);
   const account = snapshot.accounts.find((a) => a.id === accountId);
   useLayoutEffect(() => setRevealed(false), [accountId, setRevealed]);
-  useEffect(() => {
-    setSku(account?.preset_sku || "MK2M4CH");
-    setQuantity(account?.preset_quantity || 1);
-  }, [account?.id, account?.preset_sku, account?.preset_quantity]);
+  const { sku, quantity, setSku, setQuantity } = usePurchaseDraft(account);
   const tasks = snapshot.tasks
     .filter((t) => t.account_id === accountId)
     .sort((a, b) => b.created_at - a.created_at || b.updated_at - a.updated_at);
@@ -407,6 +403,14 @@ function WorkspaceApp() {
       <PurchaseQueue
         bridge={bridge}
         accounts={snapshot.accounts}
+        tasks={snapshot.tasks}
+        initialAccountId={accountId}
+        onConfigure={(targetAccount) => {
+          setTaskTarget(null);
+          setFocusTaskId("");
+          setAccountId(targetAccount);
+          navigate("settings");
+        }}
         onTask={async (taskId, targetAccount) => {
           const state = await bridge.snapshot();
           setSnapshot(state);
@@ -867,6 +871,7 @@ function WorkspaceApp() {
                             <NumberField
                               label="数量"
                               min={1}
+                              max={999}
                               required
                               value={quantity}
                               onChange={setQuantity}

@@ -14,6 +14,71 @@ const steps = [
   ["payment", "待付款"],
 ] as const;
 
+const phaseIds = new Set<string>(steps.map(([phase]) => phase));
+function stagePhase(stage: string): string {
+  const known: Record<string, string> = {
+    search: "verify",
+    fulfillment: "verify",
+    pickup: "verify",
+    review: "checkout",
+    billing: "checkout",
+    checkout: "checkout",
+    submit: "submit",
+  };
+  if (known[stage.trim()]) return known[stage.trim()];
+  if (/认证|登录|验证码|设备信任/.test(stage)) return "prepare";
+  if (/提交订单|订单提交/.test(stage)) return "submit";
+  if (/自提门店|自提时段|取货|可取|核对商品|预选门店/.test(stage))
+    return "verify";
+  if (/结算|付款方式|结账/.test(stage)) return "checkout";
+  if (/准备|预热/.test(stage)) return "prepare";
+  return "unknown";
+}
+
+function taskCause(task: Task): string {
+  if (typeof task.result?.message === "string" && task.result.message.trim())
+    return task.result.message;
+  if (
+    ["failed", "interrupted"].includes(task.status) &&
+    task.stage?.trim() &&
+    ![
+      "失败",
+      "已失败",
+      "已中断",
+      "已完成",
+      "search",
+      "review",
+      "submit",
+      "checkout",
+    ].includes(task.stage.trim())
+  )
+    return task.stage;
+  const nestedError = (result: Data | null, depth = 0): string => {
+    if (
+      !result ||
+      depth > 3 ||
+      (result.account_id && result.account_id !== task.account_id)
+    )
+      return "";
+    if (typeof result.error === "string" && result.error.trim())
+      return result.error;
+    if (result.success === false && typeof result.message === "string")
+      return result.message;
+    const children = [
+      result.result,
+      ...[result.jobs, result.queue_jobs, result.attempts].flatMap((rows) =>
+        Array.isArray(rows) ? rows : [],
+      ),
+    ];
+    for (const child of children.slice(0, 100)) {
+      const error = nestedError(child, depth + 1);
+      if (error) return error;
+    }
+    return "";
+  };
+  return nestedError(task.result);
+}
+
 const resolvedStatuses = new Set([
   "order_paid",
   "paid",
@@ -105,28 +170,36 @@ function describe(task: Task, tasks: Task[]) {
       task.order_submitted &&
       !result.pending &&
       !resolvedTask(task, tasks));
+  const tracePhase = task.purchase_progress?.current;
+  const phase =
+    tracePhase && phaseIds.has(tracePhase)
+      ? tracePhase
+      : stagePhase(task.stage || "");
+  const cause = taskCause(task);
   if (unknown)
     return {
       tone: "danger",
-      phase: "unknown",
+      phase: phase === "unknown" ? "submit" : phase,
       title: "提交结果待确认",
-      detail: "请先核对官网订单，再决定后续操作。",
+      detail: cause || "官网尚未确认订单结果，请先查询订单。",
     };
   if (result.pending)
     return {
       tone: "warning",
       phase: "payment",
       title: "订单待付款",
-      detail: active(task)
-        ? "已有待付款订单，任务仍在处理。请查看任务详情。"
-        : "订单已创建，请查看任务并完成付款。",
+      detail:
+        cause ||
+        (active(task)
+          ? "已有待付款订单，任务仍在处理。请查看任务详情。"
+          : "订单已创建，请查看任务并完成付款。"),
     };
   if (["failed", "interrupted"].includes(task.status))
     return {
       tone: "danger",
-      phase: "unknown",
+      phase: phase === "unknown" ? stagePhase(cause) : phase,
       title: task.status === "failed" ? "下单失败" : "下单已中断",
-      detail: "查看当前任务，核对原因与订单状态。",
+      detail: cause || "任务未返回异常说明，请打开当前任务查看记录。",
     };
   if (task.status === "scheduled")
     return {
@@ -147,7 +220,7 @@ function describe(task: Task, tasks: Task[]) {
   if (task.status === "waiting")
     return {
       tone: "warning",
-      phase: "unknown",
+      phase,
       title: "下单需要操作",
       detail: "打开当前任务，完成所需输入或确认。",
     };
@@ -165,24 +238,17 @@ function describe(task: Task, tasks: Task[]) {
   if (mapped)
     return {
       tone: "info",
-      phase: mapped[0],
+      phase,
       title: formatTaskStage(stage),
       detail: "以官网返回的任务状态为准。",
     };
   // Chinese stages are worker-authored status text. Unknown protocol tokens do
   // not imply a completed phase or a percentage of progress.
-  const phase = /正在提交订单/.test(stage)
-    ? "submit"
-    : /自提门店|自提时段|核对商品/.test(stage)
-      ? "verify"
-      : /结算|付款方式/.test(stage)
-        ? "checkout"
-        : "unknown";
   return {
     tone: "info",
     phase,
     title: formatTaskStage(stage),
-    detail: "状态随当前任务更新。",
+    detail: cause || "状态随当前任务更新。",
   };
 }
 
@@ -251,6 +317,13 @@ export function OrderProgressBar({
   }, [task?.id, task?.updated_at, candidates.length]);
   if (!task) return null;
   const state = describe(task, tasks);
+  const completed = new Set(
+    (task.purchase_progress?.completed || []).filter(
+      (phase) => phaseIds.has(phase) && phase !== "payment",
+    ),
+  );
+  if (state.phase === "payment" && orderNumbers(task.result).length > 0)
+    completed.add("submit");
   const accountName = (current: Task) => {
     const account = accounts.find((item) => item.id === current.account_id);
     return format(account?.name || account?.email || "下单账号");
@@ -278,25 +351,24 @@ export function OrderProgressBar({
         </div>
         <div className="order-progress-status" role="status" aria-live="polite">
           <strong>{format(state.title)}</strong>
-          <small>{state.detail}</small>
+          <small title={format(state.detail)}>{format(state.detail)}</small>
         </div>
       </div>
-      {candidates.length > 1 && (
-        <SelectField
-          className="order-progress-picker"
-          label="查看下单任务"
-          value={task.id}
-          onChange={setSelected}
-          options={candidates.map((candidate) => ({
-            value: candidate.id,
-            label: `${accountName(candidate)} · ${actionName(candidate)} · ${describe(candidate, tasks).title}`,
-          }))}
-        />
-      )}
       <ol className="order-progress-steps" aria-label="下单步骤">
         {steps.map(([phase, label]) => (
           <li
             key={phase}
+            data-state={
+              state.phase === phase
+                ? state.tone === "danger"
+                  ? "error"
+                  : state.tone === "warning"
+                    ? "pending"
+                    : "current"
+                : completed.has(phase)
+                  ? "done"
+                  : "pending"
+            }
             data-current={state.phase === phase || undefined}
             aria-current={state.phase === phase ? "step" : undefined}
           >
@@ -305,16 +377,33 @@ export function OrderProgressBar({
         ))}
       </ol>
       <div className="order-progress-actions">
-        <button type="button" onClick={() => onOpen(task)}>
-          查看当前任务 <ArrowRight size={15} aria-hidden="true" />
+        {candidates.length > 1 && (
+          <SelectField
+            className="order-progress-picker"
+            label="查看下单任务"
+            value={task.id}
+            onChange={setSelected}
+            options={candidates.map((candidate) => ({
+              value: candidate.id,
+              label: `${accountName(candidate)} · ${actionName(candidate)} · ${describe(candidate, tasks).title}`,
+            }))}
+          />
+        )}
+        <button
+          type="button"
+          aria-label="查看当前任务"
+          onClick={() => onOpen(task)}
+        >
+          查看任务 <ArrowRight size={15} aria-hidden="true" />
         </button>
         {active(task) ? (
           <button
             type="button"
             className="text-button"
+            aria-label="取消当前下单"
             onClick={() => onCancel(task)}
           >
-            取消当前下单
+            取消
           </button>
         ) : (
           <button

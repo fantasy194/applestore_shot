@@ -206,7 +206,9 @@ for (const width of [320, 390, 1180]) {
     await page.goto("/#/queue", { waitUntil: "domcontentloaded" });
     const row = page.locator('[data-job-id="running"]');
     await expect(row.getByText("正在核对门店和联系人")).toBeVisible();
-    await expect(row.locator("time")).not.toBeVisible();
+    await expect(
+      row.locator('.queue-job-times time[data-kind="enqueued"]'),
+    ).toBeVisible();
     await expect(row.getByRole("link", { name: "查看任务日志" })).toBeVisible();
     await mkdir("artifacts/ui-review/queue-density", { recursive: true });
     await page.screenshot({
@@ -214,12 +216,17 @@ for (const width of [320, 390, 1180]) {
       fullPage: true,
     });
     const bounds = await row.boundingBox();
-    expect(bounds!.height).toBeLessThanOrEqual(width === 1180 ? 170 : 220);
+    const times = await row.locator(".queue-job-times").boundingBox();
+    expect(bounds!.height - times!.height - 12).toBeLessThanOrEqual(
+      width === 1180 ? 170 : 220,
+    );
     const details = row.locator("details");
     await details.locator("summary").focus();
     await page.keyboard.press("Enter");
     await expect(details).toHaveAttribute("open", "");
-    await expect(details.locator("time")).toBeVisible();
+    await expect(
+      row.locator('.queue-job-times time[data-kind="enqueued"]'),
+    ).toBeVisible();
     await page.keyboard.press("Space");
     await expect(details).not.toHaveAttribute("open", "");
     await noHorizontalOverflow(page);

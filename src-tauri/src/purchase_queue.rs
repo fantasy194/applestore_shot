@@ -9,6 +9,8 @@ const CAPACITY: usize = 500;
 const HISTORY: usize = 200;
 const FRESH_MS: u64 = 10_000;
 const CHILD_SLOTS: u32 = 10;
+const RESTORE_PRIORITY_MODE: &str = "下单方式已变更，任务暂停。恢复本账号的「预选多店」和自动抢购授权后，有货时继续；改用固定单店请取消此任务。";
+const RESTORE_FIXED_MODE: &str = "下单方式已变更，任务暂停。恢复本账号的「固定单店」和自动抢购授权后，有货时继续；改用预选多店请取消此任务。";
 
 fn default_mode() -> String { "sequential".into() }
 fn default_limit() -> u32 { 1 }
@@ -18,6 +20,14 @@ pub(super) struct QueueJob {
     pub id: String,
     pub sequence: u64,
     pub enqueued_at_ms: u64,
+    #[serde(default)]
+    pub stock_detected_at_ms: Option<u64>,
+    #[serde(default)]
+    pub queued_at_ms: Option<u64>,
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub order_confirmed_at_ms: Option<u64>,
     pub account_id: String,
     pub target_id: String,
     pub sku: String,
@@ -90,6 +100,8 @@ pub(super) struct QueueState {
     #[serde(default)]
     paused: bool,
     #[serde(default)]
+    resume_after_restart: Option<bool>,
+    #[serde(default)]
     next_sequence: u64,
     #[serde(default)]
     jobs: Vec<QueueJob>,
@@ -108,7 +120,7 @@ struct PolicyRejection {account_id:String,sku:String,quantity:u32,message:String
 
 impl Default for QueueState {
     fn default() -> Self {
-        Self {mode:default_mode(),max_concurrency:1,paused:false,next_sequence:0,jobs:vec![],episodes:HashMap::new(),blocked_accounts:HashMap::new(),priority_migrated:HashSet::new(),policy_rejections:HashMap::new()}
+        Self {mode:default_mode(),max_concurrency:1,paused:false,resume_after_restart:Some(true),next_sequence:0,jobs:vec![],episodes:HashMap::new(),blocked_accounts:HashMap::new(),priority_migrated:HashSet::new(),policy_rejections:HashMap::new()}
     }
 }
 
@@ -124,6 +136,9 @@ impl QueueState {
             || state.jobs.len()>CAPACITY+HISTORY+10 {
             return Err("下单队列配置或容量无效，未恢复下单".into());
         }
+        // Legacy paused state is the only available user intent. A previously
+        // persisted pause remains paused; never infer resume from old inventory.
+        if state.resume_after_restart.is_none() {state.resume_after_restart=Some(!state.paused);}
         let mut identities=HashSet::new();
         for job in &state.jobs {
             if Uuid::parse_str(&job.id).is_err() || Uuid::parse_str(&job.account_id).is_err() || job.account_id==LOCAL_ID
@@ -155,7 +170,7 @@ impl QueueState {
             } else if job.pending() {
                 job.authorization_confirmed=false;job.authorized_stores.clear();
                 job.stock_status="unknown".into(); job.checked_at_ms=0; job.status="waiting_stock".into();
-                job.message="服务已重启；请继续队列并等待新的库存检查".into(); recovered=true;
+                job.message="服务已重启，等待新的监控库存确认；暂停的队列需手动继续".into(); recovered=true;
             }
         }
         if recovered { state.paused=true; }
@@ -273,6 +288,40 @@ fn read_account_priority(root:&Path,account:&str)->Result<Option<Value>,String> 
     }
 }
 
+// This is receipt evidence, not the Apple order creation time. Only a
+// current matching worker ACK with a pending order number can supply it.
+fn queue_order_confirmation_at(result:&Value,enqueued:u64,received:u64)->Option<u64> {
+    fn valid_time(value:&Value,earliest:u64,received:u64)->Option<u64> {
+        value.as_u64().filter(|at|*at>0&&*at>=earliest&&*at<=received)
+    }
+    fn visit(node:&Value,depth:usize,pending_entry:bool,remaining:&mut usize,earliest:u64,received:u64)->Option<u64> {
+        if depth>3 || *remaining==0 {return None}
+        *remaining-=1;
+        let number=node["order_number"].as_str().or_else(||node["result"]["order_number"].as_str());
+        let has_number=number.is_some_and(|number|!number.trim().is_empty()&&number.len()<=128
+            &&number.trim().bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'-'));
+        let pending=(pending_entry&&!matches!(node["status"].as_str(),Some("submission_unknown"|"payment_unknown")))||node["status"]=="pending_payment";
+        if pending&&has_number {
+            return Some(valid_time(&node["payment_confirmed_at_ms"],earliest,received)
+                .or_else(||valid_time(&node["result"]["payment_confirmed_at_ms"],earliest,received)).unwrap_or(received));
+        }
+        if depth==3 {return None}
+        for key in ["pending_orders","queue_jobs","attempts","jobs"] {
+            if let Some(rows)=node[key].as_array() {
+                for row in rows {
+                    if *remaining==0 {return None}
+                    if let Some(at)=visit(row,depth+1,key=="pending_orders",remaining,earliest,received) {return Some(at)}
+                }
+            }
+        }
+        node.get("result").filter(|value|value.is_object())
+            .and_then(|nested|visit(nested,depth+1,false,remaining,earliest,received))
+    }
+    let mut remaining=100;
+    let confirmed=visit(result,0,false,&mut remaining,enqueued,received)?;
+    Some(valid_time(&result["payment_confirmed_at_ms"],enqueued,received).unwrap_or(confirmed))
+}
+
 pub(super) fn contains_unknown(result: &Value) -> bool {
     if matches!(result["status"].as_str(),Some("submission_unknown"|"payment_unknown")) {return true}
     let known=result["order_number"].as_str().is_some_and(|number|!number.is_empty())
@@ -312,7 +361,7 @@ impl Engine {
                 Ok(Some(policy))=>policy,
                 Ok(None)=>{
                     for job in queue.jobs.iter_mut().filter(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_some()) {
-                        job.status="waiting_stock".into();job.authorization_confirmed=false;job.checked_at_ms=0;job.message="候选门店模式已关闭，保留原排队位置，等待恢复原模式与授权库存".into();
+                        job.status="waiting_stock".into();job.authorization_confirmed=false;job.checked_at_ms=0;job.message=RESTORE_PRIORITY_MODE.into();
                     }
                     queue.priority_migrated.remove(&key);
                     if queue.jobs.iter().any(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_some()) {
@@ -354,7 +403,7 @@ impl Engine {
                     || authorized.iter().any(|store|queue.episodes.get(&format!("{account}|{}|{}",rows[0]["sku"].as_str().unwrap_or(&sku),store["store_id"].as_str().unwrap())).is_some_and(|value|value=="legacy-attempt"));
                 if fixed_attempt {queue.episodes.entry(key.clone()).or_insert_with(||"mode-transition-existing-attempt".into());}
                 for job in queue.jobs.iter_mut().filter(|job|same_group(job)&&job.pickup_policy.is_none()&&job.pending()) {
-                    job.status="waiting_stock".into();job.authorization_confirmed=false;job.checked_at_ms=0;job.message="已切换候选门店模式，保留原逐店任务，等待恢复原模式与授权库存".into();
+                    job.status="waiting_stock".into();job.authorization_confirmed=false;job.checked_at_ms=0;job.message=RESTORE_FIXED_MODE.into();
                 }
             }
             if queue.jobs.iter().any(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_none()) {
@@ -363,7 +412,7 @@ impl Engine {
                 if let Some(row)=rows.first() {output.push(json!({
                     "id":row["id"],"account_id":account,"sku":row["sku"],"quantity":quantity,
                     "store_id":row["store_id"],"auto_purchase":false,"status":"unknown","checked_at_ms":0,
-                    "_queue_episode_key":key,"_queue_reject":"原逐店任务仍保留排队；请恢复逐店模式，或显式取消原任务后启用候选池"}));}
+                    "_queue_episode_key":key,"_queue_reject":RESTORE_FIXED_MODE}));}
                 continue;
             }
             let old=queue.jobs.iter().find(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_some()).and_then(|job|job.pickup_policy.clone());
@@ -404,8 +453,8 @@ impl Engine {
                         Some("原候选门店授权已变更，保留排队位置，等待授权候选的新库存确认".to_owned())
                     }else {None}
                 },
-                (Some(_),Ok(None))=>Some("候选门店模式已关闭，保留原排队位置，等待恢复原模式与授权库存".into()),
-                (None,Ok(Some(_)))=>Some("已切换候选门店模式，保留原逐店任务，等待恢复原模式与授权库存".into()),
+                (Some(_),Ok(None))=>Some(RESTORE_PRIORITY_MODE.into()),
+                (None,Ok(Some(_)))=>Some(RESTORE_FIXED_MODE.into()),
                 (_,Err(message))=>Some(message.clone()),
                 _=>None,
             };
@@ -439,7 +488,7 @@ impl Engine {
                 }
                 queue.mode=mode.into();queue.max_concurrency=limit as u32;
             },
-            "pause"=>{queue.paused=true;},
+            "pause"=>{queue.paused=true;queue.resume_after_restart=Some(false);},
             "resume"=>{
                 if let Some(account)=params.get("account_id").and_then(Value::as_str) {
                     if queue.blocked_accounts.get(account).is_some_and(|reason|reason=="submission_unknown") {
@@ -448,12 +497,13 @@ impl Engine {
                     queue.blocked_accounts.remove(account);
                 }
                 queue.paused=false;
+                queue.resume_after_restart=Some(true);
             },
             "cancel"=>{
                 let all=params["all"]==true;
                 let id=params["job_id"].as_str().unwrap_or("");
                 if !all && !queue.jobs.iter().any(|job|job.id==id) {return Err("队列任务不存在".into())}
-                if all {queue.paused=true;}
+                if all {queue.paused=true;queue.resume_after_restart=Some(false);}
                 for job in queue.jobs.iter_mut().filter(|job|all||job.id==id) {
                     if job.pending() {job.status="cancelled".into();job.message="已取消排队，未发起下单".into();}
                     else if job.inflight() {job.status="cancelling".into();job.message="正在停止此任务；已提交结果仍需官网确认".into();cancel_jobs.push((job.account_id.clone(),job.task_id.clone(),job.id.clone(),job.assignment));}
@@ -539,7 +589,8 @@ impl Engine {
             let id=Uuid::new_v4().to_string();queue.next_sequence=queue.next_sequence.saturating_add(1);
             let sequence=queue.next_sequence;
             queue.jobs.push(QueueJob {id:id.clone(),sequence,enqueued_at_ms:target["checked_at_ms"].as_u64().unwrap_or(current),
-                account_id:account,target_id:target["id"].as_str().unwrap_or("").chars().take(100).collect(),sku,quantity,
+                stock_detected_at_ms:target["checked_at_ms"].as_u64().filter(|at|*at>0),queued_at_ms:Some(current),
+                started_at_ms:None,order_confirmed_at_ms:None,account_id:account,target_id:target["id"].as_str().unwrap_or("").chars().take(100).collect(),sku,quantity,
                 store_id:store,store_name:target["store_name"].as_str().unwrap_or("").chars().take(160).collect(),
                 location:target["location"].as_str().unwrap_or("").chars().take(160).collect(),concurrency,retry_count:retries,
                 status:"queued".into(),stock_status:"available".into(),checked_at_ms:target["checked_at_ms"].as_u64().unwrap_or(0),
@@ -696,37 +747,47 @@ impl Engine {
         if changed && queue.save(&self.root).is_err() {queue.paused=true;}
     }
 
-    pub(super) fn queue_worker_event(&self,account:&str,task:&str,event:&Value) {
+    pub(super) fn queue_worker_event(&self,account:&str,task:&str,event:&Value)->bool {
         let mut queue=self.purchase_queue.lock().unwrap();
         let mut runtime=self.queue_runtime.lock().unwrap();
-        if runtime.coordinators.get(account).is_none_or(|coordinator|coordinator.task_id!=task) {return}
+        if runtime.coordinators.get(account).is_none_or(|coordinator|coordinator.task_id!=task) {return false}
         let kind=event["type"].as_str().unwrap_or("");
         // Stage text belongs to one assigned target, never the whole coordinator.
         // Keep this presentation update separate from result/dispatch/stop handling.
         if kind=="stage" {
-            let Some(id)=event["queue_job_id"].as_str() else {return};
-            let Some(assignment)=event["queue_assignment"].as_u64() else {return};
-            let Some(message)=event["message"].as_str().map(str::trim).filter(|message|!message.is_empty()) else {return};
+            let Some(message)=event["message"].as_str().map(str::trim).filter(|message|!message.is_empty()) else {return false};
+            // Coordinator preflight has no target identity; target stages need the exact current assignment.
+            if event.get("queue_job_id").is_none() {return event.get("queue_assignment").is_none()}
+            let Some(id)=event["queue_job_id"].as_str() else {return false};
+            let Some(assignment)=event["queue_assignment"].as_u64() else {return false};
             let Some(job)=queue.jobs.iter_mut().find(|job|job.id==id&&job.account_id==account
                 &&job.task_id.as_deref()==Some(task)&&job.assignment==assignment
-                &&matches!(job.status.as_str(),"dispatched"|"running")) else {return};
+                &&matches!(job.status.as_str(),"dispatched"|"running")) else {return false};
             let message:String=message.chars().take(2000).collect();
             if job.message!=message {
                 job.message=message;
                 if queue.save(&self.root).is_err() {queue.paused=true;}
             }
-            return;
+            return true;
         }
+        let mut accepted=matches!(kind,"queue_ready"|"queue_idle");
         if kind=="queue_ready" {if let Some(coordinator)=runtime.coordinators.get_mut(account){coordinator.ready=true;}}
         if kind=="queue_idle" {if let Some(coordinator)=runtime.coordinators.get_mut(account){coordinator.idle=true;}}
         if let Some(id)=event["queue_job_id"].as_str() {
             if let Some(index)=queue.jobs.iter().position(|job|job.id==id&&job.account_id==account&&job.task_id.as_deref()==Some(task)) {
                 let assignment=event["queue_assignment"].as_u64().or_else(||event["result"]["queue_assignment"].as_u64());
-                if assignment!=Some(queue.jobs[index].assignment) {return}
+                if assignment!=Some(queue.jobs[index].assignment) {return false}
                 if queue.jobs[index].inflight() {
+                    accepted=matches!(kind,"queue_started"|"queue_progress"|"queue_finished");
+                    if kind=="queue_started" && matches!(queue.jobs[index].status.as_str(),"dispatched"|"running") && queue.jobs[index].started_at_ms.is_none() {
+                        queue.jobs[index].started_at_ms=Some(now_ms());
+                    }
                     if kind=="queue_started" {queue.jobs[index].status="running".into();queue.jobs[index].message="正在执行此门店下单".into();}
                     if matches!(kind,"queue_progress"|"queue_finished") {
                         let mut result=event["result"].clone();remove_private_payment_links(&mut result);
+                        if queue.jobs[index].order_confirmed_at_ms.is_none() {
+                            queue.jobs[index].order_confirmed_at_ms=queue_order_confirmation_at(&result,queue.jobs[index].enqueued_at_ms,now_ms());
+                        }
                         let unknown=contains_unknown(&result);
                         if result["order_submitted"]==true || event["order_submitted"]==true {queue.jobs[index].order_submitted=true;}
                         if kind=="queue_finished" {
@@ -764,6 +825,7 @@ impl Engine {
             }
         }
         queue.prune();if queue.save(&self.root).is_err(){queue.paused=true;}
+        accepted
     }
 
     pub(super) fn queue_worker_ended(&self,account:&str,task:&str) {
@@ -783,7 +845,21 @@ impl Engine {
     }
 
     pub(super) fn queue_pause_for_shutdown(&self) {
-        let mut queue=self.purchase_queue.lock().unwrap();queue.paused=true;let _=queue.save(&self.root);
+        let mut queue=self.purchase_queue.lock().unwrap();
+        if queue.resume_after_restart.is_none() {queue.resume_after_restart=Some(!queue.paused);}
+        queue.paused=true;let _=queue.save(&self.root);
+    }
+
+    pub(super) fn queue_restore_running_intent(self:&Arc<Self>, host:TaskHost)->Result<(),String> {
+        let mut queue=self.purchase_queue.lock().unwrap();
+        if queue.resume_after_restart!=Some(true) {return Ok(())}
+        // Loading already invalidated every pending sample and blocked interrupted
+        // assignments. Restoring dispatch intent cannot replay those purchases.
+        queue.paused=false;
+        if let Err(error)=queue.save(&self.root) {queue.paused=true;return Err(error)}
+        drop(queue);
+        self.ensure_queue_pump(host);
+        Ok(())
     }
 }
 
@@ -1123,6 +1199,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_stock_and_creation_times_are_immutable_compatible_and_do_not_change_fifo() {
+        let (root,engine,host,account)=fixture();
+        engine.queue_command(host.clone(),"pause",&json!({})).unwrap();
+        let detected=now_ms().saturating_sub(500);
+        observe(&engine,&host,vec![target(&account,"R390",detected),target(&account,"R391",detected)]);
+        let before=jobs(&engine);assert_eq!(before[0].stock_detected_at_ms,Some(detected));
+        assert_eq!(before[0].enqueued_at_ms,detected);assert!(before[0].queued_at_ms.is_some_and(|at|at>detected&&at<=now_ms()));
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),negative(target(&account,"R391",now_ms()))]);
+        let after=jobs(&engine);
+        for (old,new) in before.iter().zip(&after) {
+            assert_eq!(new.id,old.id);assert_eq!(new.sequence,old.sequence);assert_eq!(new.enqueued_at_ms,old.enqueued_at_ms);
+            assert_eq!(new.stock_detected_at_ms,old.stock_detected_at_ms);assert_eq!(new.queued_at_ms,old.queued_at_ms);
+        }
+        assert!(after[0].sequence<after[1].sequence);assert_eq!(after[1].status,"waiting_stock");
+        let restored=QueueState::load(root.path(),&HashMap::new()).unwrap();
+        assert_eq!(restored.jobs[0].stock_detected_at_ms,Some(detected));assert_eq!(restored.jobs[0].queued_at_ms,before[0].queued_at_ms);
+        assert_eq!(restored.jobs[0].checked_at_ms,0);
+        let mut legacy=serde_json::to_value(&before[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("stock_detected_at_ms");legacy.as_object_mut().unwrap().remove("queued_at_ms");
+        let old:QueueJob=serde_json::from_value(legacy).unwrap();assert!(old.stock_detected_at_ms.is_none()&&old.queued_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_timestamps_record_first_matching_ack_and_survive_persistence() {
+        let (root,engine,host,account)=fixture();
+        engine.queue_command(host.clone(),"configure",&json!({"mode":"parallel","max_concurrency":2})).unwrap();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);engine.queue_pump_once();
+        let initial=jobs(&engine);assert!(initial.iter().all(|job|job.started_at_ms.is_none()&&job.order_confirmed_at_ms.is_none()));
+        let job=&initial[0];let task=job.task_id.as_deref().unwrap();
+        let started=json!({"type":"queue_started","queue_job_id":job.id,"queue_assignment":job.assignment});
+        engine.queue_worker_event("another-account",task,&started);
+        engine.queue_worker_event(&account,"another-task",&started);
+        for (key,value) in [("queue_job_id",json!("another-job")),("queue_assignment",json!(job.assignment+1))] {
+            let mut invalid=started.clone();invalid[key]=value;engine.queue_worker_event(&account,task,&invalid);
+        }
+        assert!(jobs(&engine).iter().all(|job|job.started_at_ms.is_none()));
+        ack(&engine,job,"queue_started",Value::Null);let first_start=jobs(&engine)[0].started_at_ms.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ack(&engine,job,"queue_started",Value::Null);assert_eq!(jobs(&engine)[0].started_at_ms,Some(first_start));
+        let confirmed=job.enqueued_at_ms;
+        ack(&engine,job,"queue_progress",json!({"status":"parallel_complete","order_submitted":true,
+            "pending_orders":[{"order_number":"W123"}],"payment_confirmed_at_ms":confirmed}));
+        assert_eq!(jobs(&engine)[0].order_confirmed_at_ms,Some(confirmed));
+        ack(&engine,job,"queue_finished",json!({"status":"pending_payment","order_number":"W123","payment_confirmed_at_ms":now_ms()}));
+        let completed=jobs(&engine);assert_eq!(completed[0].started_at_ms,Some(first_start));assert_eq!(completed[0].order_confirmed_at_ms,Some(confirmed));
+        assert!(completed[1].started_at_ms.is_none()&&completed[1].order_confirmed_at_ms.is_none());
+        ack(&engine,job,"queue_started",Value::Null);assert_eq!(jobs(&engine)[0].started_at_ms,Some(first_start));
+        let restored=QueueState::load(root.path(),&HashMap::new()).unwrap();
+        assert_eq!(restored.jobs[0].started_at_ms,Some(first_start));assert_eq!(restored.jobs[0].order_confirmed_at_ms,Some(confirmed));
+        let mut legacy=serde_json::to_value(&completed[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("started_at_ms");legacy.as_object_mut().unwrap().remove("order_confirmed_at_ms");
+        let old:QueueJob=serde_json::from_value(legacy).unwrap();assert!(old.started_at_ms.is_none()&&old.order_confirmed_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_timestamps_do_not_invent_start_or_confirmation_for_unexecuted_or_unknown_jobs() {
+        let (_root,engine,host,account)=fixture();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);
+        let queued=jobs(&engine)[1].clone();engine.queue_command(host.clone(),"cancel",&json!({"job_id":queued.id})).unwrap();
+        engine.queue_pump_once();let job=jobs(&engine)[0].clone();ready(&engine,&job);
+        ack(&engine,&job,"queue_progress",json!({"status":"submission_unknown","order_submitted":true}));
+        assert!(jobs(&engine).iter().all(|job|job.started_at_ms.is_none()&&job.order_confirmed_at_ms.is_none()));
+        ack(&engine,&job,"queue_finished",json!({"status":"paused","started":false,"pause_reason":"inventory_stale"}));
+        assert_eq!(jobs(&engine)[0].status,"waiting_stock");
+        assert!(jobs(&engine).iter().all(|job|job.started_at_ms.is_none()&&job.order_confirmed_at_ms.is_none()));
+        observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();let reassigned=jobs(&engine)[0].clone();
+        ack(&engine,&job,"queue_started",Value::Null);
+        ack(&engine,&job,"queue_progress",json!({"status":"pending_payment","order_number":"W123"}));
+        assert!(jobs(&engine)[0].started_at_ms.is_none()&&jobs(&engine)[0].order_confirmed_at_ms.is_none());
+        ack(&engine,&reassigned,"queue_started",Value::Null);
+        let before=now_ms();ack(&engine,&reassigned,"queue_finished",json!({"status":"pending_payment","order_number":"W123"}));
+        assert!(jobs(&engine)[0].order_confirmed_at_ms.is_some_and(|at|at>=before&&at<=now_ms()));
+        assert!(jobs(&engine)[1].started_at_ms.is_none()&&jobs(&engine)[1].order_confirmed_at_ms.is_none());
+    }
+
+    #[test]
+    fn queue_confirmation_requires_pending_number_and_validates_worker_timestamp() {
+        for result in [json!({"status":"submission_unknown","order_number":"W123"}),json!({"status":"payment_unknown"}),
+            json!({"status":"pending_payment","order_number":" "}),json!({"status":"succeeded","order_number":"W123"})] {
+            assert_eq!(queue_order_confirmation_at(&result,100,200),None);
+        }
+        for invalid in [json!(0),json!(99),json!(201),json!("150")] {
+            assert_eq!(queue_order_confirmation_at(&json!({"status":"pending_payment","order_number":"W123","payment_confirmed_at_ms":invalid}),100,200),Some(200));
+        }
+        assert_eq!(queue_order_confirmation_at(&json!({"status":"queue_complete","payment_confirmed_at_ms":150,
+            "pending_orders":[{"order_number":"W123","payment_confirmed_at_ms":160}],
+            "attempts":[{"status":"submission_unknown"}]}),100,200),Some(150));
+        assert_eq!(queue_order_confirmation_at(&json!({"queue_jobs":[{"result":{"status":"pending_payment","order_number":"W123","payment_confirmed_at_ms":160}}]}),100,200),Some(160));
+    }
+
+    #[tokio::test]
+    async fn rejected_queue_assignment_and_terminal_job_cannot_change_aggregate_progress() {
+        let (_root,engine,host,account)=fixture();
+        engine.queue_command(host.clone(),"configure",&json!({"mode":"parallel","max_concurrency":2})).unwrap();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);engine.queue_pump_once();
+        let assigned=jobs(&engine);let task=assigned[0].task_id.as_deref().unwrap();
+        let stage=|job:&QueueJob,message:&str|json!({"type":"stage","queue_job_id":job.id,"queue_assignment":job.assignment,"message":message});
+        for message in ["prepare","verify","submit"] {engine.apply_worker_event(&host,&account,task,&stage(&assigned[0],message),true);}
+        let before=engine.tasks.lock().unwrap()[task].clone();
+        assert_eq!(serde_json::to_value(before.purchase_progress.as_ref().unwrap()).unwrap(),json!({"current":"submit","completed":["prepare","verify"]}));
+        let mut stale=stage(&assigned[0],"checkout");stale["queue_assignment"]=json!(assigned[0].assignment-1);stale["order_submitted"]=json!(true);
+        engine.apply_worker_event(&host,&account,task,&stale,true);
+        let unchanged=engine.tasks.lock().unwrap()[task].clone();
+        assert_eq!(unchanged.stage,before.stage);assert_eq!(serde_json::to_value(&unchanged).unwrap(),serde_json::to_value(&before).unwrap());
+        engine.apply_worker_event(&host,&account,task,&json!({"type":"queue_finished","queue_job_id":assigned[0].id,
+            "queue_assignment":assigned[0].assignment,"result":{"success":false,"status":"failed"}}),true);
+        assert_eq!(jobs(&engine)[0].status,"failed");
+        // A second current job still updates the same coordinator; the completed first job cannot rewind it.
+        engine.apply_worker_event(&host,&account,task,&stage(&assigned[1],"checkout"),true);
+        let second=engine.tasks.lock().unwrap()[task].clone();assert_eq!(second.stage,"checkout");
+        engine.apply_worker_event(&host,&account,task,&stage(&assigned[0],"prepare"),true);
+        engine.apply_worker_event(&host,&account,task,&json!({"type":"queue_progress","queue_job_id":assigned[0].id,
+            "queue_assignment":assigned[0].assignment,"result":{"status":"pending_payment","order_number":"W123"}}),true);
+        assert_eq!(serde_json::to_value(&engine.tasks.lock().unwrap()[task]).unwrap(),serde_json::to_value(&second).unwrap());
+    }
+
+    #[tokio::test]
     async fn queue_stage_updates_only_the_matching_target_message() {
         let (root,engine,host,account)=fixture();
         engine.queue_command(host.clone(),"configure",&json!({"mode":"parallel","max_concurrency":2})).unwrap();
@@ -1270,7 +1463,18 @@ mod tests {
     }
 
     fn bridge_audit(path:&Path)->Vec<Value> {
-        fs::read_to_string(path).unwrap_or_default().lines().filter_map(|line|serde_json::from_str(line).ok()).collect()
+        let children=path.file_name().is_some_and(|name|name=="children.jsonl");
+        let paths=if children {
+            fs::read_dir(path.parent().unwrap()).into_iter().flatten().filter_map(Result::ok)
+                .filter(|entry|entry.file_name().to_str().is_some_and(|name|name.starts_with("children-")&&name.ends_with(".jsonl")))
+                .map(|entry|entry.path()).collect::<Vec<_>>()
+        }else {vec![path.into()]};
+        let mut events:Vec<Value>=paths.iter().flat_map(|path|fs::read_to_string(path).unwrap_or_default().lines()
+            .filter_map(|line|serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>()).collect();
+        if children {events.sort_by(|a,b|a["at_ns"].as_u64().cmp(&b["at_ns"].as_u64())
+            .then_with(||a["type"].as_str().cmp(&b["type"].as_str()))
+            .then_with(||a["task_id"].as_str().cmp(&b["task_id"].as_str())));}
+        events
     }
 
     #[test]
@@ -1356,7 +1560,8 @@ mod tests {
         let outcomes=engine.inventory_dispatch(&host,&json!({"targets":[first,second]}));
         assert_eq!(outcomes.len(),2);assert!(outcomes.iter().all(|outcome|outcome["status"]=="queued"));
         engine.queue_pump_once();
-        assert!(bridge_wait(||bridge_audit(&audit.join("children.jsonl")).iter().filter(|entry|entry["type"]=="start").count()==2).await,
+        assert!(bridge_wait(||bridge_audit(&audit.join("children.jsonl")).iter().filter(|entry|entry["type"]=="start").count()==2
+            && jobs(&engine).iter().all(|job|job.status=="running")).await,
             "actual child processes did not start: queue={}, protocol={}, tasks={}, thread_stacks={}",engine.purchase_queue.lock().unwrap().view(),
             json!(bridge_audit(&audit.join("protocol.jsonl"))),json!(engine.snapshot().tasks),
             fs::read_to_string(audit.join("thread-stacks.txt")).unwrap_or_default());
@@ -1389,7 +1594,7 @@ mod tests {
         let task=engine.tasks.lock().unwrap()[&task_id].clone();assert_eq!(task.status,"succeeded","{}",task.stage);
         assert_eq!(task.queue_job_ids.len(),3);let aggregate=task.result.unwrap();assert_eq!(aggregate["status"],"queue_complete");
         assert_eq!(aggregate["pending_orders"].as_array().unwrap().len(),3);assert!(task.order_submitted);
-        let mut child_events=bridge_audit(&audit.join("children.jsonl"));child_events.sort_by_key(|entry|entry["at_ns"].as_u64().unwrap());
+        let child_events=bridge_audit(&audit.join("children.jsonl"));
         let(mut active,mut maximum)=(0_i32,0_i32);
         for event in &child_events {if event["type"]=="start"{active+=1;maximum=maximum.max(active);}else{active-=1;}assert!(active>=0);}
         assert_eq!((maximum,active),(2,0));assert_eq!(child_events.len(),6);

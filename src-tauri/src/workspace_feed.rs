@@ -19,7 +19,7 @@ fn revision(task: &Task) -> String {
 }
 // Preserve only bounded order-attention evidence in the polling view.
 // Never copy nested payment/contact details into the workspace transport.
-fn purchase_attention(result: &Value) -> Value {
+pub(super) fn purchase_attention(result: &Value) -> Value {
     struct Attention {
         pending: std::collections::BTreeSet<String>,
         unknown: std::collections::BTreeSet<String>,
@@ -110,7 +110,8 @@ fn summary(task: &Task) -> Value {
         Value::Object(reduced)
     });
     json!({"id":task.id,"account_id":task.account_id,"action":task.action,"status":task.status,
-        "stage":task.stage,"created_at":task.created_at,"updated_at":task.updated_at,
+        "stage":task.stage,"purchase_progress":task.purchase_progress.as_ref().map(|progress|progress.sanitized()),
+        "created_at":task.created_at,"updated_at":task.updated_at,
         "execution_started_at_ms":task.execution_started_at_ms,"prompt":task.prompt,"result":result,
         "order_submitted":task.order_submitted,"logs":[],"schedule":task.schedule,
         "queue_job_ids":task.queue_job_ids,"is_summary":true,"detail_revision":revision(task),
@@ -324,6 +325,22 @@ mod tests {
         assert_eq!(invalid,json!({"pending_order_numbers":["W123"],"unknown_order_numbers":[],
             "pending_unidentified":true,"unknown_unidentified":true}));
         assert!(!invalid.to_string().contains("PRIVATE_"));assert!(!invalid.to_string().contains("example.test"));
+    }
+
+    #[test]
+    fn purchase_progress_summary_is_fixed_bounded_and_does_not_copy_private_metadata() {
+        let mut current=task(&Uuid::new_v4().to_string());current.action="purchase".into();
+        current.purchase_progress=Some(serde_json::from_value(json!({"current":"payment",
+            "completed":["prepare","verify","checkout","submit","payment","submit","PRIVATE_CONTACT"],
+            "contact":"PRIVATE_CONTACT","payment_url":"PRIVATE_PAYMENT","logs":["PRIVATE_LOG"]})).unwrap());
+        let light=summary(&current);
+        assert_eq!(light["purchase_progress"],json!({"current":"payment","completed":["prepare","verify","checkout","submit"]}));
+        assert!(!light.to_string().contains("PRIVATE_"));
+        assert!(light["purchase_progress"].to_string().len()<128);
+        current.purchase_progress=Some(serde_json::from_value(json!({"current":"PRIVATE_URL".repeat(1000),
+            "completed":vec!["PRIVATE_CONTACT";10000]})).unwrap());
+        assert_eq!(summary(&current)["purchase_progress"],json!({"current":null,"completed":[]}));
+        current.purchase_progress=None;assert!(summary(&current)["purchase_progress"].is_null());
     }
 
     #[test]

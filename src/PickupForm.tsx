@@ -48,7 +48,7 @@ export function PickupForm({
     id_last4: "",
   });
   const [selectionMode, setSelectionMode] = useState<"fixed" | "priority">(
-    "fixed",
+    "priority",
   );
   const [stores, setStores] = useState<PreferredStore[]>([]);
   const [rule, setRule] = useState<TimeRule>(earliest);
@@ -70,7 +70,14 @@ export function PickupForm({
       id_last4: prior.id_last4 || "",
     });
     setSelectionMode(
-      prior.selection_mode === "priority" ? "priority" : "fixed",
+      prior.selection_mode === "priority" ||
+        (!prior.selection_mode &&
+          !prior.store_id &&
+          !prior.store_name &&
+          !prior.search &&
+          !prior.stores?.length)
+        ? "priority"
+        : "fixed",
     );
     setStores(
       Array.isArray(prior.stores)
@@ -125,7 +132,11 @@ export function PickupForm({
     const policy: Data = {
       ...pickup,
       selection_mode: selectionMode,
-      stores: selectedStores,
+      ...(selectionMode === "priority"
+        ? { stores: selectedStores }
+        : stores.length
+          ? { stores }
+          : {}),
       time_slot_rule: { ...rule },
       contact_mode: contactMode,
     };

@@ -907,6 +907,10 @@ test("pickup preset preloads saved contact and saves only within its account", a
   await expect(page.getByLabel("取货通知邮箱", { exact: true })).toHaveValue(
     "pickup@example.test",
   );
+  await page
+    .getByRole("combobox", { name: "门店选择方式", exact: true })
+    .click();
+  await page.getByRole("option", { name: "固定单店", exact: true }).click();
   await page.getByLabel("自提城市 / 邮编", { exact: true }).fill("上海");
   await page.getByLabel("自提门店", { exact: true }).fill("七宝");
   const identity = page.getByLabel("取货证件号码后四位", { exact: true });
@@ -931,6 +935,10 @@ test("pickup preset preloads saved contact and saves only within its account", a
   ).toBe(false);
   await page.getByLabel("配置范围", { exact: true }).click();
   await page.getByRole("option", { name: /备用账号/ }).click();
+  await page
+    .getByRole("combobox", { name: "门店选择方式", exact: true })
+    .click();
+  await page.getByRole("option", { name: "固定单店", exact: true }).click();
   await expect(page.getByLabel("自提门店", { exact: true })).toHaveValue("");
   await expect(page.getByLabel("取货手机号", { exact: true })).toHaveValue("");
   await expect(

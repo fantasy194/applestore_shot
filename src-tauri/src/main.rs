@@ -159,6 +159,7 @@ fn main() {
             };
             tauri::async_runtime::block_on(async {
                 activity::start(host.clone(), engine.root.clone());
+                if let Err(error) = engine.restore_monitor(host.clone()) { eprintln!("{error}"); }
                 session_maintenance::start(engine.clone(), host.clone());
             });
             app.manage(host);

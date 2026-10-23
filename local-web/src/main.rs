@@ -505,6 +505,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         push: push.clone(),
     };
     activity::start(state.host.clone(), engine.root.clone());
+    if let Err(error) = engine.restore_monitor(state.host.clone()) { eprintln!("{error}"); }
     session_maintenance::start(engine.clone(), state.host.clone());
     let mut app = Router::new()
         .route("/api/auth/status", get(auth_status))

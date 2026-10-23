@@ -60,6 +60,7 @@ export interface Task {
   logs: string[];
   queue_job_ids?: string[];
   execution_started_at_ms?: number;
+  purchase_progress?: { current: string | null; completed: string[] };
   schedule?: {
     at_ms: number;
     sku: string;

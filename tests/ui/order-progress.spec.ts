@@ -166,9 +166,10 @@ test("global order progress translates the actual stage and stays available on n
         items.map((item) => item.getBoundingClientRect().height),
       );
     expect(stepHeights.every((height) => height <= 20)).toBe(true);
-    await page.screenshot({
+    if (width === 1180)
+      expect((await bar.boundingBox())!.height).toBeLessThanOrEqual(84);
+    await bar.screenshot({
       path: `artifacts/ui-review/order-progress/${width}-running.png`,
-      fullPage: true,
     });
   }
   await bar.getByRole("button", { name: "查看当前任务", exact: true }).click();
@@ -186,6 +187,11 @@ test("successful task with an unpaid order stays warning and terminal dismissal 
   const bar = page.getByRole("region", { name: "下单进度", exact: true });
   await expect(bar).toHaveAttribute("data-tone", "warning");
   await expect(bar).toHaveAttribute("data-phase", "payment");
+  await expect(bar.locator('li[data-state="done"]')).toHaveText(["提交"]);
+  await expect(bar.locator('li[aria-current="step"]')).toHaveAttribute(
+    "data-state",
+    "pending",
+  );
   await expect(bar.getByRole("status")).toContainText("订单待付款");
   await expect(bar).not.toContainText("付款完成");
   await expect(bar.getByRole("button", { name: "取消当前下单" })).toHaveCount(
@@ -195,6 +201,118 @@ test("successful task with an unpaid order stays warning and terminal dismissal 
   await expect(bar).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).orderProgressCalls)).toEqual(
     [],
+  );
+});
+
+test("真实阶段轨迹仅将已完成阶段标绿，失败阶段及原因保留", async ({ page }) => {
+  await fixture(page);
+  const bar = page.getByRole("region", { name: "下单进度", exact: true });
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      purchase_progress: { current: "verify", completed: ["prepare"] },
+    }),
+  );
+  await expect(bar.locator('li[data-state="done"]')).toHaveText(["准备"]);
+  await expect(bar.locator('li[aria-current="step"]')).toHaveAttribute(
+    "data-state",
+    "current",
+  );
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      stage: "review",
+      purchase_progress: {
+        current: "checkout",
+        completed: ["prepare", "verify"],
+      },
+    }),
+  );
+  await expect(bar.locator('li[data-state="done"]')).toHaveText([
+    "准备",
+    "核对",
+  ]);
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      status: "failed",
+      stage: "结算失败",
+      result: { message: "结账重新认证失败：HTTP 541，请在官网登录恢复后重试" },
+    }),
+  );
+  await expect(bar).toHaveAttribute("data-phase", "checkout");
+  await expect(bar.locator('li[data-state="error"]')).toHaveText(["结算"]);
+  await expect(bar.getByRole("status")).toContainText(
+    "结账重新认证失败：HTTP 541",
+  );
+  await expect(bar.locator(".order-progress-status small")).toHaveAttribute(
+    "title",
+    "结账重新认证失败：HTTP 541，请在官网登录恢复后重试",
+  );
+  await page.setViewportSize({ width: 1180, height: 844 });
+  expect((await bar.boundingBox())!.height).toBeLessThanOrEqual(84);
+  for (const width of [1180, 390, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    await noHorizontalOverflow(page);
+    await bar.screenshot({
+      path: `artifacts/ui-review/order-progress/${width}-failure.png`,
+    });
+  }
+});
+
+test("旧任务仅定位明确失败阶段，未知与部分轨迹不会虚构完成", async ({
+  page,
+}) => {
+  await fixture(page, "failure");
+  const bar = page.getByRole("region", { name: "下单进度", exact: true });
+  await expect(bar.locator('li[data-state="done"]')).toHaveCount(0);
+  await expect(bar.locator('li[data-state="error"]')).toHaveText(["核对"]);
+  await expect(bar.getByRole("status")).toContainText("门店暂无可取时段");
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      stage: "预选门店目前均不可取货，请稍后重试",
+      result: null,
+    }),
+  );
+  await expect(bar.locator('li[data-state="error"]')).toHaveText(["核对"]);
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      stage: "结账重新认证失败，HTTP 541",
+      result: null,
+    }),
+  );
+  await expect(bar.locator('li[data-state="error"]')).toHaveText(["准备"]);
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      stage: "失败",
+      result: {
+        jobs: [
+          { account_id: "other", error: "其他账号原因不能展示" },
+          { error: "本次下单服务异常" },
+        ],
+      },
+    }),
+  );
+  await expect(bar.getByRole("status")).toContainText("本次下单服务异常");
+  await expect(bar).not.toContainText("其他账号原因不能展示");
+  await expect(bar.locator('li[data-state="error"]')).toHaveCount(0);
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      status: "running",
+      stage: "review",
+      result: null,
+      purchase_progress: { current: "checkout", completed: [] },
+    }),
+  );
+  await expect(bar).toHaveAttribute("data-phase", "checkout");
+  await expect(bar.locator('li[data-state="done"]')).toHaveCount(0);
+  await page.evaluate(() =>
+    (window as any).orderProgressUpdate("order-1", {
+      stage: "search",
+      purchase_progress: { current: "verify", completed: ["prepare"] },
+    }),
+  );
+  await expect(bar.locator('li[data-state="done"]')).toHaveText(["准备"]);
+  await expect(bar.locator("li").filter({ hasText: "结算" })).toHaveAttribute(
+    "data-state",
+    "pending",
   );
 });
 
@@ -224,6 +342,7 @@ test("multiple account orders can be selected without mixing identity or task ac
   await fixture(page, "multiple");
   const bar = page.getByRole("region", { name: "下单进度", exact: true });
   await expect(bar).toContainText("2 个下单任务");
+  expect((await bar.boundingBox())!.height).toBeLessThanOrEqual(84);
   await chooseOption(
     bar.getByRole("combobox", { name: "查看下单任务" }),
     "备用账号 · 购买商品 · 正在提交订单",

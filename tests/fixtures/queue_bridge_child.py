@@ -47,7 +47,10 @@ def record(kind):
         assert policy['selection_mode'] == 'priority'
         assert store in [row['store_id'] for row in policy['stores']]
         entry['pickup_policy'] = policy
-    descriptor = os.open(audit / 'children.jsonl', os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    # Windows O_APPEND seeks then writes; separate processes can overwrite each
+    # other's complete JSONL records. Each child exclusively owns this shard.
+    descriptor = os.open(audit / ('children-' + args.task_id + '.jsonl'),
+                         os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
         os.write(descriptor, (json.dumps(entry) + '\n').encode())
     finally:

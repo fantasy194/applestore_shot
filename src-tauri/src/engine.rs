@@ -20,6 +20,11 @@ use uuid::Uuid;
 mod purchase_queue;
 #[path = "workspace_feed.rs"]
 mod workspace_feed;
+#[path = "purchase_progress.rs"]
+mod purchase_progress;
+pub use purchase_progress::PurchaseProgress;
+#[path = "monitor_restart.rs"]
+mod monitor_restart;
 
 const ACTIONS: &[&str] = &[
     "enroll",
@@ -190,6 +195,8 @@ pub struct Task {
     pub action: String,
     pub status: String,
     pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purchase_progress: Option<PurchaseProgress>,
     pub created_at: u64,
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +253,7 @@ pub struct Engine {
     defaults: Mutex<Account>,
     removing: Mutex<HashSet<String>>,
     monitor_dispatches: Mutex<HashMap<String, MonitorEpisode>>,
+    monitor_restart: Mutex<monitor_restart::MonitorRestart>,
     purchase_queue: Mutex<purchase_queue::QueueState>,
     queue_runtime: Mutex<purchase_queue::QueueRuntime>,
     queue_stopping: std::sync::atomic::AtomicBool,
@@ -371,6 +379,7 @@ impl Engine {
         };
         defaults.id = LOCAL_ID.into();
         let mut tasks = HashMap::new();
+        let mut latest_legacy_monitor = None;
         for account in accounts.iter().chain(std::iter::once(&local_defaults())) {
             Uuid::parse_str(&account.id).map_err(|_| "账号标识无效")?;
             if let Ok(entries) = fs::read_dir(scope_dir(&root, &account.id).join("tasks"))
@@ -380,6 +389,15 @@ impl Engine {
                         if let Ok(mut task) = serde_json::from_slice::<Task>(&raw) {
                             if task.account_id != account.id || Uuid::parse_str(&task.id).is_err() {
                                 continue;
+                            }
+                            if task.account_id == LOCAL_ID && task.action == "inventory_monitor" {
+                                if latest_legacy_monitor.as_ref().is_none_or(|(previous, _)| task.created_at > *previous) {
+                                    latest_legacy_monitor = Some((task.created_at, !terminal(&task.status)));
+                                } else if let Some((created_at, enabled)) = latest_legacy_monitor.as_mut() {
+                                    // Historical timestamps have second precision. UUIDs do
+                                    // not establish order; a same-second stop must win.
+                                    if task.created_at == *created_at { *enabled &= !terminal(&task.status); }
+                                }
                             }
                             if !terminal(&task.status) {
                                 task.status = "interrupted".into();
@@ -405,6 +423,8 @@ impl Engine {
                 .map_err(|_| "库存自动下单记录损坏，请先核实已有订单，未恢复自动下单")?
         } else { HashMap::new() };
         let purchase_queue = purchase_queue::QueueState::load(&root, &monitor_dispatches)?;
+        let monitor_restart = monitor_restart::MonitorRestart::load(&root,
+            latest_legacy_monitor.is_some_and(|(_, enabled)| enabled))?;
         Ok(Arc::new(Self {
             root,
             accounts: Mutex::new(accounts),
@@ -415,6 +435,7 @@ impl Engine {
             defaults: Mutex::new(defaults),
             removing: Mutex::new(HashSet::new()),
             monitor_dispatches: Mutex::new(monitor_dispatches),
+            monitor_restart: Mutex::new(monitor_restart),
             purchase_queue: Mutex::new(purchase_queue),
             queue_runtime: Mutex::new(purchase_queue::QueueRuntime::default()),
             queue_stopping: std::sync::atomic::AtomicBool::new(false),
@@ -603,6 +624,15 @@ impl Engine {
         }
         Ok(true)
     }
+    // Share the queue acknowledgement gate with aggregate presentation, so a
+    // rejected old target event cannot change the banner after queue validation.
+    fn apply_worker_event(&self, app: &TaskHost, account: &str, id: &str, event: &Value, queue_stream: bool) {
+        if event.get("account_id").is_some_and(|owner|owner!=account) || event.get("task_id").is_some_and(|owner|owner!=id) {return}
+        let kind=event["type"].as_str().unwrap_or("");
+        if queue_stream && matches!(kind,"queue_ready"|"queue_started"|"queue_progress"|"queue_finished"|"queue_idle"|"stage")
+            && !self.queue_worker_event(account,id,event) {return}
+        self.update(app,id,|task|apply_event(task,event));
+    }
     fn update(&self, app: &TaskHost, id: &str, change: impl FnOnce(&mut Task)) {
         let task = {
             let mut tasks = self.tasks.lock().unwrap();
@@ -704,6 +734,7 @@ impl Engine {
         }
         if action == "inventory_monitor" {
             if let Some(existing) = tasks.values().find(|task| task.action == action && !terminal(&task.status)) {
+                self.monitor_restart.lock().unwrap().set_enabled(&self.root, true)?;
                 return Ok(existing.id.clone());
             }
         }
@@ -731,6 +762,9 @@ impl Engine {
         {
             return Err("该账号等待中的任务过多，请先完成或取消".into());
         }
+        if action == "inventory_monitor" {
+            self.monitor_restart.lock().unwrap().set_enabled(&self.root, true)?;
+        }
         let id = Uuid::new_v4().to_string();
         tasks.insert(
             id.clone(),
@@ -743,6 +777,7 @@ impl Engine {
                 created_at: now(),
                 updated_at: now(),
                 execution_started_at_ms: None,
+                purchase_progress: None,
                 prompt: None,
                 result: None,
                 order_submitted: false,
@@ -819,6 +854,10 @@ impl Engine {
             .is_none_or(|t| t.account_id != account_id)
         {
             return Err("账号与任务不匹配".into());
+        }
+        if tasks.get(task_id).is_some_and(|task| task.action == "inventory_monitor")
+            && !tasks.values().any(|task| task.id != task_id && task.action == "inventory_monitor" && !terminal(&task.status)) {
+            self.monitor_restart.lock().unwrap().set_enabled(&self.root, false)?;
         }
         if let Some(control) = self.controls.lock().unwrap().get(task_id) {
             let _ = control.cancel.send(true);
@@ -915,9 +954,6 @@ impl Engine {
                             let outcomes = self.inventory_dispatch(&app, &event["result"]);
                             event["result"]["dispatches"] = json!(outcomes);
                         }
-                        if params["queue_stream"] == true && matches!(kind.as_str(), "queue_ready" | "queue_started" | "queue_progress" | "queue_finished" | "queue_idle" | "stage") {
-                            self.queue_worker_event(&account.id, &id, &event);
-                        }
                         if kind == "result" && matches!(action.as_str(), "enroll" | "me") {
                             self.sync_account_identity(&account.id, &event["result"], action == "enroll")?;
                         }
@@ -934,7 +970,7 @@ impl Engine {
                         if event.get("browser_pid").is_some() {
                             if let Some(control) = self.controls.lock().unwrap().get_mut(&id) { control.browser_pid = event["browser_pid"].as_u64().map(|n| n as u32); }
                         }
-                        self.update(&app, &id, |t| apply_event(t, &event));
+                        self.apply_worker_event(&app, &account.id, &id, &event, params["queue_stream"] == true);
                         if matches!(kind.as_str(), "result" | "error" | "cancelled") { completed = true; }
                     }
                 }
@@ -1040,6 +1076,7 @@ pub fn validate_reply(
 }
 
 pub fn apply_event(task: &mut Task, event: &Value) {
+    purchase_progress::update(task, event);
     if event["order_submitted"] == true {
         task.order_submitted = true;
     }
@@ -1163,6 +1200,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             execution_started_at_ms: None,
+            purchase_progress: None,
             prompt: Some(json!({"id":"p","kind":"code"})),
             result: None,
             order_submitted: false,
