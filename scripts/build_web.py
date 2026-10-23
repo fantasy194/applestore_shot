@@ -14,13 +14,28 @@ OUTPUT = ROOT / 'local-web-release'
 def replace_release(staging, destination):
     # Both paths stay on the same filesystem. Never delete user data or desktop packages.
     previous = destination.with_name('.local-web-previous-' + uuid.uuid4().hex)
-    if destination.is_symlink():
+    base = destination.parent.resolve()
+    if any(path.resolve().parent != base for path in (staging, destination, previous)):
+        raise ValueError('构建和替换目录必须位于同一个目录。')
+    if staging.is_symlink() or destination.is_symlink():
         raise ValueError('构建目录不能是符号链接。')
     if destination.exists():
         destination.rename(previous)
+    copied = False
     try:
-        staging.rename(destination)
+        try:
+            staging.rename(destination)
+        except PermissionError:
+            if os.name != 'nt':
+                raise
+            # The old release is already saved. Own a fresh destination so a
+            # failed Windows copy can be removed without touching other files.
+            destination.mkdir()
+            copied = True
+            shutil.copytree(staging, destination, dirs_exist_ok=True)
     except BaseException:
+        if copied:
+            shutil.rmtree(destination)
         if previous.exists():
             previous.rename(destination)
         raise
@@ -51,7 +66,16 @@ def main():
                         '--collect-data', 'tzdata', '--hidden-import', backend,
                         '--hidden-import', 'srp._pysrp', '--hidden-import', 'qrcode.image.pure',
                         str(ROOT / 'worker/main.py')], cwd=ROOT, check=True)
-        (staging / 'python-dist/duo-killer-worker').rename(staging / 'worker')
+        frozen = staging / 'python-dist/duo-killer-worker'
+        try:
+            frozen.rename(staging / 'worker')
+        except PermissionError:
+            if os.name != 'nt':
+                raise
+            # Windows can hold a just-created executable directory open.
+            # Copy into staging; the bundled smoke still gates publication.
+            shutil.copytree(frozen, staging / 'worker')
+            shutil.rmtree(frozen)
         (staging / 'python-dist').rmdir()
         executable = 'duo-killer-web.exe' if os.name == 'nt' else 'duo-killer-web'
         shutil.copy2(ROOT / 'local-web/target/release' / executable, staging / executable)

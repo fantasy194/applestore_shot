@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, LoaderCircle, Plus, Trash2, X } from "lucide-react";
 import { useAccountPrivacy } from "./AccountPrivacy";
+import { RemoteBrowser } from "./RemoteBrowser";
 import type { Bridge } from "./api";
 import {
   active,
@@ -178,7 +179,9 @@ export function AccountGate({
     setRunning(true);
     setError("");
     try {
-      const result = await execute(id, "enroll", { browser_login: browserLogin });
+      const result = await execute(id, "enroll", {
+        browser_login: browserLogin,
+      });
       if (!mounted.current) return;
       await refresh();
       if (confirmed(result) && !stopped.current) onDone([id]);
@@ -285,6 +288,7 @@ export function AccountGate({
         >
           <h2>{format(account?.name || "正在处理账号")}</h2>
           <p>{format(account?.email || "")}</p>
+          {task && <RemoteBrowser bridge={bridge} task={task} />}
           {task?.prompt ? (
             renderPrompt(task, stop)
           ) : (

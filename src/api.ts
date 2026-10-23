@@ -5,6 +5,11 @@ import { localWebBridge } from "./web-api";
 export const isLocalWeb = import.meta.env.MODE === "local-web";
 export interface Bridge {
   snapshot(): Promise<Snapshot>;
+  task?(
+    accountId: string,
+    taskId: string,
+    options?: { includeLogs?: boolean },
+  ): Promise<Task>;
   add(email: string): Promise<Account>;
   remove(accountId: string): Promise<void>;
   savePreset(
@@ -20,7 +25,19 @@ export interface Bridge {
     value: unknown,
   ): Promise<void>;
   cancel(accountId: string, taskId: string): Promise<void>;
-  subscribe(callback: (task: Task) => void): Promise<() => void>;
+  queue?(operation: string, params?: Data): Promise<Data>;
+  logs?(params?: Data): Promise<Data>;
+  browser?(
+    accountId: string,
+    taskId: string,
+    operation: string,
+    params?: Data,
+  ): Promise<Data>;
+  maintenance?(operation: string, params?: Data): Promise<Data>;
+  subscribe(
+    callback: (task: Task) => void,
+    onSnapshot?: (snapshot: Snapshot) => void,
+  ): Promise<() => void>;
 }
 declare global {
   interface Window {
@@ -29,6 +46,8 @@ declare global {
 }
 const native: Bridge = {
   snapshot: () => invoke("snapshot"),
+  task: (accountId, taskId, options = {}) =>
+    invoke("task_detail", { accountId, taskId, ...options }),
   add: (email) => invoke("add_account", { email }),
   remove: (accountId) => invoke("remove_account", { accountId }),
   savePreset: (accountId, sku, quantity) =>
@@ -38,6 +57,13 @@ const native: Bridge = {
   reply: (accountId, taskId, requestId, value) =>
     invoke("reply_task", { accountId, taskId, requestId, value }),
   cancel: (accountId, taskId) => invoke("cancel_task", { accountId, taskId }),
+  queue: (operation, params = {}) =>
+    invoke("queue_command", { operation, params }),
+  logs: (params = {}) => invoke("activity_logs", { params }),
+  browser: (accountId, taskId, operation, params = {}) =>
+    invoke("browser_command", { accountId, taskId, operation, params }),
+  maintenance: (operation, params = {}) =>
+    invoke("maintenance_command", { operation, params }),
   subscribe: async (callback) =>
     listen<Task>("task-updated", (event) => callback(event.payload)),
 };

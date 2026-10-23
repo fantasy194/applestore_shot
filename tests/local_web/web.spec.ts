@@ -19,7 +19,7 @@ test.beforeAll(async () => {
     "0",
     "--data-dir",
     directory,
-  ]);
+  ], { env: { ...global.process.env, DUO_WEB_PASSWORD: "synthetic-pwa-browser-123" } });
   launchUrl = await new Promise<string>((resolve, reject) => {
     let buffer = "";
     process.once("error", reject);
@@ -71,8 +71,33 @@ test("a browser opened without a launch secret cannot read account data", async 
   page,
 }) => {
   await page.goto(launchUrl.split("#")[0]);
-  await expect(page.getByRole("alert")).toContainText("连接已失效");
+  await expect(page.getByLabel("访问密码", { exact: true })).toBeVisible();
   await expect(
     page.getByText("web-**@example.test", { exact: true }),
   ).toHaveCount(0);
+  const blocked = await page.request.post(new URL("/api/snapshot", launchUrl).href, { data: {} });
+  expect(blocked.status()).toBe(401);
+});
+
+test("password login installs the worker and keeps APIs out of offline cache", async ({ page }) => {
+  await page.goto(launchUrl.split("#")[0]);
+  await page.getByLabel("访问密码", { exact: true }).fill("wrong-password");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("密码不正确");
+  await page.getByLabel("访问密码", { exact: true }).fill("synthetic-pwa-browser-123");
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  await expect(page.getByRole("link", { name: "自动监控", exact: true })).toBeVisible();
+  const worker = await page.evaluate(async () => {
+    const registration = await navigator.serviceWorker.ready;
+    const names = await caches.keys();
+    const paths: string[] = [];
+    for (const name of names) paths.push(...(await (await caches.open(name)).keys()).map((request) => new URL(request.url).pathname));
+    return { scope: registration.scope, script: registration.active?.scriptURL, paths };
+  });
+  expect(worker.script).toMatch(/\/sw\.js$/);
+  expect(worker.paths).toContain("/offline.html");
+  expect(worker.paths.some((path) => path.startsWith("/api/"))).toBe(false);
+  await page.getByText("手机安装、通知与访问密码", { exact: true }).click();
+  await page.getByRole("button", { name: "退出 Web 登录", exact: true }).click();
+  await expect(page.getByLabel("访问密码", { exact: true })).toBeVisible();
 });

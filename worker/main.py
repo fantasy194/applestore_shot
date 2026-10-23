@@ -4,7 +4,7 @@ import os
 import sys
 import threading
 import uuid
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import nullcontext, redirect_stdout, redirect_stderr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'legacy'))
@@ -33,6 +33,15 @@ class AccountLock:
 
 
 def main():
+    if '--activity-log' in sys.argv[1:]:
+        from activity_log import main as activity_main
+        activity_main()
+        return
+    # The persistent push worker never opens an Apple account or checkout.
+    if '--web-push' in sys.argv[1:]:
+        from push_service import main as push_main
+        push_main()
+        return
     # Local removal only: reuse the OS vault without starting a login task.
     if '--forget-account' in sys.argv[1:]:
         parser = argparse.ArgumentParser()
@@ -49,6 +58,9 @@ def main():
     parser.add_argument('--task-id', required=True, type=uuid.UUID)
     args = parser.parse_args()
     channel = Channel(str(args.account_id), str(args.task_id))
+    from activity_log import ActivityLog, safe_details
+    data_dir = Path(args.data_dir).resolve()
+    channel.activity = ActivityLog(data_dir, account_id=channel.account_id, task_id=channel.task_id)
     service = None
     error = None
     try:
@@ -58,9 +70,22 @@ def main():
         request = json.loads(raw)
         if request.get('account_id') != channel.account_id or request.get('task_id') != channel.task_id:
             raise ValueError('任务与账号标识不匹配。')
+        params = request.get('params', {})
+        child = isinstance(params, dict) and params.get('_parallel_child') is True
+        # Parallel workers keep account/checkout files in isolated sandboxes,
+        # while their business diagnostics stay queryable in the owner database.
+        activity_root = Path(os.environ.get('DUO_ACTIVITY_DATA_DIR', str(data_dir))) if child else data_dir
+        if not child:
+            os.environ['DUO_ACTIVITY_DATA_DIR'] = str(data_dir)
+        channel.activity = ActivityLog(activity_root, account_id=channel.account_id, task_id=channel.task_id,
+                                       action=request.get('action', 'operation'))
+        channel.activity.record('operation_start', '开始操作。', details=safe_details(request.get('params')))
         account = request.get('account', '')
         local = args.account_id.int == 0
-        if local and request.get('action') not in ('catalog', 'address_read', 'address_save'):
+        inventory_action = request.get('action') in (
+            'inventory_settings_read', 'inventory_settings_save', 'store_search',
+            'inventory_check', 'inventory_monitor')
+        if local and request.get('action') not in ('catalog', 'address_read', 'address_save') and not inventory_action:
             raise ValueError('此操作需要选择并登录 Apple 账号。')
         if not local and (not isinstance(account, str) or not account.strip()):
             raise ValueError('账号不能为空。')
@@ -69,14 +94,20 @@ def main():
         task_dir = root / 'tasks' / channel.task_id
         task_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         threading.Thread(target=channel.read_replies, args=(sys.stdin,), daemon=True).start()
-        with AccountLock(root / '.worker.lock'), redirect_stdout(LogStream(channel)), redirect_stderr(LogStream(channel)):
+        # Anonymous monitoring must not keep the settings/account execution lock:
+        # the owner can still edit targets and discover stores while it runs.
+        task_lock = (AccountLock(root / '.inventory-monitor.lock')
+                     if request.get('action') == 'inventory_monitor' else
+                     nullcontext() if inventory_action else AccountLock(root / '.worker.lock'))
+        with task_lock, redirect_stdout(LogStream(channel)), redirect_stderr(LogStream(channel)):
             from service import Service
             service = Service(channel, root, task_dir, account)
             service.enable_logging()
             result = service.run(request['action'], request.get('params', {}))
             channel.emit('result', result=result)
     except Cancelled:
-        channel.emit('cancelled', message='任务已取消。')
+        channel.emit('cancelled', message='任务已取消。',
+                     order_submitted=bool(service and service.submitted))
     except Exception as exc:
         error = exc
         # Never include requests' exception URLs, headers, or a traceback with locals.
@@ -92,8 +123,9 @@ def main():
         if service:
             try:
                 service.cleanup_credentials(error)
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                channel.activity.record('credential_cleanup_error', '任务本地会话清理未完成。', level='warning',
+                                        details={'error_type': type(cleanup_error).__name__})
 
 
 if __name__ == '__main__':

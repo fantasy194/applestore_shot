@@ -91,12 +91,13 @@ def detail_summary(flow, number):
     return {'order_number': number, 'items': items, 'verified_by': 'official_detail'}
 
 
-def supplement_known_orders(session, listing, root):
+def supplement_known_orders(session, listing, root, *, verify_existing=False):
     result = {**listing, 'orders': list(listing['orders'])}
     present = {order['order_number'] for order in listing['orders']}
-    verified, unresolved = [], []
+    verified, refreshed, unresolved = [], [], []
     for number in known_order_numbers(root):
-        if number in present:
+        already_listed = number in present
+        if already_listed and not verify_existing:
             continue
         url = account_detail_url(listing, number)
         if not url:
@@ -107,14 +108,21 @@ def supplement_known_orders(session, listing, root):
         except (requests.RequestException, ValueError):
             unresolved.append(number)
             continue
-        verified.append(summary)
+        if already_listed:
+            result['orders'] = [summary if order.get('order_number') == number else order
+                                for order in result['orders']]
+            refreshed.append(summary)
+        else:
+            verified.append(summary)
         present.add(number)
     result['orders'] = verified + result['orders']
     result['count'] = len(result['orders'])
-    result['detail_verified_count'] = len(verified)
+    result['detail_verified_count'] = len(verified) + len(refreshed)
     result['unverified_order_numbers'] = unresolved
     if verified:
         result['message'] = f'官网账号列表之外，已通过官方详情另行核实 {len(verified)} 笔本地已知订单。'
+    if refreshed:
+        result['message'] = result.get('message', '') + f' 已核对 {len(refreshed)} 笔本地订单的官方详情状态。'
     if unresolved:
         result['message'] = result.get('message', '') + f' 另有 {len(unresolved)} 笔本地记录尚未核实，未作为有效订单加入。'
     return result

@@ -9,10 +9,14 @@ async-stream = "0.3"
 tower-http = { version = "0.7", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+# uuid 1.27 requires Rust 1.89; keep compatibility with Rust 1.88.
+uuid = { version = "=1.26.0", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt-multi-thread", "net", "signal"] }
 tempfile = "3"
 fs2 = "0.4"
+argon2 = "0.5"
+reqwest = { version = "0.13", default-features = false }
+base64 = "0.22"
 
 # Same Xcode 27 proc-macro workaround as the desktop crate.
 [profile.release]

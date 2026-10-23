@@ -5,6 +5,10 @@ import {
   Settings2,
   Radio,
   LayoutDashboard,
+  Activity,
+  ListOrdered,
+  ScrollText,
+  SlidersHorizontal,
 } from "lucide-react";
 import type { Bridge } from "./api";
 import {
@@ -22,21 +26,33 @@ import { useAccountPrivacy } from "./AccountPrivacy";
 import { AddressForm } from "./AddressForm";
 import { PickupForm } from "./PickupForm";
 import { SelectField } from "./SelectField";
+import { InventoryMonitor } from "./InventoryMonitor";
 
-export type Route = "workspace" | "settings" | "duo";
-const readRoute = (): Route =>
-  location.hash === "#/settings"
-    ? "settings"
-    : location.hash === "#/duo"
-      ? "duo"
-      : "workspace";
-export function useRoute() {
-  const [route, setRoute] = useState<Route>(readRoute);
+export type Route =
+  | "workspace"
+  | "settings"
+  | "duo"
+  | "monitor"
+  | "queue"
+  | "logs"
+  | "access";
+const readRoute = (localWeb: boolean): Route => {
+  const route = location.hash.slice(1).split("?")[0].replace(/^\//, "");
+  if (["settings", "duo", "monitor", "queue", "logs"].includes(route))
+    return route as Route;
+  if (localWeb && route === "access") return "access";
+  return !location.hash &&
+    new URLSearchParams(location.search).get("view") === "monitor"
+    ? "monitor"
+    : "workspace";
+};
+export function useRoute(localWeb = false) {
+  const [route, setRoute] = useState<Route>(() => readRoute(localWeb));
   useEffect(() => {
-    const update = () => setRoute(readRoute());
+    const update = () => setRoute(readRoute(localWeb));
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
-  }, []);
+  }, [localWeb]);
   return [
     route,
     (next: Route) => {
@@ -48,9 +64,11 @@ export function useRoute() {
 export function RouteNav({
   route,
   navigate,
+  localWeb = false,
 }: {
   route: Route;
   navigate: (route: Route) => void;
+  localWeb?: boolean;
 }) {
   return (
     <nav className="route-nav" aria-label="页面导航">
@@ -59,6 +77,12 @@ export function RouteNav({
           ["workspace", "账号工作台", LayoutDashboard],
           ["settings", "本地配置", Settings2],
           ["duo", "DUO 状态", Radio],
+          ["monitor", "自动监控", Activity],
+          ["queue", "执行队列", ListOrdered],
+          ["logs", "运行日志", ScrollText],
+          ...(localWeb
+            ? [["access", "应用设置", SlidersHorizontal] as const]
+            : []),
         ] as const
       ).map(([id, label, Icon]) => (
         <a
@@ -100,7 +124,8 @@ export function ProductSelect({
       />
       {sku.replace(/\/A$/i, "").toUpperCase() === "MJT84CH" && (
         <p className="muted">
-          此预设只加购手机，不主动添加 AppleCare+。结算时会核对实际商品、数量、支付方式，以及当前账号已启用的金额上限。
+          此预设只加购手机，不主动添加
+          AppleCare+。结算时会核对实际商品、数量、支付方式，以及当前账号已启用的金额上限。
         </p>
       )}
     </>
@@ -157,7 +182,9 @@ export function LocalSettings({
   )?.result;
   const [dispatching, setDispatching] = useState(false);
   const [error, setError] = useState("");
-  const busy = dispatching || tasks.some(active);
+  const busy =
+    dispatching ||
+    tasks.some((task) => active(task) && task.action !== "inventory_monitor");
   async function start(action: Action, params: Data = {}) {
     setError("");
     setDispatching(true);
@@ -220,7 +247,15 @@ export function LocalSettings({
         }
         start={start}
       />
-      <PickupForm key={`pickup-${account.id}`} account={account} busy={busy} result={result || undefined} start={start} />
+      <PickupForm
+        key={`pickup-${account.id}`}
+        account={account}
+        bridge={bridge}
+        busy={busy}
+        result={result || undefined}
+        start={start}
+        refresh={refresh}
+      />
       <TaskStatus
         task={requested || addressTasks[0]}
         cancel={() => {
@@ -295,7 +330,13 @@ function PurchasePreset({
           预制商品仅用于快捷选择，价格与可购买状态以官网实时结果及结账金额为准。
         </p>
         <div className="button-row">
-          <button type="submit" disabled={saving || !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, ""))}>
+          <button
+            type="submit"
+            disabled={
+              saving ||
+              !presetProducts.some((p) => p.sku === sku.replace(/\/A$/i, ""))
+            }
+          >
             保存购买预设
           </button>
           <span role="status">{status}</span>
@@ -310,6 +351,7 @@ function PurchasePreset({
   );
 }
 export function DuoStatus({ snapshot, bridge, refresh }: PageProps) {
+  const [showInventory, setShowInventory] = useState(false);
   const [requestId, setRequestId] = useState("");
   const tasks = snapshot.tasks
     .filter((t) => t.account_id === LOCAL_ID && t.action === "catalog")
@@ -322,9 +364,9 @@ export function DuoStatus({ snapshot, bridge, refresh }: PageProps) {
   const live: Data[] = result?.items || [];
   const normalize = (sku: string) => sku.toUpperCase().replace(/\/A$/, "");
   const rows = duoProducts.map((p) => ({
-      preset: p,
-      item: live.find((i) => normalize(i.sku) === p.sku),
-    }));
+    preset: p,
+    item: live.find((i) => normalize(i.sku) === p.sku),
+  }));
   return (
     <main className="local-page duo-page">
       <header className="local-heading">
@@ -452,7 +494,31 @@ export function DuoStatus({ snapshot, bridge, refresh }: PageProps) {
           </tbody>
         </table>
       </div>
-      <p className="muted">只读查询，不进行加购，也不查询门店或配送库存。</p>
+      <p className="muted">
+        上方为公开发售状态；实际门店库存与自动抢购在下方监控模块中配置。
+      </p>
+      <section className="section">
+        <details
+          onToggle={(event) => setShowInventory(event.currentTarget.open)}
+        >
+          <summary>
+            门店库存监控与自动抢购
+            {snapshot.tasks.some(
+              (task) => task.action === "inventory_monitor" && active(task),
+            )
+              ? " · 运行中"
+              : ""}
+          </summary>
+          {showInventory && (
+            <InventoryMonitor
+              snapshot={snapshot}
+              bridge={bridge}
+              refresh={refresh}
+              compact
+            />
+          )}
+        </details>
+      </section>
     </main>
   );
 }

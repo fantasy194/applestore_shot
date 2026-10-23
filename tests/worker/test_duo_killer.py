@@ -501,22 +501,22 @@ class BrowserInitializationTests(unittest.TestCase):
                 self.assertEqual((client.browser_profile / ".authx-541").exists(), status == 541)
                 self.assertEqual(path.read_text(), '{"account":"test@example.invalid"}')
 
-    def test_rejected_profile_is_preserved_and_replaced_only_once(self):
+    def test_rejected_profile_keeps_its_original_browser_identity(self):
         with tempfile.TemporaryDirectory() as temp:
             client = AppleStoreLogin(auth_path=Path(temp) / "auth.json")
             client.mark_rejected_browser_context()
             state = client.browser_profile / "existing-state"
             state.write_text("old browser state")
             client.prepare_browser_profile()
-            self.assertFalse(state.exists())
-            self.assertFalse((client.browser_profile / ".authx-541").exists())
+            self.assertTrue(state.exists())
+            self.assertTrue((client.browser_profile / ".authx-541").exists())
             backups = list(client.browser_profile.parent.glob("native-rejected-*"))
-            self.assertEqual(len(backups), 1)
-            self.assertEqual((backups[0] / "existing-state").read_text(), "old browser state")
+            self.assertEqual(len(backups), 0)
+            self.assertEqual(state.read_text(), "old browser state")
             state.write_text("new browser state")
             client.prepare_browser_profile()
             self.assertEqual(state.read_text(), "new browser state")
-            self.assertEqual(len(list(client.browser_profile.parent.glob("native-rejected-*"))), 1)
+            self.assertEqual(len(list(client.browser_profile.parent.glob("native-rejected-*"))), 0)
 
     @unittest.skipIf(os.name == "nt", "POSIX Chrome lock uses a symbolic link")
     def test_rejected_profile_with_chrome_lock_is_not_moved(self):
@@ -1117,7 +1117,7 @@ class StrongLoginTests(unittest.TestCase):
                 self.assertFalse(duo_killer.ensure_strong_login(session))
                 login.assert_not_called()
 
-    def test_541_marker_forces_login_even_when_cookies_have_not_expired(self):
+    def test_541_marker_requires_verified_recovery_not_profile_preparation(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(duo_killer, "AUTH_PATH", Path(temp) / "auth.json"), requests.Session() as session:
             duo_killer.AUTH_PATH.write_text(json.dumps(self.config()))
@@ -1125,8 +1125,10 @@ class StrongLoginTests(unittest.TestCase):
             client = AppleStoreLogin(auth_path=duo_killer.AUTH_PATH)
             client.mark_rejected_browser_context()
             with patch.object(duo_killer, "login", side_effect=lambda **kwargs: client.prepare_browser_profile()) as login:
-                self.assertTrue(duo_killer.ensure_strong_login(session))
+                with self.assertRaisesRegex(ValueError, '仍缺少有效会话'):
+                    duo_killer.ensure_strong_login(session)
                 login.assert_called_once_with(sms=False)
+                (client.browser_profile / '.authx-541').unlink()  # A verified browser recovery clears it.
                 self.assertFalse(duo_killer.ensure_strong_login(session))
 
     def test_wrong_cookie_scope_triggers_full_login_and_forwards_sms(self):

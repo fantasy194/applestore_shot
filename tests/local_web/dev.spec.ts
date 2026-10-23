@@ -144,7 +144,9 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
   const sidebar = await page.locator(".sidebar").boundingBox();
   const content = await page.locator(".duo-page").boundingBox();
   expect(sidebar!.x + sidebar!.width).toBeLessThanOrEqual(content!.x);
-  await expect(page.locator("tbody tr")).toHaveCount(8);
+  await expect(page.locator("tbody tr")).toHaveCount(2);
+  await expect(page.locator("tbody")).toContainText("MK2M4CH");
+  await expect(page.locator("tbody")).toContainText("MK2P4CH");
   await expect(page.getByRole("button", { name: "刷新状态" })).toBeEnabled();
   await expect(
     page.getByLabel("Apple 账号", { exact: true }),

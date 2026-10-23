@@ -6,3 +6,5 @@ pypng==0.20220715.0
 prompt-toolkit==3.0.52
 keyring==25.7.0
 tzdata==2026.5
+cryptography==50.0.2
+pywebpush==2.5.0

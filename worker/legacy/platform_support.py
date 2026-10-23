@@ -21,6 +21,13 @@ def browser_candidates(platform=None, environ=None):
         return [Path(env[root]) / suffix for root in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA')
                 if env.get(root) for suffix in ('Google/Chrome/Application/chrome.exe',
                                                 'Microsoft/Edge/Application/msedge.exe')]
+    if platform == 'linux':
+        return [Path(path) for path in ('/usr/bin/google-chrome-stable',
+                                       '/usr/bin/google-chrome',
+                                       '/opt/google/chrome/google-chrome',
+                                       '/usr/bin/microsoft-edge-stable',
+                                       '/usr/bin/microsoft-edge',
+                                       '/usr/bin/chromium')]
     return []
 
 
@@ -28,4 +35,4 @@ def find_browser():
     for path in browser_candidates():
         if path.is_file():
             return path
-    raise ValueError('未找到 Chrome 或 Edge，请先安装其中一种浏览器。')
+    raise ValueError('未找到 Chrome 或 Edge（Linux 也支持 Chromium），请先安装其中一种浏览器。')

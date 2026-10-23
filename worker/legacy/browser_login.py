@@ -4,6 +4,8 @@ import subprocess
 import time
 import logging
 import re
+import json
+import weakref
 from urllib.parse import urlsplit
 
 import requests
@@ -23,8 +25,28 @@ LOGIN_PATHS = {
 }
 
 
+class BrowserSessionError(ValueError):
+    """A public phase/code with no private browser exception body or URL."""
+    def __init__(self, code, message, *, status='failed', requires_login=False,
+                 http_status=None, browser_started=False, browser_connected=False):
+        super().__init__(message)
+        self.code, self.status, self.requires_login = code, status, requires_login
+        self.http_status = http_status
+        self.browser_started, self.browser_connected = browser_started, browser_connected
+
+
+def signin_page(url):
+    parsed = urlsplit(url)
+    host = parsed.hostname or ''
+    if parsed.scheme != 'https':
+        return False
+    return (bool(re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn', host))
+            and parsed.path in ('/shop/signIn', '/shop/signIn/account', '/shop/signIn/orders')) or (
+            host in ('idmsa.apple.com.cn', 'appleid.apple.com') and '/auth' in parsed.path)
+
+
 def observe_login_network(context, service):
-    state = {'pending': {}, 'error': None}
+    state = {'pending': {}, 'error': None, 'last_activity': time.monotonic(), 'blocked_status': None}
 
     def phase(request):
         parsed = urlsplit(request.url)
@@ -36,16 +58,23 @@ def observe_login_network(context, service):
     def started(request):
         name = phase(request)
         if name:
+            state['last_activity'] = time.monotonic()
             state['pending'][request] = (name, time.monotonic())
             log.info('[官网浏览器] %s：请求已发送（不记录请求参数）', name)
 
     def responded(response):
         name = phase(response.request)
         if name:
+            state['last_activity'] = time.monotonic()
             state['pending'].pop(response.request, None)
             log.info('[官网浏览器] %s：HTTP %s', name, response.status)
             if response.status >= 500 or response.status == 403:
                 state['error'] = f'官网浏览器的{name}返回 HTTP {response.status}；本次登录未完成。'
+                state['blocked_status'] = response.status
+            elif response.status < 400:
+                state['error'], state['blocked_status'] = None, None
+        elif (urlsplit(response.request.url).path == '/shop/account/home' and response.status == 200):
+            state['error'], state['blocked_status'] = None, None
 
     def failed(request):
         name = phase(request)
@@ -54,7 +83,11 @@ def observe_login_network(context, service):
             failure = request.failure or ''
             code = failure if re.fullmatch(r'net::ERR_[A-Z0-9_]+', failure) else '网络连接失败'
             log.info('[官网浏览器] %s：%s', name, code)
-            state['error'] = f'官网浏览器的{name}请求失败（{code}）；本次登录未完成。'
+            # Redirecting a frame or a user navigation can abort its old request.
+            # Keep the official window open; success still requires verified
+            # account/home, settled trust requests and matching account identity.
+            if code != 'net::ERR_ABORTED':
+                state['error'] = f'官网浏览器的{name}请求失败（{code}）；本次登录未完成。'
 
     context.on('request', started)
     context.on('response', responded)
@@ -62,21 +95,81 @@ def observe_login_network(context, service):
     return state
 
 
-def wait_for_account_page(browser, process, service, timeout, network):
+TRUST_SCREEN = re.compile(r'信任此浏览器|是否信任.{0,12}浏览器|Trust this browser', re.I)
+TRUST_BUTTON = re.compile(r'^(?:信任|信任此浏览器|Trust|Trust this browser)$', re.I)
+_TRUST_SENT = weakref.WeakKeyDictionary()
+
+
+def pending_auth_page(page):
+    from browser_remote import official_page
+    if not isinstance(getattr(page, 'url', None), str) or not official_page(page):
+        return False
+    parsed = urlsplit(page.url)
+    return ('/shop/signIn' in parsed.path or parsed.hostname in ('idmsa.apple.com.cn', 'appleid.apple.com')
+            and '/auth' in parsed.path)
+
+
+def trust_browser_if_offered(page):
+    """Accept only the explicit official trust-browser choice authorized by user."""
+    from browser_remote import official_page
+    try:
+        frames = list(page.frames)
+    except TypeError:
+        return False
+    for frame in frames:
+        if not official_page(frame):
+            continue
+        try:
+            body = frame.locator('body').inner_text(timeout=250)
+            if not isinstance(body, str) or not TRUST_SCREEN.search(body[:16000]):
+                _TRUST_SENT.pop(frame, None)
+                continue
+        except Exception:
+            continue
+        try:
+            button = frame.get_by_role('button', name=TRUST_BUTTON)
+            if (_TRUST_SENT.get(frame) != frame.url and button.count() == 1 and button.is_visible()):
+                _TRUST_SENT[frame] = frame.url  # Reserve before an uncertain click response.
+                button.click(timeout=1000)
+                log.info('[官网浏览器] 已选择信任此浏览器，等待官网确认')
+        except Exception:
+            pass
+        return True  # A visible trust question must finish before closing.
+    return False
+
+
+def wait_for_account_page(browser, process, service, timeout, network, *, remote=None, settle_seconds=2):
     deadline = time.monotonic() + timeout
+    ready_since = None
+    reported_541 = False
     while time.monotonic() < deadline:
         service.channel.checkpoint()
         if process.poll() is not None:
             raise ValueError('官网登录窗口已关闭，未完成会话导入。')
         if network['error']:
-            raise ValueError(network['error'])
+            if network.get('blocked_status') != 541:
+                raise ValueError(network['error'])
+            if not reported_541:
+                service.stage('官网返回 541，窗口保持打开；请在官网窗口完成验证或稍后取消重试')
+                reported_541 = True
         for name, started in network['pending'].values():
             if time.monotonic() - started > 45:
                 raise ValueError(f'官网浏览器的{name}请求超过 45 秒未响应；未自动重复提交。')
         pages = []
         for context in browser.contexts:
+            pages.extend(context.pages)
+        if not pages:
+            raise ValueError('官网登录页面已关闭，未完成会话导入。')
+        if remote is not None:
+            remote.pump(pages[-1])
+        trust_pending = any(trust_browser_if_offered(page) for page in pages)
+        if trust_pending:
+            ready_since = None
+            network['last_activity'] = time.monotonic()
+        for context in browser.contexts:
             for page in context.pages:
-                pages.append(page)
+                if trust_pending:
+                    continue
                 parsed = urlsplit(page.url)
                 host = parsed.hostname or ''
                 if (parsed.scheme != 'https' or not host.endswith('.www.apple.com.cn')
@@ -86,13 +179,17 @@ def wait_for_account_page(browser, process, service, timeout, network):
                 if any(c['name'] == 'as_ltn_cn' and c['value']
                        and c['domain'].lstrip('.') == 'apple.com.cn'
                        and (c.get('expires', -1) < 0 or c['expires'] > time.time()) for c in cookies):
-                    return cookies, page.evaluate('navigator.userAgent')
-        if not pages:
-            raise ValueError('官网登录页面已关闭，未完成会话导入。')
+                    if network['pending'] or network['error']:
+                        ready_since = None
+                    else:
+                        ready_since = ready_since if ready_since is not None else time.monotonic()
+                        last = max(ready_since, network.get('last_activity', ready_since))
+                        if time.monotonic() - last >= settle_seconds:
+                            return cookies, page.evaluate('navigator.userAgent')
         # Playwright's sync dispatcher must pump navigation and network events.
         # time.sleep leaves cached page.url and callbacks stale while the user logs in.
         pages[0].wait_for_timeout(500)
-    raise ValueError('等待官网登录超时；未覆盖已有会话，可再次尝试。')
+    raise ValueError(network.get('error') or '等待官网登录超时；未覆盖已有会话，可再次尝试。')
 
 
 def verified_identity(session, expected_account):
@@ -120,31 +217,87 @@ def import_browser_session(cookies, user_agent, expected_account):
                 rest={'HttpOnly': None} if c.get('httpOnly') else {}))
         result = verified_identity(session, expected_account)
         duo_killer.save_auth(session)
+        from apple_login import stored_device_trust, TRUST_COOKIE_NAME
+        candidates = [{'name': c.name, 'value': c.value, 'domain': c.domain, 'path': c.path,
+                       'expires': c.expires} for c in session.cookies if TRUST_COOKIE_NAME.fullmatch(c.name)]
+        if candidates:
+            saved = json.loads(duo_killer.AUTH_PATH.read_text(encoding='utf-8'))
+            saved['trust_account'] = expected_account
+            saved['trust_cookies'] = stored_device_trust({'account': expected_account,
+                'trust_account': expected_account, 'trust_cookies': candidates}, expected_account)
+            duo_killer.write_private_json(duo_killer.AUTH_PATH, saved)
         return result
 
 
-def login_in_browser(service, timeout=300):
-    from playwright.sync_api import sync_playwright, Error as BrowserError
+def seed_missing_session(context, service):
+    """Carry valid HTTP login cookies into the same account's existing browser.
+    Browser fingerprint and trust cookies remain authoritative and untouched."""
+    try:
+        saved = json.loads(service.auth.read_text(encoding='utf-8'))
+    except (ValueError, OSError):
+        return
+    if str(saved.get('account', '')).casefold() != service.account.casefold():
+        return
+    present = {(c['name'], c['domain'].lstrip('.'), c.get('path', '/')) for c in context.cookies()}
+    selected = []
+    for rows in saved.get('cookies', {}).values():
+        if not isinstance(rows, list):
+            continue
+        for cookie in rows:
+            if not isinstance(cookie, dict):
+                continue
+            name, domain = cookie.get('name'), cookie.get('domain', '')
+            if (name not in ('as_ltn_cn', 'as_cn', 'as_disa', 'as_rec', 'myacinfo', 'acn01')
+                    or not isinstance(domain, str) or (domain.lstrip('.') != 'apple.com.cn'
+                        and not domain.lstrip('.').endswith('.apple.com.cn'))
+                    or not isinstance(cookie.get('value'), str)):
+                continue
+            key = (name, domain.lstrip('.'), cookie.get('path', '/'))
+            expiry = cookie.get('expires')
+            if key in present or expiry is not None and (type(expiry) not in (int, float) or expiry <= time.time()):
+                continue
+            entry = {'name': name, 'value': cookie['value'], 'domain': domain,
+                     'path': cookie.get('path', '/'), 'secure': cookie.get('secure', True)}
+            if expiry is not None:
+                entry['expires'] = expiry
+            selected.append(entry)
+    if selected:
+        context.add_cookies(selected)
+
+
+def login_in_browser(service, timeout=300, *, maintenance=False):
+    from playwright.sync_api import sync_playwright, Error as BrowserError, TimeoutError as BrowserTimeout
     from apple_login import browser_profile_path
 
-    profile = service.root / '.chrome-profile' / 'official-login'
-    profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = browser_profile_path(service.auth)
+    try:
+        profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        raise BrowserSessionError('BROWSER_PROFILE_ACCESS_FAILED', '无法访问该账号的浏览器资料目录；会话状态尚未检查。') from None
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    args = [str(find_browser()), '--user-data-dir=' + str(profile),
+    try:
+        executable = find_browser()
+    except (ValueError, OSError):
+        raise BrowserSessionError('BROWSER_NOT_FOUND', '未找到可用的 Chrome 或 Edge；请先安装浏览器，会话状态尚未检查。') from None
+    args = [str(executable), '--user-data-dir=' + str(profile),
             '--remote-debugging-port=' + str(port), '--remote-debugging-address=127.0.0.1',
             '--no-first-run', '--no-default-browser-check', '--window-size=1000,800',
-            'https://secure.www.apple.com.cn/shop/account/home']
+            'about:blank' if maintenance else 'https://secure.www.apple.com.cn/shop/account/home']
     proxy = requests.utils.get_environ_proxies(duo_killer.BASE_URL)
     proxy_url = proxy.get('https') or proxy.get('all')
     if proxy_url:
         parsed = urlsplit(proxy_url)
         if parsed.username or parsed.password:
-            raise ValueError('官网浏览器登录暂不支持需要账号密码的代理。')
+            raise BrowserSessionError('BROWSER_PROXY_UNSUPPORTED', '官网浏览器暂不支持需要账号密码的系统代理；会话状态尚未检查。')
         args.append('--proxy-server=' + proxy_url)
-    process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    service.stage('请在新打开的 Apple 官网窗口登录所选账号；密码和验证码直接在官网输入',
+    try:
+        process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        raise BrowserSessionError('BROWSER_LAUNCH_FAILED', '无法启动该账号的官方浏览器窗口；会话状态尚未检查。') from None
+    service.stage('只读维护官网浏览器会话，不加购、不下单' if maintenance else
+                  '请在新打开的 Apple 官网窗口登录所选账号；密码和验证码直接在官网输入',
                   browser_pid=process.pid)
     browser = None
     try:
@@ -153,20 +306,57 @@ def login_in_browser(service, timeout=300):
                 deadline = time.monotonic() + 30
                 while browser is None:
                     service.channel.checkpoint()
-                    if process.poll() is not None or time.monotonic() >= deadline:
-                        raise ValueError('无法连接官网登录窗口，请关闭该账号的专用窗口后重试。')
+                    if process.poll() is not None:
+                        raise BrowserSessionError('BROWSER_EXITED_EARLY',
+                            '浏览器窗口启动后提前退出，可能正被其他窗口使用；会话状态尚未检查。', browser_started=True)
+                    if time.monotonic() >= deadline:
+                        raise BrowserSessionError('BROWSER_CONNECT_TIMEOUT',
+                            '连接官方浏览器窗口超时，请检查该账号的专用窗口；会话状态尚未检查。', browser_started=True)
                     try:
                         browser = p.chromium.connect_over_cdp(
                             f'http://127.0.0.1:{port}', timeout=1000, no_defaults=True)
                     except BrowserError:
                         time.sleep(.2)
                 if not browser.contexts:
-                    raise ValueError('未找到官网登录窗口的浏览器上下文。')
+                    raise BrowserSessionError('BROWSER_CONTEXT_MISSING', '已连接浏览器但没有可用页面；会话状态尚未检查。',
+                                              browser_started=True, browser_connected=True)
                 network = observe_login_network(browser.contexts[0], service)
-                cookies, agent = wait_for_account_page(browser, process, service, timeout, network)
+                from browser_remote import remote_context
+                with remote_context(service, port) as remote:
+                    if maintenance:
+                        seed_missing_session(browser.contexts[0], service)
+                        page = browser.contexts[0].pages[-1]
+                        reply = page.goto('https://secure.www.apple.com.cn/shop/account/home',
+                                          wait_until='domcontentloaded', timeout=20000)
+                        if reply is not None and reply.status in (403, 429, 541):
+                            return {'success': False, 'status': 'blocked', 'requires_login': True,
+                                    'error_code': 'APPLE_SESSION_BLOCKED', 'http_status': reply.status,
+                                    'browser_started': True, 'browser_connected': True,
+                                    'message': '官网会话检查被拒绝，请使用官网窗口恢复登录；未自动重新认证。'}
+                        if reply is None or reply.status >= 400:
+                            return {'success': False, 'status': 'failed', 'requires_login': False,
+                                    'error_code': 'BROWSER_NAVIGATION_HTTP_ERROR',
+                                    'http_status': reply.status if reply is not None else None,
+                                    'browser_started': True, 'browser_connected': True,
+                                    'message': '官网页面请求未正常完成，会话状态尚未确认；未判定登录过期。'}
+                        parsed = urlsplit(page.url)
+                        if parsed.path != '/shop/account/home':
+                            needs_login = signin_page(page.url)
+                            return {'success': False, 'status': 'requires_login' if needs_login else 'failed',
+                                    'requires_login': needs_login,
+                                    'error_code': 'OFFICIAL_SIGNIN_REQUIRED' if needs_login else 'BROWSER_UNEXPECTED_PAGE',
+                                    'browser_started': True, 'browser_connected': True,
+                                    'message': ('官网明确跳转到登录页面，请打开官网窗口完成验证；未自动登录。'
+                                                if needs_login else '浏览器到达了未识别的官网页面，会话状态尚未确认；未判定登录过期。')}
+                    cookies, agent = wait_for_account_page(browser, process, service, timeout, network, remote=remote)
                 service.stage('正在核对官网登录账号并验证工具会话')
                 result = import_browser_session(cookies, agent, service.account)
                 (browser_profile_path(service.auth) / '.authx-541').unlink(missing_ok=True)
+                (service.root / 'session-maintenance.json').unlink(missing_ok=True)
+                if maintenance:
+                    result.update(status='healthy', requires_login=False,
+                                  browser_started=True, browser_connected=True,
+                                  message='官网浏览器会话只读检查完成，已同步当前账号会话。')
                 return result
             finally:
                 if browser is not None:
@@ -174,8 +364,14 @@ def login_in_browser(service, timeout=300):
                         browser.new_browser_cdp_session().send('Browser.close')
                     except BrowserError:
                         pass
+    except BrowserTimeout:
+        raise BrowserSessionError('BROWSER_NAVIGATION_TIMEOUT',
+            '官网页面导航或会话检查超时；请检查网络，会话状态尚未确认。',
+            browser_started=True, browser_connected=browser is not None) from None
     except BrowserError:
-        raise ValueError('官网浏览器连接中断；未完成账号会话验证。') from None
+        raise BrowserSessionError('BROWSER_CONNECTION_INTERRUPTED',
+            '官方浏览器连接中断；会话状态尚未确认，未判定登录过期。',
+            browser_started=True, browser_connected=browser is not None) from None
     finally:
         if process.poll() is None:
             try:

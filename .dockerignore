@@ -1,0 +1,31 @@
+# Allow only build inputs. Local accounts, browser profiles and credentials must
+# never enter the build context, even when this checkout has untracked data.
+**
+!.dockerignore
+!Dockerfile
+!package.json
+!pnpm-lock.yaml
+!tsconfig.json
+!index.html
+!src/
+!src/**
+!public/
+!public/**
+!assets/
+!assets/**
+!worker/
+!worker/*.py
+!worker/requirements.txt
+!worker/legacy/
+!worker/legacy/*.py
+!local-web/
+!local-web/Cargo.toml
+!local-web/Cargo.lock
+!local-web/src/
+!local-web/src/**
+!src-tauri/
+!src-tauri/src/
+!src-tauri/src/**
+!docker/
+!docker/*.py
+!docker/worker-launcher.sh

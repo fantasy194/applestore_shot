@@ -1,0 +1,13 @@
+{
+  "id": "/",
+  "name": "DUO Killer 库存监控",
+  "short_name": "DUO Killer",
+  "description": "多门店库存监控、自提抢购和待付款提醒",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f5f6f8",
+  "theme_color": "#171b24",
+  "icons": [{ "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }]
+}

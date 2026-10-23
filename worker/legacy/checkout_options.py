@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+from pathlib import Path
 
 import requests
 import interaction
@@ -32,7 +33,30 @@ def read_config(path):
     config = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     if not isinstance(config, dict):
         raise ValueError('checkout.json 必须是 JSON 对象。')
+    handler = interaction.handler
+    policy = getattr(handler, 'pickup_policy_override', None)
+    if (isinstance(policy, dict) and getattr(handler, 'checkout', None)
+            and Path(path).resolve() == Path(handler.checkout).resolve()):
+        config = {**config, 'pickup': {**config.get('pickup', {}), **policy}}
+    override = getattr(handler, 'pickup_override', None)
+    if (isinstance(override, dict) and getattr(handler, 'checkout', None)
+            and Path(path).resolve() == Path(handler.checkout).resolve()
+            and config.get('pickup', {}).get('selection_mode', 'fixed') != 'priority'):
+        # A monitor target belongs to this attempt only. The account's saved
+        # store and the shared contact/address file remain intact.
+        config = {**config, 'pickup': {**config.get('pickup', {}), **override}}
+    if config.get('pickup', {}).get('selection_mode') == 'priority' and 'store_id' in config['pickup']:
+        config = {**config, 'pickup': {key:val for key,val in config['pickup'].items() if key != 'store_id'}}
     return config
+
+
+def config_fingerprint(path):
+    import hashlib
+    raw = path.read_bytes() if path.exists() else b''
+    policy = getattr(interaction.handler, 'pickup_policy_override', None)
+    if isinstance(policy, dict):
+        raw += b'\npolicy:' + json.dumps(policy, ensure_ascii=False, sort_keys=True).encode()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def save_config(path, config):
@@ -265,12 +289,17 @@ def pickup_contact(flow, config, config_path):
     address = path + '.selfPickupContact.selfContact.address'
     flow.require(address)
     payload = verification(flow, address)
-    from pickup_options import identity_payload, fulfillment_error
+    from pickup_options import identity_payload, fulfillment_error, resolve_contact
     payload.update(identity_payload(flow, path + '.selfPickupContact.nationalIdSelf', config))
-    details = contact(config)
-    config['contact'] = details
-    save_config(config_path, config)
-    payload.update({address + '.' + key: val for key, val in details.items()})
+    if config.get('pickup', {}).get('contact_mode', 'local') == 'official' or config.get('pickup', {}).get('selection_mode') == 'priority':
+        payload.update(resolve_contact(flow, address, config))
+    else:
+        details = contact(config)
+        config['contact'] = details
+        if not any(isinstance(getattr(interaction.handler, key, None), dict)
+                   for key in ('pickup_policy_override', 'pickup_override')):
+            save_config(config_path, config)
+        payload.update({address + '.' + key: val for key, val in details.items()})
     payload.update(invoice_data(flow, path))
     actions = flow.require(path).get('a', {})
     action = next((a for a in ('continueFromPickupContactToShipping', 'continueFromPickupContactToBilling') if a in actions), None)
@@ -288,6 +317,98 @@ def pickup_contact(flow, config, config_path):
             raise ValueError('取货联系人未通过服务端校验：' + (error or '官网仍停留在联系人步骤，请核对页面提示')
                              + '；未继续结账，不重复发送联系人表单。')
     flow.require('checkout.shipping' if action.endswith('Shipping') else 'checkout.billing')
+    if interaction.handler is not None:
+        handler = interaction.handler
+        handler.pickup_contact_accepted = True
+        for key, record in (getattr(handler, 'pickup_contact_proof', None) or {}).items():
+            # Only fields actually sent in this form gain provenance for a
+            # later redacted Review display. HTTP success alone is insufficient:
+            # the next page and expected section were confirmed above.
+            if (isinstance(record, dict) and isinstance(record.get('value'), str)
+                    and payload.get(address + '.' + key) == record['value']):
+                record['server_accepted'] = True
+
+
+def priority_fulfillment(flow, config, config_path, payload):
+    """Try allowed stores in order only while still choosing fulfillment."""
+    from pickup_options import validate_preset, search_results, store_name, time_slot_payload, NoPickupSlot, PickupUnavailable, fulfillment_error
+    policy = validate_preset(config)['pickup']
+    path = 'checkout.fulfillment'
+    locator = path + '.pickupTab.pickup.storeLocator'
+    slot_path = path + '.pickupTab.pickup.timeSlot'
+    region = locator + '.address.stateCitySelectorForCheckout'
+    handler = interaction.handler
+    rejected = []
+    for preferred in policy['stores']:
+        if getattr(handler, 'submitted', False) is True or value(flow.model, 'checkout.d.page') != 'Fulfillment':
+            raise ValueError('已离开自提选择阶段，不能自动切换其他门店。')
+        flow.require(locator)
+        store_data = {locator + '.showAllStores':'true', locator + '.selectStore':'',
+                      locator + '.searchInput':preferred['search']}
+        store_data.update({region + '.' + key:value(flow.model, region + '.d.' + key, '')
+                           for key in ('state','city','district','provinceCityDistrict','countryCode')})
+        previous_body = getattr(flow, 'current_response_body', None)
+        flow.action(locator, 'search', store_data)
+        current_body = getattr(flow, 'current_response_body', None)
+        fresh_locator = value(current_body, locator)
+        if current_body is previous_body or not isinstance(fresh_locator, dict):
+            raise ValueError('官网本次门店搜索未返回可核对的新列表，未复用旧门店结果，未提交订单。')
+        try:
+            stores = search_results(fresh_locator)
+        except PickupUnavailable:
+            rejected.append(preferred['store_name'])
+            continue
+        matches = [store for store in stores if isinstance(store, dict) and store.get('storeId') == preferred['store_id']]
+        if len(matches) > 1:
+            raise ValueError('官网返回重复门店编号，无法确认优先门店；未提交订单。')
+        if not matches or matches[0].get('storeDisabled') is True:
+            rejected.append(preferred['store_name'])
+            continue
+        chosen = matches[0]
+        if chosen.get('storeDisabled') is not False:
+            raise ValueError('官网尚未明确确认预选门店的可取货状态，未当作无货换店，未提交订单。')
+        if store_name(chosen.get('storeName')) != store_name(preferred['store_name']):
+            raise ValueError('官网门店编号与预选门店名称不一致；未提交订单。')
+        store_data[locator + '.selectStore'] = chosen['storeId']
+        required_slot = value(flow.model, slot_path + '.d.enableTimeSlotWindows') is True
+        flow.require(path + '.pickupTab.pickup').pop('timeSlot', None)
+        flow.require(locator).setdefault('d', {})['selectStore'] = ''
+        flow.action(locator, 'select', store_data)
+        if value(flow.model, locator + '.d.selectStore') != chosen['storeId']:
+            raise ValueError('服务端未确认所选优先自提门店，已停止。')
+        if required_slot and value(flow.model, slot_path) is None:
+            flow.page(flow.apple_url('/shop/checkout'), '重新核对优先门店自提时段', fresh=True)
+            if value(flow.model, slot_path) is None:
+                raise ValueError('官网尚未返回当前门店时段，未继续结账，未提交订单。')
+        try:
+            slots = time_slot_payload(flow, slot_path, chosen['storeId'], rule=policy.get('time_slot_rule'))
+        except NoPickupSlot:
+            # A valid, empty/unsuitable slot response is an explicit reason to
+            # try the next allowed store. Network/unknown errors never get here.
+            rejected.append(preferred['store_name'])
+            handler.pickup_selected = None
+            handler.pickup_slot_selected = None
+            continue
+        if value(flow.model, path + '.pickupTab.deliveryForced.shipmentGroups'):
+            raise ValueError('自提订单中仍包含必须送货的商品，未自动改为配送，未提交订单。')
+        handler.pickup_selected = chosen
+        interaction.report_stage('按预设顺序选择自提门店：' + chosen['storeName'])
+        payload = {**payload, **store_data, **slots}
+        flow.action(path, 'continueFromFulfillmentToPickupContact', payload)
+        def advanced():
+            page = value(flow.model, 'checkout.d.page')
+            key = {'PickupContact':'pickupContact','Billing':'billing','Review':'review'}.get(page)
+            return bool(key and isinstance(value(flow.model, 'checkout.' + key), dict))
+        if not advanced():
+            error = fulfillment_error(value(flow.model, path, {}))
+            if not error:
+                flow.page(flow.apple_url('/shop/checkout'), '核对优先门店自提选择是否已完成', fresh=True)
+                error = fulfillment_error(value(flow.model, path, {}))
+            if not advanced():
+                raise ValueError('优先门店自提选择未通过官网校验：' + (error or '尚未进入下一步骤')
+                                 + '；未提交订单，不自动切换门店重发。')
+        return
+    raise PickupUnavailable('预选门店目前均不可取货或没有符合规则的有效时段；未改选列表外门店，未提交订单。')
 
 
 def home_delivery(flow, config):
@@ -306,6 +427,12 @@ def home_delivery(flow, config):
 
 
 def fulfillment(flow, config_path):
+    if interaction.handler is not None:
+        interaction.handler.pickup_slot_selected = None
+        interaction.handler.pickup_contact_proof = None
+        interaction.handler.pickup_identity_proof = None
+        interaction.handler.pickup_contact_accepted = False
+        interaction.handler.pickup_contact_review_verified = False
     config = read_config(config_path)
     path = 'checkout.fulfillment'
     node = flow.require(path + '.fulfillmentOptions')['d']
@@ -318,6 +445,9 @@ def fulfillment(flow, config_path):
     payload = {path + '.fulfillmentOptions.selectFulfillmentLocation': mode}
     if mode == 'HOME':
         home_delivery(flow, config)
+        return
+    if automatic_options() and config.get('pickup', {}).get('selection_mode') == 'priority':
+        priority_fulfillment(flow, config, config_path, payload)
         return
     locator = path + '.pickupTab.pickup.storeLocator'
     node = flow.require(locator)
@@ -334,9 +464,16 @@ def fulfillment(flow, config_path):
                   locator + '.selectStore': '', locator + '.searchInput': search}
     store_data.update({region + '.' + k: value(flow.model, region + '.d.' + k, '')
                       for k in ('state', 'city', 'district', 'provinceCityDistrict', 'countryCode')})
-    flow.action(locator, 'search', store_data)
-    from pickup_options import search_results
-    stores = search_results(flow.require(locator))
+    from pickup_options import search_results, fresh_pickup_context, fresh_pickup_slot_payload
+    fresh_context = fresh_pickup_context(flow, config['pickup']) if automatic_options() else None
+    if fresh_context is None:
+        flow.action(locator, 'search', store_data)
+        stores = search_results(flow.require(locator))
+        fresh_context = fresh_pickup_context(flow, config['pickup']) if automatic_options() else None
+    else:
+        stores = fresh_context['stores']
+        import logging
+        logging.getLogger('duo_killer').info('[自提门店] 本次响应已核对商品和可取门店，跳过重复搜索。')
     if automatic_options():
         import logging
         from duo_killer import order_text
@@ -373,7 +510,23 @@ def fulfillment(flow, config_path):
         home_delivery(flow, config)
         return
     store_data[locator + '.selectStore'] = selected
-    flow.action(locator, 'select', store_data)
+    slot_path = path + '.pickupTab.pickup.timeSlot'
+    required_slot = value(flow.model, slot_path + '.d.enableTimeSlotWindows') is True
+    fresh_slots = fresh_pickup_slot_payload(fresh_context, config.get('pickup', {}).get('time_slot_rule')) if fresh_context is not None else None
+    if fresh_slots is None:
+        if automatic_options():
+            # The fresh response did not prove a usable slot state. Never let
+            # an older merged slot survive the new selection response.
+            flow.require(path + '.pickupTab.pickup').pop('timeSlot', None)
+        flow.action(locator, 'select', store_data)
+        if automatic_options() and required_slot and value(flow.model, slot_path) is None:
+            # An omitted increment is not proof that a previously required
+            # appointment disappeared. Recover its live state without replay.
+            flow.page(flow.apple_url('/shop/checkout'), '重新核对自提时段', fresh=True)
+            if value(flow.model, slot_path) is None:
+                raise ValueError('官网尚未返回当前自提时段，请重新准备；未继续结账，未提交订单。')
+    else:
+        logging.getLogger('duo_killer').info('[自提门店] 本次响应已确认相同门店和时段，跳过重复选择。')
     if value(flow.model, locator + '.d.selectStore') != selected:
         raise ValueError('服务端未确认所选自提门店，已停止。')
     if automatic_options():
@@ -388,8 +541,9 @@ def fulfillment(flow, config_path):
         payload.update(region_data(flow, forced + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=True))
         payload.update(shipping_options(flow, forced + '.shipmentGroups'))
     from pickup_options import time_slot_payload, fulfillment_error
-    payload.update(time_slot_payload(flow, path + '.pickupTab.pickup.timeSlot', selected,
-                                    None if automatic_options() else choose))
+    payload.update(fresh_slots if fresh_slots is not None else time_slot_payload(
+        flow, path + '.pickupTab.pickup.timeSlot', selected, None if automatic_options() else choose,
+        rule=config.get('pickup', {}).get('time_slot_rule')))
     flow.action(path, 'continueFromFulfillmentToPickupContact', payload)
     def advanced():
         node = {'PickupContact': 'pickupContact', 'Billing': 'billing', 'Review': 'review'}.get(value(flow.model, 'checkout.d.page'))

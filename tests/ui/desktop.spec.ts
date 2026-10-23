@@ -127,6 +127,23 @@ async function fixture(
             task.status = "waiting";
             task.prompt = { id: "cancel-" + id, kind: "confirm", label: "确认取消订单 " + params.order_number,
               details: { operation: "cancel_order", order_number: params.order_number, items: [{ name: "抛光布", quantity: 1, subtotal: "RMB 69" }], total: "RMB 69" } };
+          } else if (action === "purchase" && params.prepare_only === true && params.fulfillment === "RETAIL" && params.keep_ready === true) {
+            task.result = { success: true, status: "prepared", message: "自提准备完成，未创建订单。" };
+            update(task); // Preparation progress arrives before its same-task confirmation.
+            task.status = "waiting";
+            task.stage = "自提准备完成，等待继续";
+            task.prompt = {
+              id: "prepared-" + id,
+              kind: "confirm",
+              label: "自提准备完成，等待下单",
+              details: {
+                operation: "prepared_pickup",
+                expires_at: Math.floor(Date.now() / 1000) + 300,
+                items: [{ name: "测试商品", sku: params.sku, quantity: params.quantity, subtotal: "RMB 138" }],
+                total: "RMB 138",
+                store: "Apple 测试门店",
+              },
+            };
           } else if (action === "purchase" && params.prepare_only === true) {
             task.status = "succeeded";
             task.result = { success: true, status: "prepared", message: "准备完成，未创建订单。" };
@@ -293,6 +310,14 @@ async function fixture(
               order_number: root.started.find((t: any) => t.id === taskId).params.order_number,
               message: value === true ? "官网已确认订单取消。" : "已放弃取消，原订单保留。" };
             update(task);
+          } else if (task.prompt.details?.operation === "prepared_pickup") {
+            task.status = "succeeded";
+            task.order_submitted = value === true;
+            task.prompt = null;
+            task.result = value === true
+              ? { success: true, status: "pending_payment", order_number: "TEST001", amount_due: "RMB 138", pickup_store: "Apple 测试门店" }
+              : { success: true, status: "preparation_ended", message: "已结束自提准备，未创建订单。" };
+            update(task);
           } else {
             task.status = "succeeded";
             task.prompt = null;
@@ -358,6 +383,64 @@ test("prepare button requests preparation without opening order confirmation", a
   const tasks = await page.evaluate(() => (window as any).started);
   expect(tasks).toHaveLength(1);
   expect(tasks[0].params.prepare_only).toBe(true);
+  expect(tasks[0].params.fulfillment).toBe("HOME");
+});
+
+test("pickup preparation waits for confirmation and continues the same purchase task", async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(async () => {
+    const api = (window as any).__DUO_KILLER_TEST__;
+    await api.remove("b");
+    await api.savePreset("a", "MK2M4CH", 1);
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "提前准备自提（不下单）", exact: true }).click();
+  const submit = page.getByRole("button", { name: "立即下单（已准备自提）", exact: true });
+  await expect(submit).toBeVisible();
+  await expect(page.getByText("自提门店：Apple 测试门店", { exact: true })).toBeVisible();
+  await expect(page.getByText(/准备有效至 \d{2}:\d{2}:\d{2}/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单（自提）", exact: true })).toBeDisabled();
+  await expect(page.getByRole("heading", { name: "苹果已返回订单号，等待付款" })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).sent)).toHaveLength(0);
+  const started = await page.evaluate(() => (window as any).started);
+  expect(started).toHaveLength(1);
+  expect(started[0]).toMatchObject({ accountId: "a", action: "purchase", params: {
+    sku: "MK2M4CH", quantity: 1, fulfillment: "RETAIL", prepare_only: true, keep_ready: true,
+  } });
+  await submit.click();
+  await expect(page.getByRole("heading", { name: "苹果已返回订单号，等待付款" })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).started)).toHaveLength(1);
+  expect(await page.evaluate(() => (window as any).sent)).toEqual([
+    { accountId: "a", taskId: started[0].id, requestId: "prepared-" + started[0].id, value: true },
+  ]);
+});
+
+test("ending pickup preparation releases the task without creating an order", async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(async () => { await (window as any).__DUO_KILLER_TEST__.remove("b"); });
+  await page.goto("/");
+  await page.getByRole("button", { name: "提前准备自提（不下单）", exact: true }).click();
+  await page.getByRole("button", { name: "结束准备", exact: true }).click();
+  await expect(page.getByText("已结束自提准备，未创建订单。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "立即下单（自提）", exact: true })).toBeEnabled();
+  await expect(page.getByRole("heading", { name: "苹果已返回订单号，等待付款" })).toHaveCount(0);
+  const started = await page.evaluate(() => (window as any).started);
+  expect(started).toHaveLength(1);
+  expect(await page.evaluate(() => (window as any).sent)).toEqual([
+    { accountId: "a", taskId: started[0].id, requestId: "prepared-" + started[0].id, value: false },
+  ]);
+});
+
+test("pickup preparation confirmation fits a narrow viewport", async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(async () => { await (window as any).__DUO_KILLER_TEST__.remove("b"); });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "提前准备自提（不下单）", exact: true }).click();
+  await expect(page.getByRole("button", { name: "立即下单（已准备自提）", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "结束准备", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  expect(await page.evaluate(() => (window as any).sent)).toHaveLength(0);
 });
 
 test("warm login does not depend on product availability and does not purchase", async ({ page }) => {
@@ -610,7 +693,7 @@ test("pickup preset preloads saved contact and saves only within its account", a
   await page.getByRole("button", { name: "保存自提预设", exact: true }).click();
   await expect(page.getByText("自提门店和取货联系人已保存。", { exact: true })).toBeVisible();
   const config = await page.evaluate(() => (window as any).localConfigs);
-  expect(config.a.pickup).toEqual({ search: "上海", store_name: "七宝", id_last4: "123X" });
+  expect(config.a.pickup).toMatchObject({ search: "上海", store_name: "七宝", id_last4: "123X" });
   expect(config.a.address).toEqual({ street: "测试地址" });
   expect(config.b).toBeUndefined();
   expect((await page.evaluate(() => (window as any).started)).some((t: any) => t.action === "purchase")).toBe(false);
@@ -1456,7 +1539,8 @@ test("preparation is above purchase and separate from ordering", async ({ page }
   await enterWorkspace(page);
   const prep = page.locator("section").filter({ has: page.getByRole("heading", { name: "抢购准备", exact: true }) });
   const purchase = page.locator("section").filter({ has: page.getByRole("heading", { name: "购买商品", exact: true }) });
-  await expect(prep.getByRole("button")).toHaveCount(4);
+  await expect(prep.getByRole("button")).toHaveCount(5);
+  await expect(prep.getByRole("button", { name: "提前准备自提（不下单）", exact: true })).toBeVisible();
   await expect(purchase.getByRole("button")).toHaveCount(2);
   expect((await prep.boundingBox())!.y).toBeLessThan((await purchase.boundingBox())!.y);
 });

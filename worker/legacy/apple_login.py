@@ -189,17 +189,16 @@ class AppleStoreLogin:
         self.browser_profile.mkdir(mode=0o700, parents=True, exist_ok=True)
         marker = self.browser_profile / ".authx-541"
         marker.touch(mode=0o600)
-        print("商城回调返回 541：已标记本次浏览器上下文，下次登录将保留旧配置并创建新配置；本次不自动重试。")
+        print("商城回调返回 541：已标记需浏览器恢复，保留原浏览器资料与账号；本次不自动重试。")
 
     def prepare_browser_profile(self):
         profile = self.browser_profile
         if (profile / ".authx-541").exists():
-            # 不移动仍被 Chrome 使用的配置，也不删除旧数据。
+            # A 541 does not prove that deleting a trusted browser will help.
+            # Preserve its complete identity and recover through official UI.
             if os.path.lexists(profile / "SingletonLock"):
-                raise LoginError("待重建的专用 Chrome 配置仍有进程锁，请先关闭该浏览器后重试。")
-            backup = profile.with_name("native-rejected-" + uuid.uuid4().hex)
-            profile.rename(backup)
-            print(f"上次商城回调返回 541，旧浏览器配置已保留至 {backup}，本次重新取得上下文。")
+                raise LoginError("该账号的专用 Chrome 配置仍有进程锁，请先关闭该浏览器后重试。")
+            print("上次商城回调返回 541，继续使用原浏览器资料；可在官网窗口完成会话恢复。")
         profile.mkdir(mode=0o700, exist_ok=True)
         profile.chmod(0o700)
         return profile
@@ -249,37 +248,60 @@ class AppleStoreLogin:
                             f"http://127.0.0.1:{port}", timeout=1000, no_defaults=True)
                     except BrowserError:
                         time.sleep(0.2)
-                try:
-                    context = browser.contexts[0]
-                    page = context.pages[0] if context.pages else context.new_page()
-                    # 两个页面仍完成正常加载；Cookie 就绪后立即继续，不固定等待十秒。
-                    for url in (HOME, HOME + "shop/bag"):
-                        reply = page.goto(url, wait_until="load", timeout=45000)
-                        if reply is None or reply.status >= 400:
-                            raise LoginError("Chrome 未能正常打开官网页面，未更新上下文。")
-                    for _ in range(80):
-                        cookies = context.cookies()
-                        if any(c["name"] == "shld_bt_ck" and c["value"]
-                               and c["domain"].lstrip(".") == "apple.com.cn"
-                               and (c.get("expires", -1) < 0 or c["expires"] > time.time()) for c in cookies):
-                            break
-                        page.wait_for_timeout(250)
-                    else:
-                        raise LoginError("Chrome 尚未取得所需浏览器上下文，已停止；请检查浏览器页面或代理后重试。")
-                    user_agent = page.evaluate("navigator.userAgent")
-                finally:
-                    # 关闭专用配置中本次及历史恢复的标签页，避免下次启动继续累积。
-                    # 保留 restore-last-session，让 Chrome 继续持久保存会话 Cookie。
-                    for owned_context in browser.contexts:
-                        for opened_page in list(owned_context.pages):
-                            try:
-                                opened_page.close()
-                            except BrowserError:
-                                pass
+                from browser_remote import remote_context
+                with remote_context(interaction.handler, port) as remote:
                     try:
-                        browser.new_browser_cdp_session().send("Browser.close")
-                    except BrowserError:
-                        pass
+                        context = browser.contexts[0]
+                        from browser_login import pending_auth_page, trust_browser_if_offered, observe_login_network
+                        network = observe_login_network(context, interaction.handler)
+                        # Do not navigate a restored verification/trust page away.
+                        preserve_auth = any(pending_auth_page(opened) for opened in context.pages)
+                        page = context.new_page() if preserve_auth else context.pages[0] if context.pages else context.new_page()
+                        # 两个页面仍完成正常加载；Cookie 就绪后立即继续，不固定等待十秒。
+                        for url in (HOME, HOME + "shop/bag"):
+                            reply = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                            if reply is None or reply.status >= 400:
+                                raise LoginError("Chrome 未能正常打开官网页面，未更新上下文。")
+                        attempts, maximum, auth_seen, settled = 0, 80, False, None
+                        while attempts < maximum:
+                            attempts += 1
+                            if remote is not None:
+                                remote.pump(page)
+                            opened = [p for owned in browser.contexts for p in owned.pages]
+                            trust_pending = any(trust_browser_if_offered(p) for p in opened)
+                            auth_pending = any(pending_auth_page(p) for p in opened)
+                            if trust_pending or auth_pending or network['pending'] or network['error']:
+                                auth_seen, maximum, settled = True, 600, None
+                                if network['error'] and network.get('blocked_status') != 541:
+                                    raise LoginError(network['error'])
+                                page.wait_for_timeout(500)
+                                continue
+                            cookies = context.cookies()
+                            if any(c["name"] == "shld_bt_ck" and c["value"]
+                                   and c["domain"].lstrip(".") == "apple.com.cn"
+                                   and (c.get("expires", -1) < 0 or c["expires"] > time.time()) for c in cookies):
+                                if not auth_seen:
+                                    break
+                                settled = settled if settled is not None else time.monotonic()
+                                if time.monotonic() - max(settled, network.get('last_activity', settled)) >= 2:
+                                    break
+                            page.wait_for_timeout(250)
+                        else:
+                            raise LoginError("Chrome 尚未取得所需浏览器上下文，已停止；请检查浏览器页面或代理后重试。")
+                        user_agent = page.evaluate("navigator.userAgent")
+                    finally:
+                        # 关闭专用配置中本次及历史恢复的标签页，避免下次启动继续累积。
+                        # 保留 restore-last-session，让 Chrome 继续持久保存会话 Cookie。
+                        for owned_context in browser.contexts:
+                            for opened_page in list(owned_context.pages):
+                                try:
+                                    opened_page.close()
+                                except BrowserError:
+                                    pass
+                        try:
+                            browser.new_browser_cdp_session().send("Browser.close")
+                        except BrowserError:
+                            pass
         except BrowserError:
             raise LoginError("Chrome 初始化失败，请检查网络/代理及专用浏览器配置。") from None
         finally:

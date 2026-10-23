@@ -206,6 +206,29 @@ class ProcessIsolationTests(unittest.TestCase):
 
 
 
+class WorkerCancellationTests(unittest.TestCase):
+    def test_cancel_event_retains_submission_evidence_harvested_during_cleanup(self):
+        import main
+        for submitted in (False, True):
+            with self.subTest(submitted=submitted), tempfile.TemporaryDirectory() as directory:
+                account, task = str(uuid.uuid4()), str(uuid.uuid4())
+                request = dict(account_id=account, task_id=task, account='fixture@example.test',
+                               action='purchase', params={'retry_count': 2})
+                output = io.StringIO()
+                with patch.object(sys, 'argv', ['worker', '--data-dir', directory,
+                                               '--account-id', account, '--task-id', task]), \
+                        patch.object(sys, 'stdin', io.StringIO(json.dumps(request) + '\n')), \
+                        patch.object(sys, 'stdout', output), patch('main.threading.Thread'), \
+                        patch('service.Service') as factory:
+                    factory.return_value.submitted = submitted
+                    factory.return_value.run.side_effect = Cancelled()
+                    main.main()
+                events = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]['type'], 'cancelled')
+                self.assertIs(events[0]['order_submitted'], submitted)
+
+
 class AccountRemovalTests(unittest.TestCase):
     def test_forget_mode_only_deletes_the_requested_vault_entry(self):
         import main

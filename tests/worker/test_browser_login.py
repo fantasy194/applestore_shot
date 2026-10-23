@@ -5,6 +5,89 @@ import browser_login
 
 
 class BrowserLoginTests(unittest.TestCase):
+    def test_only_known_official_signin_pages_require_login(self):
+        for url in ('https://secure6.www.apple.com.cn/shop/signIn/account?secret=fixture',
+                    'https://secure.www.apple.com.cn/shop/signIn',
+                    'https://idmsa.apple.com.cn/appleauth/auth/authorize'):
+            self.assertTrue(browser_login.signin_page(url))
+        for url in ('https://secure6.www.apple.com.cn/shop/unknown',
+                    'https://secure6.www.apple.com.cn/shop/account/home',
+                    'https://secure6.www.apple.com.cn.example.test/shop/signIn/account',
+                    'http://secure6.www.apple.com.cn/shop/signIn/account'):
+            self.assertFalse(browser_login.signin_page(url))
+
+    def test_navigation_aborted_trust_request_does_not_close_manual_window(self):
+        context = Mock()
+        state = browser_login.observe_login_network(context, Mock())
+        callbacks = {c.args[0]: c.args[1] for c in context.on.call_args_list}
+        request = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/2sv/trust', failure='net::ERR_ABORTED')
+        callbacks['request'](request)
+        callbacks['requestfailed'](request)
+        self.assertIsNone(state['error'])
+        self.assertFalse(state['pending'])
+
+    def test_541_keeps_manual_window_open_until_official_navigation_recovers(self):
+        page = Mock(url='https://secure9.www.apple.com.cn/shop/signIn/account', frames=[])
+        page.evaluate.return_value = 'fixture-agent'
+        context = Mock(pages=[page])
+        context.cookies.return_value = [{'name': 'as_ltn_cn', 'value': 'fixture',
+                                        'domain': '.apple.com.cn', 'expires': -1}]
+        network = {'pending': {}, 'error': 'HTTP 541', 'blocked_status': 541}
+        process = Mock()
+        process.poll.return_value = None
+        service = Mock()
+        def recover(_):
+            page.url = 'https://secure9.www.apple.com.cn/shop/account/home'
+            network.update(error=None, blocked_status=None)
+        page.wait_for_timeout.side_effect = recover
+        result = browser_login.wait_for_account_page(Mock(contexts=[context]), process, service, 10,
+                                                      network, settle_seconds=0)
+        self.assertEqual(result[1], 'fixture-agent')
+        self.assertIn('窗口保持打开', service.stage.call_args.args[0])
+        process.terminate.assert_not_called()
+
+    def test_trust_question_in_official_frame_is_accepted_but_not_other_pages(self):
+        frame = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        frame.locator.return_value.inner_text.return_value = '是否信任此浏览器？'
+        button = frame.get_by_role.return_value
+        button.count.return_value = 1
+        button.is_visible.return_value = True
+        page = Mock(frames=[frame])
+        self.assertTrue(browser_login.trust_browser_if_offered(page))
+        self.assertTrue(browser_login.trust_browser_if_offered(page))
+        button.click.assert_called_once_with(timeout=1000)
+        frame.url = 'https://apple.com.cn.example.test/login'
+        button.click.reset_mock()
+        self.assertFalse(browser_login.trust_browser_if_offered(page))
+        button.click.assert_not_called()
+
+    def test_account_page_does_not_close_before_trust_page_and_network_settle(self):
+        clock = [0.0]
+        account = Mock(url='https://secure9.www.apple.com.cn/shop/account/home', frames=[])
+        account.evaluate.return_value = 'fixture-agent'
+        trust = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        trust.frames = [trust]
+        trust.locator.return_value.inner_text.return_value = 'Trust this browser?'
+        button = trust.get_by_role.return_value
+        button.count.return_value = 1
+        button.is_visible.return_value = True
+        context = Mock(pages=[account, trust])
+        cookies = [{'name': 'as_ltn_cn', 'value': 'fixture', 'domain': '.apple.com.cn', 'expires': -1}]
+        context.cookies.return_value = cookies
+        network = {'pending': {}, 'error': None}
+        button.click.side_effect = lambda **_: setattr(trust.locator.return_value.inner_text, 'return_value', '')
+
+        def wait(_):
+            clock[0] += .5
+        account.wait_for_timeout.side_effect = wait
+        process = Mock()
+        process.poll.return_value = None
+        with patch('browser_login.time.monotonic', side_effect=lambda: clock[0]):
+            result = browser_login.wait_for_account_page(Mock(contexts=[context]), process, Mock(), 10, network)
+        self.assertEqual(result, (cookies, 'fixture-agent'))
+        button.click.assert_called_once()
+        self.assertGreaterEqual(clock[0], 2.5)
+
     def test_manual_navigation_is_processed_before_login_detection(self):
         page = Mock(url='https://secure9.www.apple.com.cn/shop/signIn/account')
         page.evaluate.return_value = 'fixture-agent'
@@ -18,7 +101,7 @@ class BrowserLoginTests(unittest.TestCase):
         process.poll.return_value = None
         service = Mock()
         result = browser_login.wait_for_account_page(
-            browser, process, service, 300, {'pending': {}, 'error': None})
+            browser, process, service, 300, {'pending': {}, 'error': None}, settle_seconds=0)
         self.assertEqual(result, (cookies, 'fixture-agent'))
         page.wait_for_timeout.assert_called_once_with(500)
         self.assertEqual(service.channel.checkpoint.call_count, 2)

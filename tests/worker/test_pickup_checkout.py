@@ -446,6 +446,254 @@ class PickupIdentityTests(TestCase):
         self.assertEqual(flow.submissions, 0)
 
 
+class PickupFreshResponseTests(TestCase):
+    setUp = PickupCheckoutTests.setUp
+    tearDown = PickupCheckoutTests.tearDown
+
+    locator = 'checkout.fulfillment.pickupTab.pickup.storeLocator'
+    pickup = 'checkout.fulfillment.pickupTab.pickup'
+
+    def fresh_flow(self, slot='signed'):
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
+        model = fulfillment_model(mixed=False)
+        model['checkout']['fulfillment']['fulfillmentOptions']['d']['selectFulfillmentLocation'] = 'RETAIL'
+        model['checkout']['companionBar'] = {'orderDetails': {'item-0': {
+            'd': {'sku': 'MK2M4CH/A'}, 'itemQuantity': {'d': {'quantity': 1}}}}}
+        if slot == 'signed':
+            shop.field(model, self.pickup)['timeSlot'] = signed_pickup_slots()
+        elif slot == 'disabled':
+            shop.field(model, self.pickup)['timeSlot'] = {'d': {'storeId': 'R580', 'enableTimeSlotWindows': False}}
+        flow = FakeFlow(model, mixed=False)
+        flow.current_response_body = deepcopy(model)
+        original = flow.action
+        def action(module, name, data=None):
+            original(module, name, data)
+            if name == 'select':
+                shop.field(flow.model, self.pickup)['timeSlot'] = {
+                    'd': {'storeId': 'R580', 'enableTimeSlotWindows': False}}
+            # A partial response must invalidate the earlier response proof,
+            # even though the merged model retains its previous fields.
+            flow.current_response_body = {}
+        flow.action = action
+        return flow
+
+    def finish(self, flow):
+        checkout_options.fulfillment(flow, self.service.checkout)
+        return [name for _, name, _ in flow.calls]
+
+    def test_current_items_store_and_signed_slot_skip_two_posts_and_use_snapshot(self):
+        flow = self.fresh_flow()
+        shop.field(flow.model, self.pickup + '.timeSlot.dateTimeSlots.d')['timeSlotWindows'][1]['16'][0]['signKey'] = 'stale-merged-sign'
+        self.assertEqual(self.finish(flow), ['continueFromFulfillmentToPickupContact'])
+        payload = flow.calls[0][2]
+        self.assertEqual(payload[self.pickup + '.timeSlot.dateTimeSlots.signKey'], 'fixture-sign')
+        self.assertEqual(self.service.pickup_selected['storeId'], 'R580')
+
+    def test_explicit_no_windows_for_current_store_skips_both_posts(self):
+        flow = self.fresh_flow('disabled')
+        self.assertEqual(self.finish(flow), ['continueFromFulfillmentToPickupContact'])
+        self.assertFalse(any('.timeSlot.' in key for key in flow.calls[0][2]))
+
+    def test_missing_fresh_slot_reselects_and_drops_old_merged_slot(self):
+        flow = self.fresh_flow()
+        shop.field(flow.current_response_body, self.pickup).pop('timeSlot')
+        self.assertEqual(self.finish(flow), ['select', 'continueFromFulfillmentToPickupContact'])
+        self.assertFalse(any('.timeSlot.' in key for key in flow.calls[-1][2]))
+
+    def test_selection_refreshes_signed_slots_instead_of_reusing_old_signature(self):
+        flow = self.fresh_flow()
+        shop.field(flow.current_response_body, self.pickup).pop('timeSlot')
+        original = flow.action
+        def action(module, name, data=None):
+            original(module, name, data)
+            if name == 'select':
+                slot = signed_pickup_slots()
+                for group in slot['dateTimeSlots']['d']['timeSlotWindows']:
+                    for options in group.values():
+                        for option in options:
+                            option['signKey'] = 'new-selection-sign'
+                shop.field(flow.model, self.pickup)['timeSlot'] = slot
+        flow.action = action
+        self.assertEqual(self.finish(flow), ['select', 'continueFromFulfillmentToPickupContact'])
+        self.assertEqual(flow.calls[-1][2][self.pickup + '.timeSlot.dateTimeSlots.signKey'], 'new-selection-sign')
+
+    def test_required_slots_omitted_by_select_are_read_without_replaying_selection(self):
+        for available in (True, False):
+            with self.subTest(available=available):
+                flow = self.fresh_flow()
+                shop.field(flow.current_response_body, self.pickup).pop('timeSlot')
+                original = flow.action
+                def action(module, name, data=None):
+                    original(module, name, data)
+                    if name == 'select':
+                        shop.field(flow.model, self.pickup).pop('timeSlot', None)
+                def page(url, stage, *, fresh=False):
+                    self.assertEqual(stage, '重新核对自提时段')
+                    self.assertTrue(fresh)
+                    if available:
+                        shop.field(flow.model, self.pickup)['timeSlot'] = signed_pickup_slots()
+                flow.action, flow.page = action, Mock(side_effect=page)
+                if available:
+                    self.assertEqual(self.finish(flow), ['select', 'continueFromFulfillmentToPickupContact'])
+                    self.assertIn(self.pickup + '.timeSlot.dateTimeSlots.signKey', flow.calls[-1][2])
+                else:
+                    with self.assertRaisesRegex(ValueError, '尚未返回当前自提时段'):
+                        self.finish(flow)
+                    self.assertEqual([name for _, name, _ in flow.calls], ['select'])
+                flow.page.assert_called_once()
+
+    def test_unconfirmed_or_wrong_slot_state_never_skips_selection(self):
+        for change in ('selected', 'store', 'flag', 'signature', 'disabled_store'):
+            with self.subTest(change=change):
+                flow = self.fresh_flow()
+                fresh = shop.field(flow.current_response_body, self.pickup)
+                if change == 'selected':
+                    fresh['storeLocator']['d']['selectStore'] = 'R999'
+                elif change == 'store':
+                    fresh['timeSlot']['d']['storeId'] = 'R999'
+                elif change == 'flag':
+                    fresh['timeSlot']['d'].pop('enableTimeSlotWindows')
+                elif change == 'disabled_store':
+                    fresh['timeSlot'] = {'d': {'enableTimeSlotWindows': False}}
+                else:
+                    for group in fresh['timeSlot']['dateTimeSlots']['d']['timeSlotWindows']:
+                        for options in group.values():
+                            for option in options:
+                                option.pop('signKey')
+                self.assertEqual(self.finish(flow), ['select', 'continueFromFulfillmentToPickupContact'])
+
+    def test_missing_partial_or_mismatched_item_evidence_keeps_normal_search(self):
+        for change in ('empty', 'no_items', 'sku', 'quantity', 'extra', 'locator', 'locator_data', 'mode'):
+            with self.subTest(change=change):
+                flow = self.fresh_flow('none')
+                body = flow.current_response_body
+                if change == 'empty':
+                    flow.current_response_body = {}
+                elif change == 'no_items':
+                    body['checkout'].pop('companionBar')
+                elif change == 'sku':
+                    shop.field(body, 'checkout.companionBar.orderDetails.item-0.d')['sku'] = 'MLH74FE/A'
+                elif change == 'quantity':
+                    shop.field(body, 'checkout.companionBar.orderDetails.item-0.itemQuantity.d')['quantity'] = 2
+                elif change == 'extra':
+                    shop.field(body, 'checkout.companionBar.orderDetails')['item-1'] = {
+                        'd': {'sku': 'MLH74FE/A'}, 'itemQuantity': {'d': {'quantity': 1}}}
+                elif change == 'locator':
+                    shop.field(body, self.pickup)['storeLocator'].pop('searchResults')
+                elif change == 'locator_data':
+                    shop.field(body, self.pickup)['storeLocator']['d'] = None
+                else:
+                    shop.field(body, 'checkout.fulfillment.fulfillmentOptions.d')['selectFulfillmentLocation'] = 'HOME'
+                self.assertEqual(self.finish(flow), ['search', 'select', 'continueFromFulfillmentToPickupContact'])
+
+    def test_fresh_search_error_cannot_authorize_skipping_search(self):
+        flow = self.fresh_flow('none')
+        shop.field(flow.current_response_body, self.locator)['d']['isStoreSearchErrorPresent'] = True
+        self.assertEqual(self.finish(flow), ['search', 'select', 'continueFromFulfillmentToPickupContact'])
+
+    def test_disabled_or_ambiguous_target_stops_before_select_or_continue(self):
+        for change in ('disabled', 'duplicate', 'invalid_id'):
+            with self.subTest(change=change):
+                flow = self.fresh_flow('none')
+                stores = shop.field(flow.model, self.locator + '.searchResults.d')['retailStores']
+                if change == 'disabled':
+                    stores[0]['storeDisabled'] = True
+                elif change == 'duplicate':
+                    stores.append(deepcopy(stores[0]))
+                else:
+                    stores[0]['storeId'] = '../R580'
+                flow.current_response_body = deepcopy(flow.model)
+                with self.assertRaises(ValueError):
+                    self.finish(flow)
+                self.assertEqual([name for _, name, _ in flow.calls], ['search'])
+
+
+class PreparedPickupStoreTests(TestCase):
+    def setUp(self):
+        self.details = {'store': 'Apple 测试门店', 'store_id': 'R580',
+                        'items': [{'sku': 'MK2M4CH/A', 'quantity': 1}], 'total': 'RMB 15,999'}
+        self.item = {'d': {'sku': 'MK2M4CH/A'}, 'itemQuantity': {'d': {'quantity': 1}}}
+        self.model = {'checkout': {'review': {
+            'fulfillmentReview': {'reviewGroup-1': {'d': {'pickup': {'quote': '付款后确认'}},
+                                                   'item-0': deepcopy(self.item)}},
+            'summary': {'d': {'pickupSummary': True}}, 'pickupContactReview': {}}}}
+
+    def confirmed(self):
+        from pickup_options import prepared_pickup_store_confirmed
+        return prepared_pickup_store_confirmed(self.model, self.details)
+
+    def companion(self, **identity):
+        self.model['checkout']['companionBar'] = {'orderDetails': {
+            'fulfillmentCompanionBar': {'pickupSummary': {'d': identity}}}}
+
+    def test_fresh_companion_requires_both_store_name_and_id(self):
+        self.companion(store_name='测试门店', storeId='R580')
+        self.assertTrue(self.confirmed())
+        for identity in ({'store_name': '测试门店'}, {'storeId': 'R580'}, {}):
+            with self.subTest(identity=identity):
+                self.companion(**identity)
+                self.assertFalse(self.confirmed())
+
+    def test_all_pickup_groups_can_independently_prove_the_store(self):
+        fulfillment = self.model['checkout']['review']['fulfillmentReview']
+        fulfillment['reviewGroup-1']['d']['pickup']['storeId'] = 'R580'
+        fulfillment['reviewGroup-2'] = {'d': {'pickup': {'storeId': 'R580', 'storeName': 'Apple 测试门店'}},
+                                       'item-1': deepcopy(self.item)}
+        self.assertTrue(self.confirmed())
+        fulfillment['reviewGroup-2']['d']['pickup'].pop('storeId')
+        self.assertFalse(self.confirmed())
+
+    def test_waiting_task_selection_and_local_details_do_not_prove_current_store(self):
+        self.assertFalse(self.confirmed())
+        self.model['checkout']['pickup_selected'] = {'storeName': '测试门店', 'storeId': 'R580'}
+        self.assertFalse(self.confirmed())
+
+    def test_explicit_companion_or_group_conflict_stops_even_with_other_matching_proof(self):
+        baseline = deepcopy(self.model)
+        for source in ('companion', 'group'):
+            for identity in ({'store_name': '其他门店', 'storeId': 'R580'},
+                             {'store_name': '测试门店', 'storeId': 'R999'},
+                             {'storeId': 'R999'}, {'storeName': '其他门店'}):
+                with self.subTest(source=source, identity=identity):
+                    self.model = deepcopy(baseline)
+                    self.companion(store_name='测试门店', storeId='R580')
+                    if source == 'companion':
+                        self.companion(**identity)
+                    else:
+                        shop.field(self.model, 'checkout.review.fulfillmentReview.reviewGroup-1.d')['pickup'] = identity
+                    with self.assertRaisesRegex(ValueError, '门店.*不一致'):
+                        self.confirmed()
+
+    def test_identity_never_substitutes_for_pure_pickup_review_evidence(self):
+        baseline = deepcopy(self.model)
+        for change in ('contact', 'flag', 'shipping', 'address', 'ungrouped', 'pickup', 'quantity', 'empty'):
+            with self.subTest(change=change):
+                self.model = deepcopy(baseline)
+                self.companion(store_name='测试门店', storeId='R580')
+                review = self.model['checkout']['review']
+                group = review['fulfillmentReview']['reviewGroup-1']
+                if change == 'contact': review.pop('pickupContactReview')
+                elif change == 'flag': review['summary']['d']['pickupSummary'] = False
+                elif change == 'shipping': group['d']['delivers'] = {'quote': '送货'}
+                elif change == 'address': review['shippingReview'] = {'address': {'d': {'street': '其他地址'}}}
+                elif change == 'ungrouped': review['fulfillmentReview']['item-extra'] = deepcopy(self.item)
+                elif change == 'pickup': group['d'].pop('pickup')
+                elif change == 'quantity': group['item-0']['itemQuantity']['d']['quantity'] = 'unknown'
+                else: review['fulfillmentReview'] = {}
+                self.assertFalse(self.confirmed())
+
+    def test_missing_prepared_store_identity_or_unknown_models_are_unconfirmed(self):
+        from pickup_options import prepared_pickup_store_confirmed
+        self.companion(store_name='测试门店', storeId='R580')
+        for details in (None, {}, {'store': '测试门店'}, {'store_id': 'R580'},
+                        {'store': '测试门店', 'store_id': 'unknown'}):
+            with self.subTest(details=details):
+                self.assertFalse(prepared_pickup_store_confirmed(self.model, details))
+        for model in ({}, None, {'checkout': {'review': {'fulfillmentReview': []}}}):
+            with self.subTest(model=model):
+                self.assertFalse(prepared_pickup_store_confirmed(model, self.details))
+
+
 class PickupReviewTests(TestCase):
     setUp = PickupCheckoutTests.setUp
     tearDown = PickupCheckoutTests.tearDown

@@ -27,17 +27,31 @@ class Service:
         self.remember = False
         self.authentication_requested = False
         self.authentication_failed = False
+        self.purchase_auth_interaction = False
         self.action = None
         self.submitted = False
         self.automatic_checkout = False
         self.prefill_checkout = False
         self.test_order = False
         self.preparing = False
+        self.keep_prepared_pickup = False
+        self.prepared_order = None
         self.retry_enabled = False
         self.order_details = None
         self.purchase_selection = None
         self.fulfillment_mode = 'HOME'
         self.pickup_selected = None
+        self.pickup_override = None
+        self.pickup_policy_override = None
+        self.pickup_slot_selected = None
+        self.pickup_contact_proof = None
+        self.pickup_identity_proof = None
+        self.pickup_contact_accepted = False
+        self.pickup_contact_review_verified = False
+        self._parallel_child = False
+        self.settings_dir = (self.root.parent.parent / 'settings'
+                             if self.root.parent.name == 'accounts' else
+                             self.root if self.root.name == 'settings' else self.root / 'settings')
         self.task_created_at = None
         try:
             record = json.loads((task_dir / 'task.json').read_text(encoding='utf-8'))
@@ -82,6 +96,9 @@ class Service:
         return True
 
     def credentials(self, path):
+        self.purchase_auth_interaction = True
+        if self._parallel_child:
+            raise ValueError('并发会话需要重新登录，请先预热账号后重新发起；本次未自动登录。')
         self.authentication_requested = True
         if not self.password:
             try:
@@ -98,6 +115,10 @@ class Service:
 
     def text(self, label, default=''):
         kind = 'code' if '验证码' in label else 'text'
+        if kind == 'code':
+            self.purchase_auth_interaction = True
+        if self._parallel_child and kind == 'code':
+            raise ValueError('并发会话需要验证，请先在账号工作台完成登录，再重新发起。')
         if (self.automatic_checkout or self.prefill_checkout) and kind != 'code':
             raise ValueError('自动结账缺少必要信息：' + label + '。请先完善本地地址和联系方式。')
         label = label.replace('👉 ', '')
@@ -149,17 +170,26 @@ class Service:
                 raise ValueError('订单总额无效；未提交订单。')
             config = checkout_options.read_config(self.checkout)
             if self.fulfillment_mode == 'RETAIL':
-                from pickup_options import validate_preset, store_name
+                from pickup_options import validate_preset, store_name, allowed_store
                 preset = validate_preset(config)['pickup']
                 if details.get('address') or details.get('contains_delivery') is True:
                     raise ValueError('订单复核仍包含送货商品或地址，未确认全部商品自提；未提交订单。')
                 if not details.get('store'):
                     raise ValueError('订单复核未返回门店，且缺少本次官网已确认门店与全部商品自提的完整依据；未提交订单。')
-                if store_name(details['store']) != store_name(preset['store_name']):
+                actual_id = details.get('store_id') or (self.pickup_selected or {}).get('storeId')
+                matches_store = (allowed_store(preset, details['store'], actual_id)
+                                 if preset.get('selection_mode') == 'priority'
+                                 else store_name(details['store']) == store_name(preset['store_name']))
+                if not matches_store:
                     raise ValueError('官网复核自提门店与本地指定门店不一致；未提交订单。')
+                if preset.get('store_id') and preset.get('selection_mode') != 'priority':
+                    if actual_id != preset['store_id']:
+                        raise ValueError('官网复核尚未确认指定门店编号；未提交订单。')
                 if (self.pickup_selected and details.get('store_id')
                         and details['store_id'] != self.pickup_selected['storeId']):
                     raise ValueError('官网复核门店编号与已选门店不一致；未提交订单。')
+                if (preset.get('selection_mode') == 'priority' or preset.get('contact_mode') == 'official') and not self.pickup_contact_review_verified:
+                    raise ValueError('官网复核尚未确认本次取货联系人，未提交订单。')
             else:
                 if details.get('store') or not details.get('address'):
                     raise ValueError('订单复核未确认送货地址；未提交订单。')
@@ -177,8 +207,24 @@ class Service:
         # Keep polishing-cloth test records separate from phone orders.
         return self.root / ('test_order_submission.json' if self.test_order else 'order_submission.json')
 
+    def wait_prepared_pickup(self, result, *, timeout):
+        self.stage('自提准备就绪，等待点击下单（五分钟有效）')
+        self.channel.emit('progress_result', result=result)
+        accepted = self.channel.prompt('confirm', '自提准备就绪，等待下单',
+            details={**self.order_details, 'operation': 'prepared_pickup',
+                     'expires_at': time.time() + timeout}, account=self.account, timeout=timeout)
+        if accepted is not True:
+            return False
+        self.preparing = False
+        # Measure the purchase from the user's trigger, excluding preparation.
+        self.task_created_at = time.time()
+        return True
+
     def payment_ready(self, result):
         if self.submitted and result.get('status') == 'pending_payment' and result.get('order_number'):
+            confirmed = int(time.time() * 1000)
+            result.setdefault('payment_confirmed_at_ms', confirmed)
+            result.setdefault('payment_deadline_ms', result['payment_confirmed_at_ms'] + 30 * 60 * 1000)
             if self.task_created_at is not None:
                 # Desktop timestamps have one-second resolution. Includes queue
                 # and worker startup, stops before payment QR requests.
@@ -247,11 +293,14 @@ class Service:
             def sent_names():
                 request = session.prepare_request(requests.Request('GET', duo_killer.BASE_URL + '/shop/bag'))
                 return {part.strip().partition('=')[0] for part in request.headers.get('Cookie', '').split(';')}
-            if 'shld_bt_ck' in sent_names():
-                return False
             client = AppleStoreLogin(auth_path=self.auth, session=session)
             if (client.browser_profile / '.authx-541').exists():
-                raise ValueError('浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。')
+                from browser_login import BrowserSessionError
+                raise BrowserSessionError('APPLE_SESSION_BLOCKED',
+                    '浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。',
+                    status='blocked', requires_login=True, http_status=541)
+            if 'shld_bt_ck' in sent_names():
+                return False
             self.stage('预热浏览器校验，保留账号与本机设备信任，不加购、不下单')
             client.initialize_browser_context()
             if 'shld_bt_ck' not in sent_names():
@@ -302,7 +351,66 @@ class Service:
                 if save_session:
                     duo_killer.save_auth(session)
 
+    def warm_login(self):
+        """Reuse the explicit login preheat without any shopping-bag mutation."""
+        self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')
+        refreshed = self.warm_start_context()
+        result = self.check_account(enrolling=False)
+        empty_bag_ready = duo_killer.warm_empty_bag()
+        result.update(warm_login=True, browser_context_refreshed=refreshed,
+            empty_bag_ready=empty_bag_ready,
+            message=('登录预热完成，空购物袋已检查；两分钟内首次加购可省去重复检查。'
+                     if empty_bag_ready else '登录预热完成，购物袋非空或暂不满足快速加购条件。')
+                    + '未加购、未下单；结算仍可能要求认证。')
+        return result
+
+    def warm_pickup_prepare(self, sku, count):
+        """Use the same saved pickup policy and hard prepare-only boundary as manual preparation."""
+        if not isinstance(sku, str) or not re.fullmatch(r'[A-Za-z0-9]{1,30}(?:/A)?', sku):
+            raise ValueError('请先保存当前账号的商品SKU，再进行自提预热。')
+        if type(count) is not int or not 1 <= count <= 999:
+            raise ValueError('请先保存当前账号的购买数量，再进行自提预热。')
+        from apple_login import browser_profile_path
+        if (browser_profile_path(self.auth) / '.authx-541').exists():
+            from browser_login import BrowserSessionError
+            raise BrowserSessionError('APPLE_SESSION_BLOCKED',
+                '浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。',
+                status='blocked', requires_login=True, http_status=541)
+        self.stage('空闲自提预热：使用当前账号商品和自提偏好，不创建订单')
+        try:
+            return self.run('purchase', {'sku': sku, 'quantity': count, 'fulfillment': 'RETAIL',
+                                        'prepare_only': True, 'keep_ready': False, 'concurrency': 1,
+                                        'retry_count': 0})
+        finally:
+            # Engine ownership and purchase priority remain session-maintenance scoped.
+            self.action = 'session_maintain'
+
     def run(self, action, params):
+        self._parallel_child = params.get('_parallel_child') is True
+        self.pickup_policy_override = None
+        self.pickup_slot_selected = None
+        self.pickup_contact_proof = None
+        self.pickup_identity_proof = None
+        self.pickup_contact_accepted = False
+        self.pickup_contact_review_verified = False
+        if action == 'purchase' and params.get('queue_stream') is True:
+            if self._parallel_child:
+                raise ValueError('并发子任务不能再次创建执行队列。')
+            self.action = 'purchase'
+            self.retry_enabled = True
+            self.ensure_auth_file()
+            from queued_checkout import run_queued_purchase
+            return run_queued_purchase(self, params)
+        if action == 'purchase':
+            from purchase_retry import retry_count
+            retry_count(params)  # Reject invalid policies before auth or mutations.
+            concurrency = params.get('concurrency', 1)
+            if type(concurrency) is not int or not 1 <= concurrency <= 10:
+                raise ValueError('自提并发数必须是 1 到 10 的整数。')
+        if action in ('inventory_settings_read', 'inventory_settings_save', 'store_search',
+                      'inventory_check', 'inventory_monitor'):
+            from inventory import run_inventory
+            return run_inventory(action, params, self.channel, self.settings_dir)
         # Only the engine may defer a purchase. An older service must never
         # silently pass a scheduling request through as an immediate purchase.
         if 'scheduled_at' in params:
@@ -312,7 +420,38 @@ class Service:
         if self.fulfillment_mode not in ('HOME', 'RETAIL'):
             raise ValueError('收货方式无效，未开始购买。')
         self.pickup_selected = None
+        self.pickup_override = None
+        if action in ('purchase', 'checkout') and self.fulfillment_mode == 'RETAIL' and 'pickup_policy' in params:
+            from pickup_options import validate_policy
+            policy = params['pickup_policy']
+            if not isinstance(policy, dict) or 'contact' in policy:
+                raise ValueError('本次自提偏好不接受联系人数据。')
+            # Validate the supplied field allowlist separately, then merge with
+            # saved pickup preferences. Contact always remains account-local.
+            allowed = {'selection_mode','stores','time_slot_rule','contact_mode','search','store_id','store_name','id_last4'}
+            if set(policy) - allowed:
+                raise ValueError('本次自提偏好包含不支持的字段。')
+            saved = checkout_options.read_config(self.checkout).get('pickup', {})
+            self.pickup_policy_override = validate_policy({**saved, **policy})
+        if action in ('purchase', 'checkout') and self.fulfillment_mode == 'RETAIL' and any(
+                key in params for key in ('pickup_store_id', 'pickup_store_name', 'pickup_location')) and checkout_options.read_config(self.checkout).get('pickup', {}).get('selection_mode') != 'priority':
+            store_id, name = params.get('pickup_store_id'), params.get('pickup_store_name')
+            if (not isinstance(store_id, str) or not re.fullmatch(r'R\d{1,8}', store_id)
+                    or not isinstance(name, str) or not name.strip() or len(name) > 200):
+                raise ValueError('监控触发的自提门店编号或名称无效；未开始购买。')
+            saved = checkout_options.read_config(self.checkout).get('pickup', {})
+            location = params.get('pickup_location') or saved.get('search')
+            if not isinstance(location, str) or not location.strip() or len(location) > 200:
+                raise ValueError('请为监控门店配置城市或邮编；未开始购买。')
+            self.pickup_override = {'store_id': store_id, 'store_name': name.strip(), 'search': location.strip()}
+            # A different monitored store must never inherit a cached preparation.
+            (self.root / 'prepared_checkout.json').unlink(missing_ok=True)
         self.preparing = params.get('prepare_only') is True
+        self.keep_prepared_pickup = params.get('keep_ready') is True
+        self.prepared_order = None
+        if self.keep_prepared_pickup and not (action == 'purchase' and self.preparing
+                and self.fulfillment_mode == 'RETAIL'):
+            raise ValueError('保留准备会话仅适用于自提前准备；未开始购买。')
         self.purchase_selection = ((duo_killer.normalize_sku(params.get('sku', 'MK2M4CH')), quantity(params))
                                    if action == 'purchase' else None)
         self.test_order = action == 'purchase' and duo_killer.normalize_sku(params.get('sku', '')) == 'MLH74FE/A'
@@ -321,7 +460,7 @@ class Service:
         if action in ('purchase', 'checkout') and self.fulfillment_mode == 'RETAIL':
             from pickup_options import validate_preset
             validate_preset(config)  # Fail before authentication or adding to the bag.
-        self.prefill_checkout = action in ('purchase', 'checkout') and checkout_options.local_address_ready(config)
+        self.prefill_checkout = action in ('purchase', 'checkout') and self.fulfillment_mode != 'RETAIL' and checkout_options.local_address_ready(config)
         if self.prefill_checkout:
             validate_address(config)
             if not self.automatic_checkout:
@@ -334,11 +473,14 @@ class Service:
             config = checkout_options.read_config(self.checkout)
             if params.get('pickup_only') is True:
                 from pickup_options import validate_preset
-                config.update(validate_preset(params))
+                validated = validate_preset(params, require_contact=False)
+                config['pickup'] = validated['pickup']
+                if 'contact' in params:
+                    config['contact'] = {**config.get('contact', {}), **validated['contact']}
             else:
                 config.update(validate_address(params))
             checkout_options.save_config(self.checkout, config)
-            return {'success': True, 'config': config, 'message': '自提门店和取货联系人已保存。' if params.get('pickup_only') is True else '快捷地址已保存，结账时可选择使用。'}
+            return {'success': True, 'config': config, 'message': '自提偏好已保存。' if params.get('pickup_only') is True else '快捷地址已保存，结账时可选择使用。'}
         if action == 'import_auth':
             data = validate_import(params.get('data'), self.account)
             duo_killer.write_private_json(self.auth, data)
@@ -357,29 +499,36 @@ class Service:
             else:
                 result = self.check_account(enrolling=action == 'enroll')
         elif action == 'login':
-            if params.get('warm_only') is True:
-                self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')
-                refreshed = self.warm_start_context()
-                result = self.check_account(enrolling=False)
-                empty_bag_ready = duo_killer.warm_empty_bag()
-                result.update(warm_login=True, browser_context_refreshed=refreshed,
-                    empty_bag_ready=empty_bag_ready,
-                    message=('登录预热完成，空购物袋已检查；两分钟内首次加购可省去重复检查。'
-                             if empty_bag_ready else '登录预热完成，购物袋非空或暂不满足快速加购条件。')
-                            + '未加购、未下单；结算仍可能要求认证。')
+            if params.get('browser_login') is True:
+                from browser_login import login_in_browser
+                result = login_in_browser(self)
+                result['message'] = '官网登录与会话核对完成，账号和浏览器资料已保留。'
+            elif params.get('warm_only') is True:
+                result = self.warm_login()
             else:
                 if params.get('renew_device_trust') is True:
                     self.stage('重新验证设备信任，保留账号、密码和地址；不加购、不下单')
                     result = duo_killer.login(sms=params.get('sms') is True, renew_device_trust=True)
                 else:
                     result = duo_killer.login(sms=params.get('sms') is True)
+        elif action == 'session_maintain':
+            from session_maintenance import maintain_session
+            result = maintain_session(self, warm_only=params.get('warm_only') is True,
+                                      preheat_flow=params.get('preheat_flow', 'login'),
+                                      sku=params.get('sku'), count=params.get('quantity'))
         elif action == 'purchase':
             if params.get('prepare_only') is True:
                 if not self.automatic_checkout:
                     raise ValueError('提前准备需要已启用自动结算配置。')
                 result = duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params), prepare_only=True)
             else:
-                result = duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params))
+                from purchase_retry import run_purchase
+                def attempt():
+                    if self.fulfillment_mode == 'RETAIL' and concurrency > 1:
+                        from parallel_checkout import run_parallel_purchase
+                        return run_parallel_purchase(self, params)
+                    return duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params))
+                result = run_purchase(self, params, attempt)
         elif action == 'add':
             result = duo_killer.add_to_bag(params.get('sku', ''), quantity=quantity(params), set_total=True)
         elif action == 'checkout':
@@ -443,7 +592,7 @@ class Service:
                     if action == 'orders':
                         result = duo_killer.order_list(session)
                         from order_access import supplement_known_orders
-                        result = supplement_known_orders(session, result, self.root)
+                        result = supplement_known_orders(session, result, self.root, verify_existing=True)
                     else:
                         flow = duo_killer.Checkout(session)
                         flow.page(duo_killer.BASE_URL + '/shop/bag', '读取购物袋')

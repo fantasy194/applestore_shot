@@ -26,6 +26,8 @@ const displayTime = (ms: number) =>
 export function SchedulePurchase({
   sku,
   quantity,
+  concurrency = 1,
+  retryCount = 0,
   busy,
   task,
   start,
@@ -33,6 +35,8 @@ export function SchedulePurchase({
 }: {
   sku: string;
   quantity: number;
+  concurrency?: number;
+  retryCount?: number;
   busy: boolean;
   task?: Task;
   start: (action: Action, params: Data) => Promise<void>;
@@ -67,6 +71,10 @@ export function SchedulePurchase({
         {selected?.quantity ?? quantity} 件
         {selected &&
           ` · ${selected.fulfillment === "RETAIL" ? "指定门店自提" : "送货"}`}
+        {(selected?.fulfillment === "RETAIL" ||
+          (!selected && fulfillment === "RETAIL")) &&
+          ` · ${selected ? (selected.concurrency ?? 1) : concurrency} 路并发，每路按上述数量购买`}
+        {` · 失败额外重试 ${selected ? (selected.retry_count ?? 0) : retryCount} 次，最多共 ${(selected ? (selected.retry_count ?? 0) : retryCount) + 1} 轮`}
       </p>
       {selected && task ? (
         <div>
@@ -80,20 +88,35 @@ export function SchedulePurchase({
             取消定时抢购
           </button>
           <p className="muted">
-            此任务的商品、数量和收货方式已固定；修改上方购买选项不会改变本次定时。
+            此任务的商品、数量、收货方式和失败重试次数已固定；修改上方购买选项不会改变本次定时。
           </p>
         </div>
       ) : (
         <form
           onSubmit={(event) => {
             event.preventDefault();
+            if (
+              !Number.isInteger(retryCount) ||
+              retryCount < 0 ||
+              retryCount > 10
+            ) {
+              setError("下单失败重试次数必须为 0–10 的整数。");
+              return;
+            }
             const at = parseBeijing(target);
             if (!Number.isFinite(at) || at <= Date.now() + 1000) {
               setError("请设置至少一秒后的有效北京时间。");
               return;
             }
             setError("");
-            start("purchase", { sku, quantity, fulfillment, scheduled_at: at });
+            start("purchase", {
+              sku,
+              quantity,
+              fulfillment,
+              scheduled_at: at,
+              retry_count: retryCount,
+              ...(fulfillment === "RETAIL" ? { concurrency } : {}),
+            });
           }}
         >
           <div className="schedule-fields">
@@ -130,7 +153,13 @@ export function SchedulePurchase({
             className="primary"
             type="submit"
             disabled={
-              busy || !product || !Number.isInteger(quantity) || quantity < 1
+              busy ||
+              !product ||
+              !Number.isInteger(quantity) ||
+              quantity < 1 ||
+              !Number.isInteger(retryCount) ||
+              retryCount < 0 ||
+              retryCount > 10
             }
           >
             <Clock3 size={16} />
@@ -140,7 +169,8 @@ export function SchedulePurchase({
       )}
       <p className="muted">
         到点执行与“立即下单”相同的流程，成功后创建真实待付款订单并展示付款码。请提前保存地址或自提预设、预热登录，并保持启动程序运行、电脑唤醒。关网页不影响等待；服务退出或重启会停止定时。到点账号忙碌或迟到超过
-        3 秒时停止，不补发、不循环下单。
+        3
+        秒时停止，不补发。确认未提交的失败才按设定次数串行重试，已有订单或提交未知时停止。
       </p>
     </section>
   );
