@@ -89,6 +89,24 @@ def _identifier(value, fallback=''):
     return value if isinstance(value, str) and IDENTIFIER.fullmatch(value) else fallback
 
 
+def _enable_wal(connection):
+    """Retry SQLite's first-time WAL transition while other writers initialize."""
+    deadline = time.monotonic() + 5
+    delay = 0.005
+    while True:
+        try:
+            connection.execute('PRAGMA journal_mode=WAL')
+            return
+        except sqlite3.OperationalError as error:
+            if not any(word in str(error).casefold() for word in ('locked', 'busy')):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.1)
+
+
 class ActivityLog:
     def __init__(self, data_dir, *, account_id='', task_id='', action='', category=None,
                  now=None, retention_ms=RETENTION_MS, max_rows=MAX_ROWS):
@@ -119,7 +137,7 @@ class ActivityLog:
                 connection = sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5)
             connection.execute('PRAGMA busy_timeout=5000')
             if write:
-                connection.execute('PRAGMA journal_mode=WAL')
+                _enable_wal(connection)
                 connection.execute('PRAGMA synchronous=NORMAL')
                 connection.execute('PRAGMA wal_autocheckpoint=256')
                 connection.execute('PRAGMA journal_size_limit=8388608')
