@@ -70,6 +70,8 @@ pnpm dev:web
 
 **Docker Compose：**在项目目录执行 `docker compose up -d --build --wait`，打开 `http://127.0.0.1:17654`，从 `docker compose logs app` 获取首次访问密码。镜像支持 `linux/amd64` 和 `linux/arm64`，分别内置 GUI Google Chrome 和 Chromium，以及虚拟显示器；账号和浏览器资料保存在独立数据卷。GitHub Actions 在推送 `main` 或 `v*` 标签时构建、验证两种架构，并发布到 `ghcr.io/fantasy194/applestore_shot`。直接拉取镜像、详细配置和数据保留说明见 [Docker 本地部署](docker/README.md)。
 
+**树莓派快捷部署与自动更新：**下载并执行 [`scripts/install-docker.sh`](scripts/install-docker.sh)。脚本显示六个部署阶段、下载进度及每五秒的等待提示；配置下载、镜像拉取和服务启动分别设置超时，失败会标明阶段和退出码。首次配置 Watchtower 每五分钟检查新版；重新运行保留非空配置文件、已有 Compose 项目和 `/data` 数据卷。已安装 Docker Compose 的 64 位树莓派可执行 `bash scripts/install-docker.sh`；自定义目录使用 `DUO_INSTALL_DIR`。安装器的离线回归覆盖下载中断、原配置保留及拉取 / 启动失败。
+
 ## 最简单的购买流程：抛光布
 
 以下为 Web 界面操作截图，使用模拟账号和订单；示例二维码不可付款，金额与状态以实际结账结果为准。
