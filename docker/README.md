@@ -11,11 +11,13 @@ docker compose logs app
 
 Compose 启动 `app` 和 `browser` 两个服务。`app` 提供 Rust Web、React 页面及 Python worker；`browser` 基于 [jlesage/chromium](https://github.com/jlesage/docker-chromium) 镜像提供真实 Chromium，固定多架构 digest 为 `sha256:e42de7469bce122b8a69d4f62101850ece45c41ed7ed952f2b506f99947093ae`（Chromium `152.0.7977.82`），支持 `linux/amd64` 和 `linux/arm64`。桌面与源码服务继续使用本机 Chrome/Edge；`app` 保留原内置浏览器兼容旧单镜像启动，Compose 登录实际使用 `browser` 中的 Chromium。
 
-新增账号、手动登录、手动预热和官网登录恢复在 `browser` 中打开可见窗口，继续使用应用现有预览和鼠标 / 键盘输入（含空格键）。自动空闲预热使用同一镜像的 `--headless=new`，不注册人工预览。每次启动沿用原账号 `/data` 下的专用资料目录，多个账号使用独立进程和 Cookie；不使用镜像共享的 `/config/chromium` 默认资料，不执行其默认删除 `Singleton*` 的脚本。侧车保持固定专用 hostname，支持原资料随容器重建继续使用。
+新增账号、手动登录、自动会话维护和官网登录恢复使用 `browser` 中的普通 Chrome 窗口，继续支持应用现有预览和鼠标 / 键盘输入（含空格键）。Docker 中每个账号由 broker 持有自己的常驻浏览器及 `/data` 下的专用资料，任务结束或取消仅释放操作权，下次任务继续连接同一进程，不因自动 / 手动模式切换而重启或改用无头浏览器。自动任务是否提供人工预览仍由任务类型决定。多个账号的进程、页面和 Cookie 相互隔离；不使用共享的 `/config/chromium` 默认资料，不执行上游默认删除 `Singleton*` 的脚本。侧车保持固定专用 hostname，支持原资料随容器重建继续使用。
 
-worker 通过 `/data/.browser-control/control.sock`（目录 `0700`、socket `0600`）请求受限浏览器生命周期及 CDP 通道，CDP 仅绑定容器回环地址；app 侧为本次浏览器建立回环转发。worker 生命周期连接断开会清理它拥有的浏览器，远端 PID 不交给 app 的进程清理器。两服务无需共享网络命名空间，也不挂载 Docker socket；任一容器独立重建后，新任务连接当前 broker，不重放登录或购买。CDP、VNC、jlesage Web GUI 均不发布到宿主，文件管理器及终端关闭，仍由应用密码入口提供浏览器操作。
+worker 通过 `/data/.browser-control/control.sock`（目录 `0700`、socket `0600`）请求单账号独占操作租约及 CDP 通道，CDP 仅绑定容器回环地址；app 为本次任务建立回环转发。worker 断开仅释放租约，常驻浏览器由 broker 继续持有；活跃租约期间，同账号第二个任务不能同时操控页面。旧任务 token 随释放失效，迟到输入、连接或关闭不能影响后来任务。购买优先由应用取消并释放已有维护任务后再获取租约，不并发抢控账号。远端 PID 不交给 app 的进程清理器。
 
-空闲十分钟后，两种自动预热都会先用无头浏览器读取官网首页、购物袋和账户页，核验并同步当前会话；自提预热再继续原 `prepare_only` 流程。普通官网登录可用鼠标 / 键盘自动填写账号和可用密码，继续保持无头；验证码、其他安全挑战或缺少密码时提示人工处理。541 及冷却标记保留，不反复认证。手动官网恢复从当前首页菜单进入登录，详情和证据边界见 [官网恢复与空闲会话刷新](../docs/STOREFRONT-SESSION-RECOVERY.md)及[官网自动填写](../docs/BROWSER-LOGIN-AUTOFILL.md)。无需另设无头环境变量，普通更新继续保留 `/data`，也保留 Xvfb 供人工恢复使用。
+移除账号、显式关闭账号浏览器或服务退出会明确关闭相应常驻进程，并保留原浏览器资料。每个 Chrome 由独立监督子进程持有，保活管道属于 broker；broker 即使被强制结束，管道 EOF 也会清理它启动的账号进程组，不影响其他浏览器、不删除 `Singleton*` 锁文件。broker 正常退出会并行关闭全部受管进程；重启只读取后续任务请求，不主动恢复浏览器、登录或购买。两服务无需共享网络命名空间，也不挂载 Docker socket。CDP、VNC、jlesage Web GUI 均不发布到宿主，文件管理器及终端关闭，仍由应用密码入口提供浏览器操作。
+
+空闲会话维护在账号常驻浏览器中读取官网页面，核验并同步当前会话；自提预热再继续原 `prepare_only` 流程。普通官网登录可用鼠标 / 键盘填写账号和可用密码；验证码、其他安全挑战或缺少密码时提示人工处理。541 及冷却标记保留，不反复认证。手动官网恢复从当前首页菜单进入登录，详情和证据边界见 [官网恢复与空闲会话刷新](../docs/STOREFRONT-SESSION-RECOVERY.md)及[官网自动填写](../docs/BROWSER-LOGIN-AUTOFILL.md)。普通更新继续保留 `/data` 和容器图形显示环境。
 
 Compose 由 Docker 自动选择主机架构；两个镜像均原生构建和发布 amd64/arm64。worker、浏览器 broker 和 Chromium 使用 UID/GID `1000:1000`，jlesage 初始化与显示管理沿用上游机制。Compose 加载 [`chrome-seccomp.json`](chrome-seccomp.json) 允许沙箱所需的用户命名空间，未使用 privileged 或 `--no-sandbox`。该 profile 来自 [Playwright 官方 Docker 配置](https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json)，相关说明见 [Playwright Docker 文档](https://playwright.dev/docs/docker)。
 
@@ -140,6 +142,6 @@ docker compose start --wait
 
 可使用 `docker compose build --build-arg HTTP_PROXY=http://host.docker.internal:端口 --build-arg HTTPS_PROXY=http://host.docker.internal:端口 --build-arg http_proxy=http://host.docker.internal:端口 --build-arg https_proxy=http://host.docker.internal:端口` 临时给构建下载配置本机代理，再运行 `docker compose up -d --no-build --wait`。这些构建参数不会设置到应用运行环境。`NODE_IMAGE`、`RUST_IMAGE` 构建参数可指定已有的官方基础镜像或其 digest；默认分别使用 Node 24、Rust 1.88 的 Debian Bookworm 镜像，依赖版本仍由锁文件固定。
 
-离线浏览器验收可在 PowerShell 执行 `Get-Content -Raw docker/verify_browser.py | docker compose exec -T app python -`（Linux shell 可用 `docker compose exec -T app python - < docker/verify_browser.py`）；它仅打开临时 fixture 页面，检查真实 jlesage GUI Chromium、非 root worker、沙箱、私有 Unix CDP、预览和空格输入、同时运行的资料隔离、无头模式及 Cookie 重启保存，不访问 Apple。`verify_cdp_startup.py` 另覆盖慢 WebSocket 连接和恢复标签页。Actions 会独立重建 browser 和 app 后再次运行验收，检查两种更新顺序。HTTP 入口可用 `python docker/verify_web.py` 检查。
+离线浏览器验收可在 PowerShell 执行 `Get-Content -Raw docker/verify_browser.py | docker compose exec -T app python -`（Linux shell 可用 `docker compose exec -T app python - < docker/verify_browser.py`）；它仅打开临时 fixture 页面，检查真实 jlesage GUI Chromium、非 root worker、沙箱、私有 Unix CDP、预览和空格输入、同时运行的资料隔离、普通浏览器及 Cookie 进程重启保存，不访问 Apple。`verify_cdp_startup.py` 另覆盖慢 WebSocket 连接和恢复标签页；`verify_persistent_browser.py` 覆盖同账号跨任务复用同一进程 / 页面 JS / Cookie、独占租约、取消后保留、迟到 token 拒绝及显式关闭保留资料。Actions 会独立重建 browser 和 app 后再次运行验收，检查两种更新顺序。HTTP 入口可用 `python docker/verify_web.py` 检查。
 
 此前 amd64 本机部署的检查结果见 [本地 Docker 验收记录](VERIFICATION.md)。该记录不代表 ARM64 或后续镜像已经通过同样检查；新镜像的各架构构建与离线检查以对应 GitHub Actions 运行日志为准，均不证明真实 Apple 登录、库存或下单可用。

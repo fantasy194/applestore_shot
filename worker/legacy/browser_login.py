@@ -58,9 +58,40 @@ def signin_page(url):
             host in ('idmsa.apple.com.cn', 'appleid.apple.com') and '/auth' in parsed.path)
 
 
-def observe_login_network(context, service):
+def observe_login_network(context, service, *, page=None):
     state = {'pending': {}, 'error': None, 'last_activity': time.monotonic(), 'blocked_status': None,
              'authentication_failed': False, 'credential_rejected': False, 'authentication_completed': False}
+    state['page'] = page
+    generations = {}
+    ownership = {}
+    visible_generations = {}
+    visibility_at_send = {}
+    events = []
+    if page is not None:
+        page.on('framenavigated', lambda frame: generations.__setitem__(frame, generations.get(frame, 0) + 1))
+
+    def current(request, *, visibility=True):
+        if page is None:
+            return True
+        try:
+            frame = request.frame
+            if frame.page != page or frame.is_detached():
+                return False
+            if visibility and frame != page.main_frame:
+                from browser_signin import _account_auth_frames
+                if frame not in _account_auth_frames(page):
+                    return False
+            return True
+        except Exception:
+            # Worker/service-worker requests without a frame do not authenticate
+            # the controlled document. They never receive credentials here.
+            return False
+
+    def owned(request, *, visibility=True):
+        if page is None:
+            return True
+        return (request in ownership and current(request, visibility=visibility)
+                and ownership[request] == generations.get(request.frame, 0))
 
     def phase(request):
         parsed = urlsplit(request.url)
@@ -71,13 +102,26 @@ def observe_login_network(context, service):
 
     def started(request):
         name = phase(request)
-        if name:
+        if name and current(request, visibility=False):
+            if page is not None:
+                ownership[request] = generations.get(request.frame, 0)
+                visibility_at_send[request] = (request.frame == page.main_frame or
+                    visible_generations.get(request.frame) == ownership[request])
             state['last_activity'] = time.monotonic()
             state['pending'][request] = (name, time.monotonic())
             log.info('[官网浏览器] %s：请求已发送（不记录请求参数）', name)
 
-    def responded(response):
+    def responded(response, accepted=None, confirmed=False):
         name = phase(response.request)
+        active = owned(response.request) if accepted is None else (accepted and (
+            response.request.frame == page.main_frame or confirmed or current(response.request)))
+        if not active:
+            state['pending'].pop(response.request, None)
+            ownership.pop(response.request, None)
+            visibility_at_send.pop(response.request, None)
+            return
+        ownership.pop(response.request, None)
+        visibility_at_send.pop(response.request, None)
         if name:
             state['last_activity'] = time.monotonic()
             state['pending'].pop(response.request, None)
@@ -99,16 +143,18 @@ def observe_login_network(context, service):
                         and (path == '/shop/signIn/idms/authx' and response.status == 200
                              or path == '/appleauth/auth/2sv/trust' and response.status in (200, 204))):
                     state['authentication_completed'] = True
-        elif response.status == 200 and getattr(service, 'headless_browser', False) is not True:
-            parsed = urlsplit(response.request.url)
-            if (parsed.scheme == 'https' and parsed.path == '/shop/account/home'
-                    and re.fullmatch(r'secure\d*\.www\.apple\.com\.cn', parsed.hostname or '')):
-                # A visible manual recovery may reach the official account page.
-                # A late success cannot unlock a blocked automatic attempt.
-                state['error'], state['blocked_status'] = None, None
 
-    def failed(request):
+    def failed(request, accepted=None, confirmed=False):
         name = phase(request)
+        active = owned(request) if accepted is None else (accepted and (
+            request.frame == page.main_frame or confirmed or current(request)))
+        if not active:
+            state['pending'].pop(request, None)
+            ownership.pop(request, None)
+            visibility_at_send.pop(request, None)
+            return
+        ownership.pop(request, None)
+        visibility_at_send.pop(request, None)
         if name:
             state['pending'].pop(request, None)
             failure = request.failure or ''
@@ -120,9 +166,34 @@ def observe_login_network(context, service):
             if code != 'net::ERR_ABORTED':
                 state['error'] = f'官网浏览器的{name}请求失败（{code}）；本次登录未完成。'
 
+    def refresh():
+        # Visibility reads are CDP operations; do them outside event callbacks.
+        if page is not None:
+            from browser_signin import _account_auth_frames
+            visible_generations.clear()
+            visible_generations.update((frame, generations.get(frame, 0))
+                                       for frame in _account_auth_frames(page))
+        waiting, events[:] = list(events), []
+        for kind, event, accepted, confirmed in waiting:
+            (responded if kind == 'response' else failed)(event, accepted, confirmed)
+        for request in list(state['pending']):
+            if not owned(request, visibility=False):
+                state['pending'].pop(request, None)
+                ownership.pop(request, None)
+                visibility_at_send.pop(request, None)
+            elif not visibility_at_send.get(request, False) and not current(request):
+                # A never-active hidden iframe cannot hold the task's timeout.
+                # Keep its ownership record until its eventual response so it
+                # can still be classified if the official frame becomes active.
+                state['pending'].pop(request, None)
+
+    state['refresh'] = refresh
     context.on('request', started)
-    context.on('response', responded)
-    context.on('requestfailed', failed)
+    context.on('response', responded if page is None else lambda response: events.append(
+        ('response', response, owned(response.request, visibility=False),
+         visibility_at_send.get(response.request, False))))
+    context.on('requestfailed', failed if page is None else lambda request: events.append(
+        ('failed', request, owned(request, visibility=False), visibility_at_send.get(request, False))))
     return state
 
 
@@ -189,15 +260,15 @@ def trust_browser_if_offered(page, *, accept=True, remote=None):
 
 def headless_auth_required():
     return BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
-        '后台无头预热需要人工验证，请使用“官网登录恢复（保留账号）”完成后再继续；未弹出浏览器窗口。',
+        '官网要求额外验证，当前步骤无法自动完成；账号资料已保留，未重复提交认证。',
         status='requires_login', requires_login=True, browser_started=True, browser_connected=True)
 
 
-def open_storefront_login(context, service, *, automatic=False):
+def open_storefront_login(context, service, *, automatic=False, page=None):
     """Use the current storefront menu entry, just like normal enrollment."""
     from apple_login import HOME, LoginError, apple_url, storefront_api_key, storefront_menu_entry, storefront_signin_entry
 
-    page = context.pages[-1] if context.pages else context.new_page()
+    page = page if page is not None else context.pages[-1] if context.pages else context.new_page()
     account_url = 'https://secure.www.apple.com.cn/shop/account/home'
 
     def navigate(url, **kwargs):
@@ -287,6 +358,8 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
     reported_verification = False
     while time.monotonic() < deadline:
         service.channel.checkpoint()
+        if callable(network.get('refresh')):
+            network['refresh']()
         if process.poll() is not None:
             raise ValueError('官网登录窗口已关闭，未完成会话导入。')
         if network.get('authentication_failed'):
@@ -296,9 +369,9 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                 '官网未接受本次认证，请核对登录信息后手动重试；账号和浏览器资料已保留。',
                 status='requires_login', requires_login=True,
                 browser_started=True, browser_connected=True)
-        if headless and network.get('blocked_status') in (403, 429, 541):
+        if network.get('blocked_status') in (403, 429, 541):
             raise BrowserSessionError('APPLE_SESSION_BLOCKED',
-                '后台无头预热被官网限制，请在官网登录窗口恢复；未自动重试。',
+                '官网拒绝了当前认证；账号资料已保留，本次未重复提交。',
                 status='blocked', requires_login=True, http_status=network['blocked_status'],
                 browser_started=True, browser_connected=True)
         if network['error']:
@@ -313,6 +386,8 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
         pages = []
         for context in browser.contexts:
             pages.extend(context.pages)
+        if network.get('page') is not None:
+            pages = [page for page in pages if page == network['page']]
         if not pages:
             raise ValueError('官网登录页面已关闭，未完成会话导入。')
         if account_read_only and (any(pending_auth_page(page) or trust_browser_if_offered(page, accept=False)
@@ -373,6 +448,8 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
             network['last_activity'] = time.monotonic()
         for context in browser.contexts:
             for page in context.pages:
+                if network.get('page') is not None and page != network['page']:
+                    continue
                 if trust_pending or auth_pending:
                     continue
                 parsed = urlsplit(page.url)
@@ -401,7 +478,8 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                     if not valid_store_session(context.cookies()):
                         continue
                     candidates = [page for page in context.pages
-                                  if urlsplit(page.url).scheme == 'https'
+                                  if (network.get('page') is None or page == network['page'])
+                                  and urlsplit(page.url).scheme == 'https'
                                   and re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn',
                                                    urlsplit(page.url).hostname or '')]
                     if post_auth_probe:
@@ -541,8 +619,8 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
             '--remote-debugging-port=' + str(port), '--remote-debugging-address=127.0.0.1',
             '--no-first-run', '--no-default-browser-check', '--window-size=1000,800',
             'about:blank']
-    if headless:
-        args.append('--headless=new')
+    if headless and os.name == 'nt':
+        args.append('--start-minimized')
     proxy = requests.utils.get_environ_proxies(duo_killer.BASE_URL)
     proxy_url = proxy.get('https') or proxy.get('all')
     if proxy_url:
@@ -559,9 +637,11 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
     except OSError:
         raise BrowserSessionError('BROWSER_LAUNCH_FAILED', '无法启动该账号的官方浏览器窗口；会话状态尚未检查。') from None
     browser = None
+    task_page = None
+    retained = getattr(process, 'persistent', False) is True and callable(getattr(process, 'release', None))
     try:
         service.stage('正在自动维护官网会话，使用已保存凭证；需要六位验证码时将提示输入' if automatic else
-                      '后台无头维护官网浏览器会话，不弹窗、不加购、不下单' if headless else
+                      '正在后台维护官网浏览器会话，不加购、不下单' if headless else
                       '只读维护官网浏览器会话，不加购、不下单' if maintenance else
                       '将自动填写所选账号及可用密码；Apple 验证码和安全验证请在官网完成',
                       browser_pid=process.pid)
@@ -574,13 +654,14 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                 if not browser.contexts:
                     raise BrowserSessionError('BROWSER_CONTEXT_MISSING', '已连接浏览器但没有可用页面；会话状态尚未检查。',
                                               browser_started=True, browser_connected=True)
-                network = observe_login_network(browser.contexts[0], service)
+                task_page = browser.contexts[0].new_page()
+                network = observe_login_network(browser.contexts[0], service, page=task_page)
                 assistant = BrowserSigninAssistant(service, headless=headless, automatic=automatic)
                 from browser_remote import remote_context
-                with (nullcontext(None) if headless else remote_context(service, port)) as remote:
+                with (nullcontext(None) if headless else remote_context(service, port, page=task_page)) as remote:
                     if checkout_context is not None:
                         from browser_checkout import BrowserCheckoutRecovery
-                        checkout = BrowserCheckoutRecovery(browser.contexts[0], service, checkout_context)
+                        checkout = BrowserCheckoutRecovery(browser.contexts[0], service, checkout_context, page=task_page)
                         checkout.prepare()
                         result = checkout.wait(browser, process, assistant, network, timeout, remote=remote)
                     else:
@@ -588,7 +669,7 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                         if (maintenance or headless) and not recover and not storefront:
                             seed_missing_session(browser.contexts[0], service)
                             context = browser.contexts[0]
-                            page = context.pages[-1] if context.pages else context.new_page()
+                            page = task_page
                             # Refresh the browser's real storefront context even when
                             # the HTTP export still contains an unexpired shield cookie.
                             for url in (HOME, HOME + 'shop/bag', 'https://secure.www.apple.com.cn/shop/account/home'):
@@ -610,7 +691,7 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                                         account_url = 'https://secure.www.apple.com.cn/shop/account/home'
                                     else:
                                         service.stage('官网会话需要重新登录，正在从首页入口自动继续')
-                                        account_url = open_storefront_login(context, service, **({'automatic': True} if automatic else {}))
+                                        account_url = open_storefront_login(context, service, page=task_page, **({'automatic': True} if automatic else {}))
                                     break
                             parsed = urlsplit(page.url)
                             if account_url is None and parsed.path != '/shop/account/home':
@@ -624,7 +705,7 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                                         'message': ('官网明确跳转到登录页面，请打开官网窗口完成验证；未自动登录。'
                                                     if needs_login else '浏览器到达了未识别的官网页面，会话状态尚未确认；未判定登录过期。')}
                         else:
-                            account_url = open_storefront_login(browser.contexts[0], service, **({'automatic': True} if automatic else {}))
+                            account_url = open_storefront_login(browser.contexts[0], service, page=task_page, **({'automatic': True} if automatic else {}))
                         wait_options = {'remote': remote, 'assistant': assistant}
                         if automatic:
                             wait_options['automatic'] = True
@@ -651,7 +732,12 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
             finally:
                 if browser is not None:
                     try:
-                        browser.new_browser_cdp_session().send('Browser.close')
+                        if retained:
+                            if task_page is not None and not task_page.is_closed():
+                                task_page.close()
+                            browser.close()
+                        else:
+                            browser.new_browser_cdp_session().send('Browser.close')
                     except BrowserError:
                         pass
     except BrowserTimeout:
@@ -663,7 +749,9 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
             '官方浏览器连接中断；会话状态尚未确认，未判定登录过期。',
             browser_started=True, browser_connected=browser is not None) from None
     finally:
-        if process.poll() is None:
+        if retained:
+            process.release()
+        elif process.poll() is None:
             if headless and browser is None:
                 process.terminate()
             try:
@@ -675,4 +763,4 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
-        service.stage('官网登录窗口已关闭', browser_pid=None)
+        service.stage('官网浏览器操作已结束', browser_pid=None)

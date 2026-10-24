@@ -115,9 +115,9 @@ def main():
                             other_browser = connect_browser(playwright.chromium, other_process, other_port)
                             assert not any(cookie['name'] == 'duo_runtime_probe'
                                            for cookie in other_browser.contexts[0].cookies(fixture_url))
-                            assert 'HeadlessChrome' in other_browser.contexts[0].pages[0].evaluate('navigator.userAgent')
+                            assert 'HeadlessChrome' not in other_browser.contexts[0].pages[0].evaluate('navigator.userAgent')
                             report['simultaneous_profiles_isolated'] = True
-                            report['automatic_headless_supported'] = True
+                            report['automatic_browser_is_normal_chrome'] = True
                         finally:
                             if other_browser is not None:
                                 other_browser.close()

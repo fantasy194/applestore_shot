@@ -9,6 +9,7 @@ import json
 import faulthandler
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -60,7 +61,7 @@ faulthandler.dump_traceback_later(4, repeat=False, file=stack_output)
 
 def record(direction, kind, payload):
     entry = {'direction': direction, 'type': kind, 'at_ns': time.monotonic_ns(), **payload}
-    with open(audit / 'protocol.jsonl', 'a', encoding='utf-8') as output:
+    with open(audit / ('protocol-' + str(os.getpid()) + '.jsonl'), 'a', encoding='utf-8') as output:
         output.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
 
@@ -115,13 +116,36 @@ service.Service.purchase_session_ready = lambda owner: True
 actual_run_queued = queued_checkout.run_queued_purchase
 
 
+def synthetic_parent_checkout(context, target):
+    # Production selects one account-owned serial executor. Fake only its Apple
+    # operation with an actual gated subprocess, preserving cross-account proof.
+    command=[sys.executable,str(Path(__file__).with_name('queue_bridge_child.py')),
+             '--fixture-audit',str(audit),'--data-dir',str(data),
+             '--account-id',context.channel.account_id,'--task-id',context.channel.task_id]
+    process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,text=True,encoding='utf-8')
+    request={'account_id':context.channel.account_id,'task_id':context.channel.task_id,
+        'action':'purchase','params':{**target,'_parallel_child':True,'concurrency':1,'retry_count':0}}
+    process.stdin.write(json.dumps(request)+'\n');process.stdin.flush();process.stdin.close()
+    result=None
+    try:
+        for line in process.stdout:
+            context.channel.checkpoint()
+            event=json.loads(line)
+            assert event['account_id']==context.channel.account_id and event['task_id']==context.channel.task_id
+            if event['type']=='stage':
+                context.stage(event['message'],order_submitted=event.get('order_submitted') is True)
+            elif event['type']=='result':result=event['result']
+            elif event['type']=='error':raise ValueError(event['message'])
+        assert process.wait(timeout=2)==0 and isinstance(result,dict)
+        return result
+    finally:
+        if process.poll() is None:process.kill();process.wait(timeout=2)
+
+
 def injected_children(owner, params, **options):
-    assert params['queue_mode'] == 'parallel'
-    assert params['queue_max_concurrency'] == 2
     assert options == {}
-    return actual_run_queued(owner, params,
-        worker_command=[sys.executable, str(Path(__file__).with_name('queue_bridge_child.py')),
-                        '--fixture-audit', str(audit)], backoff_seconds=0)
+    return actual_run_queued(owner,params,parent_executor=synthetic_parent_checkout,backoff_seconds=0)
 
 
 queued_checkout.run_queued_purchase = injected_children

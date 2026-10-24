@@ -52,6 +52,32 @@ def sidecar_ready():
         return _request(connection, {'action': 'ping'})['protocol'] == 1
 
 
+def close_profile(profile):
+    """Close one idle retained account browser before account removal.
+
+    A missing host/profile is an idempotent success. Busy or failed shutdown
+    raises, allowing the caller to retain all account data.
+    """
+    path = os.environ.get('DUO_BROWSER_SOCKET')
+    if not path:
+        return True
+    with _connect(path) as connection:
+        connection.settimeout(20)
+        _request(connection, {'action': 'close_profile', 'profile': os.fspath(profile), 'force': False})
+    return True
+
+
+def shutdown_browser_host():
+    """Close retained browsers only when the application host is exiting."""
+    path = os.environ.get('DUO_BROWSER_SOCKET')
+    if not path:
+        return True
+    with _connect(path) as connection:
+        connection.settimeout(20)
+        _request(connection, {'action': 'shutdown_all'})
+    return True
+
+
 class SidecarProcess:
     # A sidecar PID must never be reported to the host's process killer.
     pid = None
@@ -64,6 +90,9 @@ class SidecarProcess:
             answer = _request(self.owner, {'action': 'launch', 'args': args[1:]})
             self.token = answer.get('token')
             self.port = answer.get('port')
+            self.remote_port = answer.get('remote_port', self.port)
+            self.persistent = answer.get('persistent') is True
+            self.reused = answer.get('reused') is True
             if not isinstance(self.token, str) or len(self.token) != 64 or type(self.port) is not int:
                 raise OSError('浏览器服务响应无效。')
             self.owner.settimeout(None)
@@ -127,6 +156,17 @@ class SidecarProcess:
     def terminate(self):
         self._signal('terminate')
 
+    def release(self):
+        """Return the operation lease without terminating its retained profile."""
+        if self.returncode is None:
+            try:
+                # The acknowledgement orders the next acquire after registry
+                # release; EOF alone races the next worker's connection.
+                with _connect(self.path) as connection:
+                    _request(connection, {'action': 'release', 'token': self.token})
+            finally:
+                self._finish(0)  # EOF also releases on broker/transport failure.
+
     def kill(self):
         self._signal('kill')
 
@@ -154,11 +194,14 @@ def background_browser_scope():
 
 
 def launch_browser(args, **options):
+    # Background work uses the same normal Chrome renderer as manual work.
+    # The Docker display is private; desktop launches should avoid stealing focus.
+    args = [arg for arg in args if not arg.startswith('--headless')]
     if _background_browser.get():
-        args = [arg for arg in args if not arg.startswith('--headless')]
-        args.append('--headless=new')
         if os.name == 'nt':
             options['creationflags'] = options.get('creationflags', 0) | subprocess.CREATE_NO_WINDOW
+            if '--start-minimized' not in args:
+                args.append('--start-minimized')
     path = os.environ.get('DUO_BROWSER_SOCKET')
     if path:
         return SidecarProcess(args, path)

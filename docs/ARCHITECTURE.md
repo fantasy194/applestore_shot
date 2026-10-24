@@ -1,5 +1,7 @@
 # 架构与运行约定
 
+0.1.13 的常驻账号浏览器、统一 App 验证码、活结账准备接手、单店购买目标及七天最早时段，见 [快速自提架构](FAST-PICKUP-ARCHITECTURE.md)；具体交接协议见 [活自提准备接手](PREPARED-HANDOFF.md)。下文历史流程若与该版本专项设计冲突，以专项设计和当前实现为准。
+
 ```mermaid
 flowchart LR
   UI[React 桌面窗口] -->|Tauri invoke| R[Rust 账号与任务管理]

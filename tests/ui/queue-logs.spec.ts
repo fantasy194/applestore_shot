@@ -280,10 +280,13 @@ test("队列最新倒序展示，执行策略折叠且保留暂停取消", async
   ).toHaveText("逐个执行");
   await expect(
     page.getByText(
-      "下单执行名额：3 / 10；按每个任务的下单路数占用，名额不足时继续排队。",
+      "下单执行名额：3 / 10；每个账号的下单任务占用1个名额，名额不足时继续排队。",
       { exact: true },
     ),
   ).toBeVisible();
+  await expect(page.locator(".queue-policy")).toContainText(
+    "不同账号同时执行1–10个任务；同账号顺序执行",
+  );
   await chooseOption(
     page.getByRole("combobox", { name: "队列执行方式", exact: true }),
     "固定并发",

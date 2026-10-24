@@ -28,6 +28,27 @@ def official_page(page):
                                          or host == 'apple.com' or host.endswith('.apple.com'))
 
 
+def browser_page_target(page):
+    """Read a stable CDP target on the page's owning Playwright thread.
+
+    Only the opaque id crosses to the remote controller; Playwright Page objects
+    from separate connections/threads must never be compared or operated there.
+    """
+    session = page.context.new_cdp_session(page)
+    try:
+        target = session.send('Target.getTargetInfo').get('targetInfo', {}).get('targetId')
+        if not isinstance(target, str) or not target or len(target) > 128:
+            raise ValueError('当前任务浏览器页面不可用。')
+        return target
+    except Exception:
+        raise ValueError('当前任务浏览器页面不可用。') from None
+    finally:
+        try:
+            session.detach()
+        except Exception:
+            pass
+
+
 class BrowserRemote:
     def __init__(self, service, *, allowed_page=official_page):
         self.service = service
@@ -65,6 +86,8 @@ class BrowserRemote:
         self.sequence = int(time.time() * 1000) * 1000
         self.last_capture = 0
         self.controller = None
+        self.bound_target_id = None
+        self.target_ids = {}
         broker = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -209,9 +232,15 @@ class BrowserRemote:
         if self.controller is not None:
             self.controller.join(timeout=17)
 
-    def attach_cdp(self, port):
+    def attach_cdp(self, port, *, target_id=None):
         """A separate connection owns its own Playwright API and stays responsive
         while the login thread is waiting for navigation/network responses."""
+        if self.controller is not None:
+            raise ValueError('浏览器预览控制器已连接。')
+        if target_id is not None and (not isinstance(target_id, str) or not target_id or len(target_id) > 128):
+            raise ValueError('当前任务浏览器页面不可用。')
+        self.bound_target_id = target_id
+
         def control():
             from playwright.sync_api import sync_playwright
             from protocol import Cancelled
@@ -230,6 +259,7 @@ class BrowserRemote:
                     self.frames.clear()
                     self.connected = False
                     self._notify()
+                self._reject_pending()
                 stage = getattr(self.service, 'stage', None)
                 if callable(stage):
                     stage(reason)
@@ -245,9 +275,19 @@ class BrowserRemote:
                             failed('BROWSER_PREVIEW_INTERRUPTED', '浏览器预览连接已中断，请等待官网窗口恢复；未发送等待中的输入。')
                             break
                         pages = [page for context in browser.contexts for page in context.pages]
-                        if pages:
+                        if self.bound_target_id is not None:
+                            # A persistent profile may contain old login tabs.
+                            # URL/account heuristics must never redirect this task.
+                            chosen = next((page for page in pages if self._matches_target(page)), None)
+                            if chosen is None:
+                                targets = health.send('Target.getTargets').get('targetInfos', [])
+                                if not any(target.get('targetId') == self.bound_target_id for target in targets):
+                                    failed('BROWSER_PREVIEW_CLOSED', '当前任务的官网窗口已关闭，未发送等待中的输入。')
+                                    break
+                        else:
                             from browser_login import pending_auth_page
-                            chosen = next((page for page in reversed(pages) if pending_auth_page(page)), pages[-1])
+                            chosen = next((page for page in reversed(pages) if pending_auth_page(page)), pages[-1]) if pages else None
+                        if chosen is not None:
                             try:
                                 self.tick(chosen)
                                 chosen.wait_for_timeout(100)
@@ -289,6 +329,25 @@ class BrowserRemote:
                 failed('BROWSER_PREVIEW_INTERRUPTED', '浏览器预览连接已中断，请等待官网窗口恢复；未发送等待中的输入。')
         self.controller = threading.Thread(target=control, daemon=True)
         self.controller.start()
+
+    def _matches_target(self, page):
+        if self.bound_target_id is None:
+            return True
+        if page not in self.target_ids:
+            try:
+                self.target_ids[page] = browser_page_target(page)
+            except Exception:
+                return False
+        return self.target_ids[page] == self.bound_target_id
+
+    def _reject_pending(self):
+        while True:
+            try:
+                command = self.commands.get_nowait()
+            except queue.Empty:
+                return
+            command['payload'].clear()
+            command['finished'].set()
 
     def pump(self, page):
         if self.controller is None:
@@ -409,10 +468,11 @@ class BrowserRemote:
     def tick(self, page):
         """Only the owning Playwright thread may call CDP or browser input."""
         self.service.channel.checkpoint()
-        permitted = self.allowed_page(page)
+        permitted = self._matches_target(page) and self.allowed_page(page)
         if not permitted:
             with self.changed:
                 if self.frame or self.connected:
+                    self.page = None
                     self._clear_page()
         elif self.page is not page or self.session is None or self.navigation_pending:
             self._start_stream(page)
@@ -490,11 +550,16 @@ class BrowserRemote:
 
 
 @contextmanager
-def remote_context(service, port):
+def remote_context(service, port, *, page=None, target_id=None):
     if (service is None or not isinstance(getattr(service, 'task_dir', None), Path)
             or not isinstance(getattr(getattr(service, 'channel', None), 'task_id', None), str)):
         yield None
         return
+    if page is not None:
+        page_target = browser_page_target(page)
+        if target_id is not None and target_id != page_target:
+            raise ValueError('当前任务浏览器页面归属不匹配。')
+        target_id = page_target
     with BrowserRemote(service) as remote:
-        remote.attach_cdp(port)
+        remote.attach_cdp(port, target_id=target_id)
         yield remote

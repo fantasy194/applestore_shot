@@ -242,7 +242,7 @@ class AppleStoreLogin:
         if (profile / ".authx-541").exists():
             # A 541 does not prove that deleting a trusted browser will help.
             # Preserve its complete identity and recover through official UI.
-            if os.path.lexists(profile / "SingletonLock"):
+            if not os.environ.get('DUO_BROWSER_SOCKET') and os.path.lexists(profile / "SingletonLock"):
                 raise LoginError("该账号的专用 Chrome 配置仍有进程锁，请先关闭该浏览器后重试。")
             print("上次商城回调返回 541，继续使用原浏览器资料；可在官网窗口完成会话恢复。")
         profile.mkdir(mode=0o700, exist_ok=True)
@@ -253,7 +253,7 @@ class AppleStoreLogin:
         from browser_cdp import BrowserConnectError, connect_browser
         started = time.monotonic()
         headless = getattr(interaction.handler, 'headless_browser', False) is True
-        log.info("[浏览器上下文] 开始初始化（%s）", '后台无头' if headless else '可见窗口')
+        log.info("[浏览器上下文] 开始初始化（%s）", '后台' if headless else '可见窗口')
         profile_root = self.browser_profile.parent
         # 正常启动与旧自动化启动使用不同配置，保留旧目录但不继承其状态。
         try:
@@ -276,22 +276,24 @@ class AppleStoreLogin:
                 "--remote-debugging-port=" + str(port), "--remote-debugging-address=127.0.0.1",
                 "--restore-last-session", "--no-first-run", "--no-default-browser-check",
                 "--window-size=500,640"]
-        if headless:
-            args.append("--headless=new")
+        if headless and os.name == 'nt':
+            args.append('--start-minimized')
         if proxy_url:
             parsed = urlsplit(proxy_url)
             if parsed.username or parsed.password:
                 raise LoginError("自动获取上下文暂不支持需要账号密码的代理，请使用本机无认证代理。")
             args.append("--proxy-server=" + proxy_url)
-        print(f"{'后台无头启动' if headless else '正常启动'} Chrome，使用专用配置：{profile}。自动获取上下文后关闭并保留浏览器数据。")
+        print(f"{'后台启动' if headless else '正常启动'} Chrome，使用专用配置：{profile}。操作结束后保留浏览器资料。")
         launch = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
         if headless and os.name == 'nt':
             launch['creationflags'] = subprocess.CREATE_NO_WINDOW
         from browser_process import launch_browser
         process = launch_browser(args, **launch)
         browser = None
+        page = None
+        retained = getattr(process, 'persistent', False) is True and callable(getattr(process, 'release', None))
         try:
-            interaction.report_stage("正在后台获取浏览器上下文（无头）" if headless else "正在获取浏览器上下文", browser_pid=process.pid)
+            interaction.report_stage("正在后台获取浏览器上下文" if headless else "正在获取浏览器上下文", browser_pid=process.pid)
             with sync_playwright() as playwright:
                 try:
                     browser = connect_browser(playwright.chromium, process, port,
@@ -301,41 +303,45 @@ class AppleStoreLogin:
                     failure.code = error.code
                     raise failure from None
                 from browser_remote import remote_context
-                with (nullcontext(None) if headless else remote_context(interaction.handler, port)) as remote:
+                context = browser.contexts[0]
+                page = context.new_page()
+                with (nullcontext(None) if headless else remote_context(interaction.handler, port, page=page)) as remote:
                     try:
                         context = browser.contexts[0]
                         from browser_login import pending_auth_page, trust_browser_if_offered, observe_login_network, headless_auth_required, BrowserSessionError
-                        network = observe_login_network(context, interaction.handler)
+                        network = observe_login_network(context, interaction.handler, page=page)
                         from browser_signin import BrowserSigninAssistant, step_browser_signin
-                        assistant = (BrowserSigninAssistant(interaction.handler) if
-                                     not headless and interaction.handler is not None else None)
-                        # Do not navigate a restored verification/trust page away.
-                        preserve_auth = any(pending_auth_page(opened) for opened in context.pages)
-                        if headless and preserve_auth:
-                            raise headless_auth_required()
-                        page = context.new_page() if preserve_auth else context.pages[0] if context.pages else context.new_page()
+                        assistant = (BrowserSigninAssistant(interaction.handler, headless=headless, automatic=True)
+                                     if interaction.handler is not None else None)
                         # 两个页面仍完成正常加载；Cookie 就绪后立即继续，不固定等待十秒。
                         for url in (HOME, HOME + "shop/bag"):
                             if headless and interaction.handler is not None:
                                 interaction.handler.channel.checkpoint()
                             reply = page.goto(url, wait_until="domcontentloaded", timeout=45000)
                             if reply is None or reply.status >= 400:
-                                if headless and reply is not None and reply.status in (403, 429, 541):
+                                if reply is not None and reply.status in (403, 429, 541):
                                     raise BrowserSessionError('APPLE_SESSION_BLOCKED',
-                                        '后台无头预热被官网限制，请在官网登录窗口恢复；未自动重试。',
+                                        '官网拒绝了当前请求；账号资料已保留，本次未重复提交。',
                                         status='blocked', requires_login=True, http_status=reply.status,
                                         browser_started=True, browser_connected=True)
                                 raise LoginError("Chrome 未能正常打开官网页面，未更新上下文。")
-                            if headless and pending_auth_page(page):
-                                raise headless_auth_required()
+                            if pending_auth_page(page):
+                                break
                         attempts, maximum, auth_seen, settled = 0, 80, False, None
                         while attempts < maximum:
                             attempts += 1
+                            network['refresh']()
+                            if network.get('authentication_failed'):
+                                if network.get('credential_rejected') and interaction.handler is not None:
+                                    interaction.handler.reject_password()
+                                raise BrowserSessionError('BROWSER_LOGIN_AUTHENTICATION_FAILED' if network.get('credential_rejected') else 'BROWSER_LOGIN_REJECTED',
+                                    '官网未接受当前认证；未重复提交。', status='requires_login', requires_login=True,
+                                    browser_started=True, browser_connected=True)
                             if headless and interaction.handler is not None:
                                 interaction.handler.channel.checkpoint()
                             if remote is not None:
                                 remote.pump(page)
-                            opened = [p for owned in browser.contexts for p in owned.pages]
+                            opened = [page]
                             if assistant is not None:
                                 assistant.process_remote_request(remote)
                                 outcome = None
@@ -346,21 +352,20 @@ class AppleStoreLogin:
                                         try:
                                             outcome = step_browser_signin(assistant, opened_page, network, remote)
                                         except BrowserSessionError as error:
-                                            if error.code not in ('BROWSER_LOGIN_INPUT_INTERRUPTED', 'HEADLESS_LOGIN_REQUIRES_ATTENTION'):
+                                            if headless or error.code not in ('BROWSER_LOGIN_INPUT_INTERRUPTED', 'HEADLESS_LOGIN_REQUIRES_ATTENTION'):
                                                 raise
                                             assistant.interrupted = True
                                             interaction.report_stage('官网自动填写已停止，可使用现有凭证继续或在官网手动操作')
                                         break
                                 assistant.publish_remote_status(remote, outcome)
-                            trust_pending = any(trust_browser_if_offered(p, accept=False) if headless
-                                                else trust_browser_if_offered(p, remote=remote) for p in opened)
+                            trust_pending = any(trust_browser_if_offered(p, remote=remote) for p in opened)
                             auth_pending = any(pending_auth_page(p) for p in opened)
-                            if headless and network.get('blocked_status') in (403, 429, 541):
+                            if network.get('blocked_status') in (403, 429, 541):
                                 raise BrowserSessionError('APPLE_SESSION_BLOCKED',
-                                    '后台无头预热被官网限制，请在官网登录窗口恢复；未自动重试。',
+                                    '官网拒绝了当前认证；账号资料已保留，本次未重复提交。',
                                     status='blocked', requires_login=True, http_status=network['blocked_status'],
                                     browser_started=True, browser_connected=True)
-                            if headless and (trust_pending or auth_pending):
+                            if assistant is None and (trust_pending or auth_pending):
                                 raise headless_auth_required()
                             if trust_pending or auth_pending or network['pending'] or network['error']:
                                 auth_seen, maximum, settled = True, 600, None
@@ -385,22 +390,28 @@ class AppleStoreLogin:
                         # 关闭专用配置中本次及历史恢复的标签页，避免下次启动继续累积。
                         # 保留 restore-last-session，让 Chrome 继续持久保存会话 Cookie。
                         for owned_context in browser.contexts:
-                            for opened_page in list(owned_context.pages):
+                            for opened_page in ([page] if retained else list(owned_context.pages)):
                                 try:
                                     opened_page.close()
                                 except BrowserError:
                                     pass
                         try:
-                            browser.new_browser_cdp_session().send("Browser.close")
+                            if retained:
+                                browser.close()
+                            else:
+                                browser.new_browser_cdp_session().send("Browser.close")
                         except BrowserError:
                             pass
         except BrowserError:
             raise LoginError("Chrome 初始化失败，请检查网络/代理及专用浏览器配置。") from None
         finally:
-            if headless and browser is None and process.poll() is None:
+            if retained:
+                process.release()
+            elif headless and browser is None and process.poll() is None:
                 process.terminate()
             try:
-                process.wait(timeout=10)
+                if not retained:
+                    process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.terminate()
                 try:
@@ -408,7 +419,7 @@ class AppleStoreLogin:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-            interaction.report_stage("浏览器已关闭", browser_pid=None)
+            interaction.report_stage("官网浏览器操作已结束", browser_pid=None)
         # 成功采集后整组替换旧非认证上下文，不拼接两次会话中的 Cookie。
         for cookie in list(self.session.cookies):
             if (cookie.domain.lstrip(".") in ("apple.com.cn", "www.apple.com.cn")

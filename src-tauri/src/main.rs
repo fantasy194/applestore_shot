@@ -188,9 +188,10 @@ fn main() {
                 api.prevent_exit();
                 let app = app.clone();
                 let engine = app.state::<Arc<Engine>>().inner().clone();
+                let shutdown_host = app.state::<TaskHost>().inner().clone();
                 tauri::async_runtime::spawn(async move {
                     session_maintenance::stop(&engine.root);
-                    engine.shutdown().await;
+                    engine.shutdown_with_host(&shutdown_host).await;
                     activity::stop(&engine.root).await;
                     app.exit(0);
                 });

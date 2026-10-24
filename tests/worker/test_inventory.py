@@ -91,6 +91,15 @@ class InventoryTests(unittest.TestCase):
         for display in ('unavailable', 'ineligible'):
             self.assertEqual(stock_for_target(target(), parse_stores(stores(display)))['status'], 'unavailable')
 
+    def test_tomorrow_pickup_is_available_without_today_text(self):
+        body = stores()
+        part = body['body']['stores'][0]['partsAvailability']['MLH74FE/A']
+        part['pickupSearchQuote']['storePickupQuote'] = '明天可取货'
+        result = stock_for_target(target(), parse_stores(body))
+        self.assertEqual(result['status'], 'available')
+        part['pickupDisplay'] = None
+        self.assertEqual(stock_for_target(target(), parse_stores(body))['status'], 'unknown')
+
     def test_read_and_save_redact_secrets_and_preserve_blanks(self):
         raw = {'targets': [target()], 'proxy': {'enabled': True, 'providers': [
             {'id': 'dm', 'kind': 'dmdaili', 'extract_url': 'http://api.dmdaili.com/dmgetip.asp?apikey=SECRET&pwd=PRIVATE',

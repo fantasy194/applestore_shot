@@ -319,15 +319,15 @@ export function PurchaseQueue({
                 下单失败记录实际原因，并按目标设置的次数重试；自动登录失败会结束本次任务，提交结果未知时先查询订单核实。
               </p>
               <p className="muted">
-                默认逐个执行，可同时执行 1–10
-                个任务。修改策略前，请暂停队列并等待执行中的任务结束。
+                默认逐个执行，也可允许不同账号同时执行1–10个任务；同账号顺序执行。
+                修改策略前，请暂停队列并等待执行中的任务结束。
               </p>
               <p className="muted">
                 下单执行名额：
                 {state?.reserved_child_slots ??
                   state?.reserved_slots ??
                   0} / {state?.child_capacity ?? 10}
-                ；按每个任务的下单路数占用，名额不足时继续排队。
+                ；每个账号的下单任务占用1个名额，名额不足时继续排队。
               </p>
               <button
                 type="submit"
@@ -483,8 +483,10 @@ export function PurchaseQueue({
                   <QueueJobTimes job={job} />
                   <div className="queue-job-meta">
                     <span>
-                      {accountName(job.account_id)} · 每路 {job.quantity} 件 ·{" "}
-                      {job.concurrency ?? 1} 路
+                      {accountName(job.account_id)} · {job.quantity} 件 ·{" "}
+                      {terminal(job.status)
+                        ? `${job.result?.effective_concurrency ?? job.concurrency ?? 1} 路`
+                        : "同账号顺序执行"}
                     </span>
                   </div>
                   {(pending || unknown) && (

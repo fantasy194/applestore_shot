@@ -14,18 +14,7 @@ import {
 } from "./inventory-api";
 
 type PreferredStore = { store_id: string; store_name: string; search: string };
-type TimeRule = {
-  mode: "earliest" | "latest" | "window";
-  start: string;
-  end: string;
-  fallback: "earliest" | "stop";
-};
-const earliest = (): TimeRule => ({
-  mode: "earliest",
-  start: "09:00",
-  end: "21:00",
-  fallback: "stop",
-});
+const earliestTimeRule = { mode: "earliest", fallback: "earliest" } as const;
 
 export function PickupForm({
   account,
@@ -51,7 +40,6 @@ export function PickupForm({
     "priority",
   );
   const [stores, setStores] = useState<PreferredStore[]>([]);
-  const [rule, setRule] = useState<TimeRule>(earliest);
   const [contactMode, setContactMode] = useState<"local" | "official">("local");
   const [contact, setContact] = useState<Data>({ emailAddress: account.email });
   const [contactTouched, setContactTouched] = useState(false);
@@ -92,7 +80,6 @@ export function PickupForm({
             ]
           : [],
     );
-    setRule({ ...earliest(), ...prior.time_slot_rule });
     setContactMode(prior.contact_mode === "official" ? "official" : "local");
     setContact({ emailAddress: account.email, ...config.contact });
     setContactTouched(false);
@@ -121,13 +108,6 @@ export function PickupForm({
       (!pickup.search.trim() || !pickup.store_name.trim())
     )
       throw new Error("请填写固定门店与搜索城市或邮编。");
-    if (
-      rule.mode === "window" &&
-      (!/^\d{2}:\d{2}$/.test(rule.start) ||
-        !/^\d{2}:\d{2}$/.test(rule.end) ||
-        rule.start >= rule.end)
-    )
-      throw new Error("请填写开始时间早于结束时间的有效时段。");
     const anchor = selectedStores[0];
     const policy: Data = {
       ...pickup,
@@ -137,7 +117,7 @@ export function PickupForm({
         : stores.length
           ? { stores }
           : {}),
-      time_slot_rule: { ...rule },
+      time_slot_rule: { ...earliestTimeRule },
       contact_mode: contactMode,
     };
     if (selectionMode === "priority" && anchor)
@@ -209,7 +189,7 @@ export function PickupForm({
         };
         if (existing)
           Object.assign(existing, details, {
-            concurrency: existing.concurrency ?? 1,
+            concurrency: 1,
             retry_count: existing.retry_count ?? 0,
           });
         else
@@ -276,7 +256,7 @@ export function PickupForm({
         <span>门店与时段偏好</span>
       </div>
       <p className="muted">
-        固定单店保留原有下单方式；预选多店时，按下方顺序选择本次实际有货且符合时段规则的门店。官网要求的联系人字段和验证仍须完成。
+        预选多店按下方顺序选择本次有货且有有效自提时段的门店。所有下单入口统一选择官网最早有效时段，官网要求的联系人字段和验证仍须完成。
       </p>
       <SelectField
         label="门店选择方式"
@@ -306,7 +286,7 @@ export function PickupForm({
         <div aria-label="预选自提门店顺序">
           {!stores.length && (
             <p className="muted">
-              从官网多选门店后添加。门店顺序优先，再按该店的时段规则选择。
+              从官网多选门店后添加。先按门店顺序，再选择该店今天起7个自然日内的官网最早有效时段。
             </p>
           )}
           {stores.map((store, index) => (
@@ -400,63 +380,17 @@ export function PickupForm({
             已选择官网门店：{pickup.store_name} · {pickup.store_id}
           </p>
         )}
-        <div className="schedule-fields">
-          <SelectField
-            label="自提时段规则"
-            disabled={disabled}
-            value={rule.mode}
-            onChange={(value) =>
-              setRule({ ...rule, mode: value as TimeRule["mode"] })
-            }
-            options={[
-              { value: "earliest", label: "最早可用日期与时段" },
-              { value: "latest", label: "最晚可用日期与时段" },
-              { value: "window", label: "指定时间窗口" },
-            ]}
-          />
-          {rule.mode === "window" && (
-            <>
-              <label>
-                可接受开始时间
-                <input
-                  type="time"
-                  required
-                  disabled={disabled}
-                  value={rule.start}
-                  onChange={(event) =>
-                    setRule({ ...rule, start: event.target.value })
-                  }
-                />
-              </label>
-              <label>
-                可接受结束时间
-                <input
-                  type="time"
-                  required
-                  disabled={disabled}
-                  value={rule.end}
-                  onChange={(event) =>
-                    setRule({ ...rule, end: event.target.value })
-                  }
-                />
-              </label>
-              <SelectField
-                label="无匹配时段"
-                disabled={disabled}
-                value={rule.fallback}
-                onChange={(value) =>
-                  setRule({ ...rule, fallback: value as TimeRule["fallback"] })
-                }
-                options={[
-                  {
-                    value: "stop",
-                    label: "尝试下一预选门店，全部无匹配时停止",
-                  },
-                  { value: "earliest", label: "接受当前优先门店窗外最早时段" },
-                ]}
-              />
-            </>
-          )}
+        <div
+          className="pickup-time-policy"
+          role="note"
+          aria-label="自提时段规则"
+        >
+          <p>
+            <strong>今天起7个自然日内最早有效自提时段</strong>
+          </p>
+          <p className="muted">
+            包含今天及随后6天，支持明天或以后取货。按官网实际可选日期和时间选择最早有效时段；预选多店时，当前门店没有有效时段会尝试下一家。
+          </p>
         </div>
         <SelectField
           label="取货联系人来源"
@@ -471,7 +405,7 @@ export function PickupForm({
         <details open={contactMode === "local"}>
           <DisclosureSummary>本地取货联系人（可选补充）</DisclosureSummary>
           <p className="muted">
-            可先保存门店与时段偏好。使用官网联系人时优先读取本次结账已有资料，本地资料仅作补充。
+            可先保存门店与取货联系人。使用官网联系人时优先读取本次结账已有资料，本地资料仅作补充。
           </p>
           <div className="address-fields">
             <label>
@@ -533,9 +467,8 @@ export function PickupForm({
         </div>
       </form>
       <p className="muted">
-        自动监控使用本账号预设商品 {sku} · 每路 {account.preset_quantity || 1}{" "}
-        件。新增监控默认 1 路、失败重试 0
-        次。已有监控不中断，其他配置与目标保留；同组按预选顺序择一抢购。
+        自动监控使用本账号预设商品 {sku} · 每次 {account.preset_quantity || 1}{" "}
+        件，同账号顺序执行，每次1路。新增监控失败重试默认0次。已有监控不中断，其他配置与目标保留；同组按预选顺序择一抢购。
       </p>
     </section>
   );

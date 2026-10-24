@@ -595,6 +595,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if !development {
         app = app.fallback_service(ServeDir::new(web_root));
     }
+    let shutdown_host = state.host.clone();
+    let failure_shutdown_host = shutdown_host.clone();
     let app = app
         .layer(DefaultBodyLimit::max(1_048_576))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -624,13 +626,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! { _ = shutdown_signal() => {}, _ = parent_closed => {}, _ = requested_shutdown.changed() => {} }
             let _ = shutdown.send(true);
             session_maintenance::stop(&shutdown_engine.root);
-            shutdown_engine.shutdown().await;
+            shutdown_engine.shutdown_with_host(&shutdown_host).await;
             activity::stop(&shutdown_engine.root).await;
         })
         .await;
     if result.is_err() {
         session_maintenance::stop(&engine.root);
-        engine.shutdown().await;
+        engine.shutdown_with_host(&failure_shutdown_host).await;
     }
     activity::stop(&engine.root).await;
     push.stop().await;

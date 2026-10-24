@@ -42,13 +42,25 @@ def main():
         from push_service import main as push_main
         push_main()
         return
+    if '--shutdown-browser-host' in sys.argv[1:]:
+        from browser_process import shutdown_browser_host
+        shutdown_browser_host()
+        return
     # Local removal only: reuse the OS vault without starting a login task.
     if '--forget-account' in sys.argv[1:]:
         parser = argparse.ArgumentParser()
         parser.add_argument('--forget-account', required=True, type=uuid.UUID)
+        parser.add_argument('--data-dir')
         args = parser.parse_args()
         if args.forget_account.int == 0:
             parser.error('不能移除通用预设。')
+        if os.environ.get('DUO_BROWSER_SOCKET'):
+            if not args.data_dir:
+                parser.error('移除浏览器账号需要应用数据目录。')
+            from apple_login import browser_profile_path
+            from browser_process import close_profile
+            auth=Path(args.data_dir).resolve()/'accounts'/str(args.forget_account)/'auth.json'
+            close_profile(browser_profile_path(auth))
         from credentials import Vault
         Vault().delete(str(args.forget_account))
         return
@@ -111,12 +123,17 @@ def main():
             credential = None
             service.enable_logging()
             result = service.run(request['action'], request.get('params', {}))
+            service.finish_prepared_handoff(result)
             channel.emit('result', result=result)
     except Cancelled:
+        if service:
+            service.finish_prepared_handoff(cancelled=True)
         channel.emit('cancelled', message='任务已取消。',
                      order_submitted=bool(service and service.submitted))
     except Exception as exc:
         error = exc
+        if service:
+            service.finish_prepared_handoff(error=exc)
         # Never include requests' exception URLs, headers, or a traceback with locals.
         import requests
         message = '网络请求失败，请检查网络或系统代理。' if isinstance(exc, requests.RequestException) else str(exc)

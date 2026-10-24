@@ -16,6 +16,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[path = "prepared_handoff.rs"]
+mod prepared_handoff;
+pub(crate) use prepared_handoff::waiting_preparation;
 #[path = "purchase_queue.rs"]
 mod purchase_queue;
 #[path = "workspace_feed.rs"]
@@ -195,6 +198,8 @@ pub struct Task {
     pub action: String,
     #[serde(default)]
     pub warm_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_handoff: Option<Value>,
     pub status: String,
     pub stage: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,7 +534,7 @@ impl Engine {
         let _reservation = self.reserve_removal(id)?;
         // Use the same OS vault as login; no Apple requests or credentials on stdout.
         let mut command = host.command()?;
-        command.arg("--forget-account").arg(id)
+        command.arg("--forget-account").arg(id).arg("--data-dir").arg(&self.root)
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .kill_on_drop(true);
         #[cfg(windows)] command.creation_flags(0x08000000);
@@ -738,12 +743,19 @@ impl Engine {
         {
             return Err("请先完成账号添加与登录验证".into());
         }
+        if action == "purchase" && params["prepare_only"]!=true && schedule.is_none() {
+            if self.tasks.lock().unwrap().values().any(|task| task.account_id==account_id && task.schedule.is_some() && !terminal(&task.status)) {
+                return Err("该账号已有定时抢购，请先取消原定时任务，避免重复下单".into());
+            }
+            if let Some(id) = self.try_claim_prepared(&app, &account_id, &params, None)? { return Ok(id); }
+        }
         let mut tasks = self.tasks.lock().unwrap();
         if params["queue_stream"]==true && (
-            tasks.values().any(|task|task.account_id==account_id && (!terminal(&task.status)
+            tasks.values().any(|task|task.account_id==account_id && (!terminal(&task.status) && !is_preemptible_preheat(task)
                 || task.order_submitted && task.result.as_ref().is_none_or(purchase_queue::contains_unknown)
                 || task.queue_job_ids.is_empty() && unresolved_submission(task,&tasks)))
-            || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock|lock.available_permits()==0)) {
+            || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock|lock.available_permits()==0)
+                && !tasks.values().any(|task| task.account_id==account_id && !terminal(&task.status) && is_preemptible_preheat(task))) {
             return Err("账号有进行中的任务或待核实订单，目标保留在下单队列中".into());
         }
         if action == "session_maintain" && (
@@ -808,6 +820,7 @@ impl Engine {
                 account_id: account_id.clone(),
                 action: action.clone(),
                 warm_only: action=="login" && params["warm_only"]==true,
+                prepared_handoff: None,
                 status: if schedule.is_some() { "scheduled" } else { "queued" }.into(),
                 stage: if schedule.is_some() { "等待定时触发；电脑须保持唤醒，本地服务须保持运行" } else { "等待执行" }.into(),
                 created_at: now(),
@@ -933,7 +946,13 @@ impl Engine {
         // Only serialize work for this account; other accounts run independently.
         let result: Result<(), String> = async {
             let schedule = self.tasks.lock().unwrap().get(&id).and_then(|t| t.schedule.clone());
-            if let Some(s) = &schedule { wait_for_schedule(s.at_ms, &mut cancel).await?; }
+            if let Some(s) = &schedule {
+                wait_for_schedule(s.at_ms, &mut cancel).await?;
+                check_schedule_lateness(s.at_ms, now_ms())?;
+                if let Some(prepared) = self.try_claim_prepared(&app, &account.id, &params, Some(&id))? {
+                    return self.follow_prepared_handoff(&app, &id, &prepared, &mut cancel).await;
+                }
+            }
             let _account = if inventory_action(&action) {
                 // Anonymous monitoring has its own transport and must not block local settings/discovery.
                 if *cancel.borrow() { return Err("cancelled".into()) }
@@ -1034,7 +1053,7 @@ impl Engine {
                             self.sync_account_identity(&account.id, &event["result"], action == "enroll")?;
                         }
                         if kind=="result" && action=="inventory_settings_save" && event["result"]["success"]==true {
-                            self.queue_inventory_settings_changed();
+                            self.queue_inventory_settings_changed(Some(&event["result"]["config"]));
                         }
                         if kind == "error" && event["account_invalid"] == true && event["order_submitted"] != true
                             && self.remove_invalid_account(&account.id, &id)? {
@@ -1046,7 +1065,8 @@ impl Engine {
                         if event.get("browser_pid").is_some() {
                             if let Some(control) = self.controls.lock().unwrap().get_mut(&id) { control.browser_pid = event["browser_pid"].as_u64().map(|n| n as u32); }
                         }
-                        self.apply_worker_event(&app, &account.id, &id, &event, params["queue_stream"] == true);
+                        let queue_bound = params["queue_stream"] == true || self.tasks.lock().unwrap().get(&id).is_some_and(|task| !task.queue_job_ids.is_empty());
+                        self.apply_worker_event(&app, &account.id, &id, &event, queue_bound);
                         if matches!(kind.as_str(), "result" | "error" | "cancelled") { completed = true; }
                     }
                 }
@@ -1079,7 +1099,7 @@ impl Engine {
             });
         }
         self.controls.lock().unwrap().remove(&id);
-        if params["queue_stream"] == true { self.queue_worker_ended(&account.id, &id); }
+        if params["queue_stream"] == true || self.tasks.lock().unwrap().get(&id).is_some_and(|task| !task.queue_job_ids.is_empty()) { self.queue_worker_ended(&account.id, &id); }
     }
     pub async fn shutdown(&self) {
         self.queue_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1101,6 +1121,21 @@ impl Engine {
             .collect();
         for pid in pids {
             stop_process(pid).await;
+        }
+    }
+    pub async fn shutdown_with_host(&self, host: &TaskHost) {
+        self.shutdown().await;
+        if std::env::var_os("DUO_BROWSER_SOCKET").is_none() { return; }
+        let Ok(mut command) = host.command() else {
+            eprintln!("无法启动浏览器宿主退出清理；浏览器资料已保留");
+            return;
+        };
+        command.arg("--shutdown-browser-host").stdin(Stdio::null())
+            .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        #[cfg(windows)] command.creation_flags(0x08000000);
+        match tokio::time::timeout(std::time::Duration::from_secs(30), command.status()).await {
+            Ok(Ok(status)) if status.success() => {},
+            _ => eprintln!("浏览器宿主退出清理未完成；浏览器资料已保留"),
         }
     }
 }
@@ -1285,6 +1320,7 @@ mod tests {
             account_id: "a".into(),
             action: "login".into(),
             warm_only: false,
+            prepared_handoff: None,
             status: "waiting".into(),
             stage: "".into(),
             created_at: 0,

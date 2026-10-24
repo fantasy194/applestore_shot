@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from contextlib import nullcontext
 from unittest.mock import patch
 
-from browser_remote import BrowserRemote
+from browser_remote import BrowserRemote, remote_context
 from browser_cdp import BrowserConnectError
 from protocol import Cancelled
 from protocol import Channel
@@ -52,6 +52,71 @@ class BrowserRemoteTests(unittest.TestCase):
             response = error
         with response:
             return response.status, json.load(response)
+
+    def test_bound_controller_never_selects_an_old_login_tab(self):
+        old = Mock(url='https://idmsa.apple.com/auth/old-task')
+        browser = Mock(contexts=[SimpleNamespace(pages=[self.page, old])])
+        browser.is_connected.return_value = True
+        with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \
+                patch('browser_remote.connect_browser', return_value=browser), \
+                patch('browser_remote.browser_page_target', side_effect=lambda page: 'current' if page is self.page else 'old'):
+            with BrowserRemote(self.service) as broker:
+                broker.tick = Mock(side_effect=Cancelled())
+                broker.attach_cdp(12345, target_id='current')
+                broker.controller.join(timeout=2)
+                self.assertFalse(broker.controller.is_alive())
+                broker.tick.assert_called_once_with(self.page)
+                old.mouse.click.assert_not_called()
+
+    def test_bound_tab_close_rejects_queued_input_and_does_not_fall_back_to_old_tab(self):
+        old = Mock(url='https://idmsa.apple.com/auth/old-task')
+        browser = Mock(contexts=[SimpleNamespace(pages=[old])])
+        browser.is_connected.return_value = True
+        browser.new_browser_cdp_session.return_value.send.return_value = {'targetInfos': [{'targetId': 'old'}]}
+        with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \
+                patch('browser_remote.connect_browser', return_value=browser), \
+                patch('browser_remote.browser_page_target', return_value='old'):
+            with BrowserRemote(self.service) as broker:
+                command = {'payload': {'type': 'text', 'text': 'fixture-only'},
+                           'finished': threading.Event(), 'accepted': False}
+                broker.commands.put(command)
+                broker.tick = Mock()
+                broker.attach_cdp(12345, target_id='current')
+                broker.controller.join(timeout=2)
+                self.assertFalse(broker.active)
+                self.assertEqual(broker.error_code, 'BROWSER_PREVIEW_CLOSED')
+                self.assertTrue(command['finished'].is_set())
+                self.assertFalse(command['payload'])
+                self.assertFalse(command['accepted'])
+                broker.tick.assert_not_called()
+
+    def test_owner_thread_page_binding_passes_only_the_opaque_target_to_controller(self):
+        remote = Mock()
+        with patch('browser_remote.browser_page_target', return_value='current') as target, \
+                patch('browser_remote.BrowserRemote', return_value=nullcontext(remote)):
+            with remote_context(self.service, 12345, page=self.page) as actual:
+                self.assertIs(actual, remote)
+            target.assert_called_once_with(self.page)
+            remote.attach_cdp.assert_called_once_with(12345, target_id='current')
+
+    def test_bound_tick_cannot_preview_or_type_into_a_different_target(self):
+        old = Mock(url='https://idmsa.apple.com/auth/old-task')
+        with BrowserRemote(self.service) as broker:
+            broker.bound_target_id = 'current'
+            broker.target_ids = {self.page: 'current', old: 'old'}
+            broker.tick(self.page)
+            sequence = broker.sequence
+            command = {'payload': {'type': 'click', 'x': 40, 'y': 50, 'sequence': sequence},
+                       'deadline': time.monotonic() + 3, 'finished': threading.Event(), 'accepted': False}
+            broker.commands.put(command)
+            broker.tick(old)
+            self.assertIsNone(broker.frame)
+            self.assertTrue(command['finished'].is_set())
+            self.assertFalse(command['accepted'])
+            old.mouse.click.assert_not_called()
+            # A late frame from the prior generation cannot restore a cleared frame.
+            self.emit()
+            self.assertIsNone(broker.frame)
 
     def test_failed_cdp_attachment_returns_inactive_safe_reason_and_rejects_input(self):
         with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \

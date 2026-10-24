@@ -36,7 +36,7 @@ if mode == 'pickup_policy':
     assert params['pickup_policy'] == {'selection_mode':'priority',
         'stores':[{'store_id':'R002','store_name':'测试门店 R002','search':'200000'},
                   {'store_id':'R001','store_name':'测试门店 R001','search':'200000'}],
-        'time_slot_rule':{'mode':'window','start':'09:00','end':'12:00','fallback':'stop'},
+        'time_slot_rule':{'mode':'earliest','fallback':'earliest'},
         'contact_mode':'official'}
 assert not (root / 'prepared_checkout.json').exists()
 assert not (root / 'warm_empty_bag.json').exists()
@@ -361,7 +361,7 @@ class ParallelPurchaseTests(unittest.TestCase):
         policy={'selection_mode':'priority','stores':[
             {'store_id':'R002','store_name':'测试门店 R002','search':'200000'},
             {'store_id':'R001','store_name':'测试门店 R001','search':'200000'}],
-            'time_slot_rule':{'mode':'window','start':'09:00','end':'12:00','fallback':'stop'},
+            'time_slot_rule':{'mode':'earliest','fallback':'earliest'},
             'contact_mode':'official'}
         params={'fulfillment':'RETAIL','sku':'MLH74FE','quantity':1,'concurrency':2,
                 'queue_job_id':'fixture-pool','fixture_mode':'pickup_policy','pickup_policy':policy}
@@ -400,38 +400,28 @@ class ParallelPurchaseTests(unittest.TestCase):
         self.assertNotIn('qr_data', manifest)
         self.assertEqual(json.loads(manifest)['status'], 'parallel_complete')
 
-    def test_actual_service_tail_accepts_batch_and_retains_each_order_marker(self):
+    def test_actual_service_tail_uses_single_account_checkout_and_retains_order_marker(self):
         from service import Service
         import duo_killer as shop
         import alipay_qr
-        with patch.object(shop, 'ROOT', shop.ROOT), \
-                patch.object(shop, 'AUTH_PATH', shop.AUTH_PATH), \
-                patch.object(shop, 'LOG_PATH', shop.LOG_PATH), \
-                patch.object(shop, 'PAYMENT_ROOT', shop.PAYMENT_ROOT), \
-                patch.object(alipay_qr, 'ROOT', alipay_qr.ROOT), \
-                patch('interaction.handler'), \
-                patch('pickup_options.validate_preset', return_value={}), \
-                patch('checkout_options.read_config', return_value={}), \
-                patch('service.Service.prepare_purchase_session'), \
-                patch('parallel_checkout._worker_command',
-                      return_value=[sys.executable, str(self.script)]):
-            service = Service(self.channel, self.root, self.task_dir,
-                              'fixture@example.test', vault=Mock())
-            service.check_account = Mock(return_value={'logged_in':True})
-            result = service.run('purchase', {'fulfillment':'RETAIL','sku':'MLH74FE',
-                                             'quantity':1,'concurrency':3,
-                                             'fixture_test_marker':True})
-        self.assertEqual(result['status'], 'parallel_complete')
-        self.assertNotIn('qr_image', result)
-        self.assertEqual(len(result['pending_orders']), 3)
-        for entry in result['attempts']:
-            path = self.root / 'tasks' / entry['task_id'] / 'test_order_submission.json'
-            marker = json.loads(path.read_text())
-            self.assertEqual(marker['task_id'], entry['task_id'])
-            self.assertEqual(marker['order_number'], entry['result']['order_number'])
-        self.assertFalse((self.root / 'test_order_submission.json').exists(),
-                         'batch must not collapse distinct orders into one root marker')
-        self.assertFalse((self.root / 'order_submission.json').exists())
+        def checkout(*args,**kwargs):
+            owner.submitted=True
+            return {'success':True,'status':'pending_payment','order_number':'W12345678'}
+        with patch.object(shop,'ROOT',shop.ROOT),patch.object(shop,'AUTH_PATH',shop.AUTH_PATH), \
+             patch.object(shop,'LOG_PATH',shop.LOG_PATH),patch.object(shop,'PAYMENT_ROOT',shop.PAYMENT_ROOT), \
+             patch.object(alipay_qr,'ROOT',alipay_qr.ROOT),patch('interaction.handler'), \
+             patch('pickup_options.validate_preset',return_value={}), \
+             patch('checkout_options.read_config',return_value={}), \
+             patch('service.Service.prepare_purchase_session'),patch('duo_killer.purchase_sku',side_effect=checkout) as purchase, \
+             patch('parallel_checkout.run_parallel_purchase',side_effect=AssertionError('single account owner required')):
+            owner=Service(self.channel,self.root,self.task_dir,'fixture@example.test',vault=Mock())
+            result=owner.run('purchase',{'fulfillment':'RETAIL','sku':'MLH74FE','quantity':1,'concurrency':3,'fixture_test_marker':True})
+        purchase.assert_called_once_with('MLH74FE',quantity=1)
+        self.assertEqual(result['status'],'pending_payment')
+        self.assertEqual(result['requested_concurrency'],3);self.assertEqual(result['effective_concurrency'],1)
+        marker=json.loads((self.root/'test_order_submission.json').read_text())
+        self.assertEqual(marker['task_id'],self.channel.task_id);self.assertEqual(marker['order_number'],'W12345678')
+        self.assertFalse((self.root/'order_submission.json').exists())
 
     def test_unknown_submission_is_retained_and_never_restarted(self):
         result = self.run_batch('unknown')

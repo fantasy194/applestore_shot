@@ -45,7 +45,7 @@ class PurchaseSessionTests(unittest.TestCase):
         network.start();self.addCleanup(network.stop)
         browser=patch('browser_login.login_in_browser',side_effect=self.browser_refresh)
         self.browser=browser.start();self.addCleanup(browser.stop)
-        account=patch('duo_killer.account_info',return_value={'success':True,'logged_in':False})
+        account=patch('duo_killer.account_info',return_value={'success':True,'logged_in':False,'reauthentication_required':True})
         self.account_read=account.start();self.addCleanup(account.stop)
         self.events=[]
 
@@ -147,11 +147,31 @@ class PurchaseSessionTests(unittest.TestCase):
         self.browser.assert_not_called();purchase.assert_called_once()
         self.assertFalse(self.account_read.call_args.kwargs['reauthenticate'])
 
-    def test_http_541_gets_one_automatic_recovery_before_exactly_one_purchase(self):
-        self.account_read.side_effect=ValueError('HTTP 541')
-        with patch('duo_killer.purchase_sku',return_value={'success':True,'status':'pending_payment'}) as purchase:
+    def test_network_unknown_and_blocked_read_never_trigger_credential_login(self):
+        import requests
+        for error in (requests.Timeout('timeout'),requests.exceptions.SSLError('tls'),
+                      requests.ConnectionError('connection'),ValueError('账户页模型无法核验'),ValueError('HTTP 541')):
+            with self.subTest(kind=type(error).__name__),patch('duo_killer.purchase_sku') as purchase:
+                self.service._purchase_session_proof=None;self.account_read.side_effect=error
+                with self.assertRaises((requests.RequestException,ValueError)):
+                    self.service.run('purchase',{'sku':'MK2M4CH'})
+                purchase.assert_not_called();self.browser.assert_not_called()
+        self.assertTrue(self.service.auth.exists())
+
+    def test_inconclusive_account_result_does_not_claim_expiry(self):
+        for result in (None,{}, {'success':False}, {'success':True,'logged_in':False}):
+            self.account_read.return_value=result
+            with self.subTest(result=result),patch('duo_killer.purchase_sku') as purchase:
+                with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})
+                purchase.assert_not_called();self.browser.assert_not_called()
+
+    def test_missing_session_recovers_once_without_meaningless_account_probe(self):
+        auth=json.loads(self.service.auth.read_text(encoding='utf-8'))
+        auth['cookies']={key:[] for key in auth['cookies']}
+        duo_killer.write_private_json(self.service.auth,auth)
+        with patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed'}) as purchase:
             self.service.run('purchase',{'sku':'MK2M4CH'})
-        self.account_read.assert_called_once();self.browser.assert_called_once();purchase.assert_called_once()
+        self.account_read.assert_not_called();self.browser.assert_called_once();purchase.assert_called_once()
 
     def test_another_service_global_auth_binding_is_rejected_before_network(self):
         duo_killer.AUTH_PATH=self.root/'other-account'/'auth.json'
@@ -234,25 +254,24 @@ class PurchaseSessionTests(unittest.TestCase):
             self.service.run('purchase',{'sku':'MK2M4CH','fulfillment':'RETAIL','prepare_only':True})
         self.browser.assert_called_once();purchase.assert_called_once_with('MK2M4CH',quantity=1,prepare_only=True)
 
-    def test_parallel_snapshot_boundary_sees_new_session_before_batch(self):
-        def batch(owner,params,*,preflight_complete):
-            self.assertTrue(preflight_complete)
+    def test_account_checkout_sees_new_session_before_bag_work(self):
+        def checkout(*args,**options):
             self.assertEqual(self.events,['canonical-browser-verified'])
-            auth=json.loads(owner.auth.read_text(encoding='utf-8'))
+            auth=json.loads(self.service.auth.read_text(encoding='utf-8'))
             self.assertEqual(auth['cookies']['with_expiry'][0]['value'],'fresh-browser-session')
-            return {'success':False,'status':'parallel_complete','attempts':[]}
-        with patch('pickup_options.validate_preset'),patch('parallel_checkout.run_parallel_purchase',side_effect=batch):
-            self.service.run('purchase',{'sku':'MK2M4CH','fulfillment':'RETAIL','concurrency':2})
-        self.browser.assert_called_once()
+            return {'success':False,'status':'failed'}
+        with patch('pickup_options.validate_preset'),patch('duo_killer.purchase_sku',side_effect=checkout) as purchase, \
+             patch('parallel_checkout.run_parallel_purchase',side_effect=AssertionError('single account owner required')):
+            result=self.service.run('purchase',{'sku':'MK2M4CH','fulfillment':'RETAIL','concurrency':2})
+        self.browser.assert_called_once();purchase.assert_called_once()
+        self.assertEqual(result['effective_concurrency'],1)
 
-    def test_actual_parallel_runner_skips_legacy_preflight_on_every_prepared_retry(self):
+    def test_account_retries_reuse_browser_preflight_without_legacy_login(self):
         self.service.check_account=Mock(side_effect=AssertionError('legacy HTTP login forbidden'))
-        with patch('pickup_options.validate_preset'),patch('parallel_checkout.PurchaseBatch') as factory, \
-                patch('purchase_retry._wait'),patch('duo_killer.login',side_effect=AssertionError('legacy SRP forbidden')):
-            factory.return_value.run.return_value={'success':False,'status':'parallel_complete','attempts':[]}
+        with patch('pickup_options.validate_preset'),patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed'}) as purchase, \
+             patch('purchase_retry._wait'),patch('duo_killer.login',side_effect=AssertionError('legacy SRP forbidden')):
             result=self.service.run('purchase',{'sku':'MK2M4CH','fulfillment':'RETAIL','concurrency':2,'retry_count':2})
-        self.assertEqual(factory.call_count,3)
-        self.assertTrue(all(call.kwargs['skip_preflight'] is True for call in factory.call_args_list))
+        self.assertEqual(purchase.call_count,3)
         self.assertEqual(result['retry_summary']['attempts_made'],3)
         self.service.check_account.assert_not_called();self.browser.assert_called_once()
 

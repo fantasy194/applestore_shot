@@ -162,7 +162,7 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
                     self.assertEqual(network['blocked_status'], status)
                     self.assertIsNotNone(network['error'])
 
-    def test_only_visible_official_account_page_can_clear_manual_block(self):
+    def test_account_page_response_cannot_erase_real_manual_authentication_rejection(self):
         context = Mock()
         network = browser_login.observe_login_network(context, Mock(headless_browser=False))
         callbacks = {call.args[0]: call.args[1] for call in context.on.call_args_list}
@@ -174,5 +174,5 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
             callbacks['response'](Mock(request=Mock(url=url), status=200))
             self.assertEqual(network['blocked_status'], 541)
         callbacks['response'](Mock(request=Mock(url=ACCOUNT), status=200))
-        self.assertIsNone(network['error'])
-        self.assertIsNone(network['blocked_status'])
+        self.assertIsNotNone(network['error'])
+        self.assertEqual(network['blocked_status'], 541)

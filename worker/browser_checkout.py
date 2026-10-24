@@ -181,10 +181,10 @@ def _verify_account(cookies, agent, expected, *, auth_path=None):
 
 
 class BrowserCheckoutRecovery:
-    def __init__(self, context, service, payload):
+    def __init__(self, context, service, payload, *, page=None):
         self.context, self.service = context, service
         self.payload = validate_checkout_recovery_payload(payload)
-        self.page = context.pages[-1] if context.pages else context.new_page()
+        self.page = page if page is not None else context.pages[-1] if context.pages else context.new_page()
         self.documents = []
         context.on('requestfinished', self._finished)
 
@@ -218,6 +218,8 @@ class BrowserCheckoutRecovery:
         deadline, ready_since = time.monotonic() + timeout, None
         while time.monotonic() < deadline:
             self.service.channel.checkpoint()
+            if callable(network.get('refresh')):
+                network['refresh']()
             if process.poll() is not None or self.page.is_closed():
                 raise _error('CHECKOUT_BROWSER_CLOSED', '官网结账认证窗口已结束，未重新开始购买。')
             if network.get('authentication_failed'):

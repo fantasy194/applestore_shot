@@ -41,11 +41,11 @@ class IdleHeadlessBrowserPolicyTests(unittest.TestCase):
                     args = self.capture(entrypoint, flag)
                     self.assertFalse(any(arg.startswith('--headless') for arg in args))
 
-    def test_exact_true_selects_headless_for_both_production_launch_points(self):
+    def test_background_uses_same_normal_chrome_for_both_production_launch_points(self):
         for entrypoint in ('context', 'login'):
             with self.subTest(entrypoint=entrypoint):
                 args = self.capture(entrypoint, True)
-                self.assertTrue(any(arg.startswith('--headless') for arg in args))
+                self.assertFalse(any(arg.startswith('--headless') for arg in args))
                 self.assertTrue(any(arg.startswith('--user-data-dir=') for arg in args))
                 self.assertIn('--remote-debugging-address=127.0.0.1', args)
 

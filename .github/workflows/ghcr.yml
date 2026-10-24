@@ -125,6 +125,10 @@ jobs:
           echo "::add-mask::$access"
           docker compose exec -T -e DUO_VERIFY_WEB_ACCESS="$access" app python - < docker/verify_browser.py
           docker compose exec -T app python - < docker/verify_cdp_startup.py
+          docker compose exec -T app python - < docker/verify_persistent_browser.py
+          docker compose exec -T app python - seed < docker/verify_broker_crash.py
+          docker compose exec -T browser python3 - kill < docker/verify_broker_crash.py
+          docker compose exec -T app python - check < docker/verify_broker_crash.py
       - name: Verify independent browser and app replacement reconnects CDP
         shell: bash
         run: |

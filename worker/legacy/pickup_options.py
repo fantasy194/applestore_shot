@@ -1,6 +1,12 @@
 """Account-local pickup preferences; select only an exact official store match."""
 import re
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from html import unescape
+
+
+def pickup_calendar_now():
+    return datetime.now(ZoneInfo('Asia/Shanghai'))
 
 
 def store_name(name):
@@ -32,7 +38,9 @@ def validate_time_rule(rule=None):
                 or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', end) or start >= end):
             raise ValueError('自提时间窗口须为同日 HH:MM，且结束时间晚于开始时间。')
         result.update(start=start, end=end)
-    return result
+    # Older latest/window settings remain readable, but all purchase entry
+    # points now select the earliest official slot in the same seven-day range.
+    return {'mode': 'earliest', 'fallback': 'earliest'}
 
 
 def _validate_stores(stores, *, required):
@@ -260,7 +268,8 @@ def time_slot_payload(flow, path, selected_store, choose_slot=None, *, rule=None
     if not isinstance(dates, list) or not isinstance(windows, list):
         raise ValueError('官网未返回可用自提日期和时段；未继续结账。')
     candidates = []
-    from datetime import date, time
+    now = pickup_calendar_now().astimezone(ZoneInfo('Asia/Shanghai'))
+    first_day, last_day = now.date(), now.date() + timedelta(days=6)
     for day in dates:
         if not isinstance(day, dict) or day.get('disabled') is True:
             continue
@@ -289,24 +298,22 @@ def time_slot_payload(flow, path, selected_store, choose_slot=None, *, rule=None
                     time.fromisoformat(match[2]); time.fromisoformat(match[3])
                 except ValueError:
                     continue
-                candidates.append((iso, match[2], day, option))
-    candidates.sort(key=lambda c: (c[0], c[1]))
+                try:
+                    official_zone = ZoneInfo(option['timeZone'])
+                    start_at = datetime.combine(valid_date, time.fromisoformat(match[2]), official_zone)
+                    end_at = datetime.combine(valid_date, time.fromisoformat(match[3]), official_zone)
+                except (ValueError, ZoneInfoNotFoundError):
+                    continue
+                shanghai_day = start_at.astimezone(ZoneInfo('Asia/Shanghai')).date()
+                if not first_day <= shanghai_day <= last_day or end_at <= now:
+                    continue
+                candidates.append((start_at, match[2], day, option))
+    candidates.sort(key=lambda c: c[0])
     if not candidates:
-        raise NoPickupSlot('所选门店当前没有可自动选择的完整自提时段；未继续结账，未提交订单。')
-    rule = validate_time_rule(rule)
-    if rule['mode'] == 'latest':
-        candidates.reverse()
-    elif rule['mode'] == 'window':
-        filtered = [candidate for candidate in candidates
-                    if (match := re.fullmatch(r'\d{1,2}-(\d{2}:\d{2})-(\d{2}:\d{2})', candidate[3]['timeSlotValue']))
-                    and rule['start'] <= match[1] and match[2] <= rule['end']]
-        if filtered:
-            candidates = filtered
-        elif rule['fallback'] == 'stop':
-            raise NoPickupSlot('所选门店没有符合指定时间窗口的可用时段；未继续结账，未提交订单。')
-    index = 0 if choose_slot is None else choose_slot('选择自提日期与时段', [
-        (i, c[0] + ' ' + str(c[3].get('Label') or c[3]['timeSlotValue'])) for i, c in enumerate(candidates)], 0)
-    iso, _, day, chosen = candidates[index]
+        raise NoPickupSlot('所选门店今天起七天内暂无完整可预约时段；未继续结账，未提交订单。')
+    validate_time_rule(rule)  # Accept legacy input only after validating it.
+    _, _, day, chosen = candidates[0]
+    iso = day['date']
     prefix = path + '.dateTimeSlots.'
     fields = {'date': iso, 'dayRadio': str(day['dayOfMonth']),
               'timeSlotType': chosen.get('timeSlotType') or '', 'timeSlotValue': chosen['timeSlotValue'],

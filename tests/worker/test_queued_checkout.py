@@ -74,7 +74,7 @@ class QueueTests(unittest.TestCase):
         return {'selection_mode':'priority', 'stores':[
             {'store_id':'R002','store_name':'测试门店 R002','search':'200000'},
             {'store_id':'R001','store_name':'测试门店 R001','search':'200000'}],
-            'time_slot_rule':{'mode':'window','start':'09:00','end':'12:00','fallback':'stop'},
+            'time_slot_rule':{'mode':'earliest','fallback':'earliest'},
             'contact_mode':'official'}
 
     def test_priority_policy_is_frozen_public_and_actual_store_is_not_overwritten(self):
@@ -252,7 +252,7 @@ class QueueTests(unittest.TestCase):
                     {'status':'failed','result':{'message':'官网所选自提时段已不可用'}}]}
         result,_=self.execute([target('parallel',concurrency=2,retry_count=2,
                               checked_at_ms=int(time.time()*1000)-60_000)],
-                              Mock(side_effect=AssertionError('must use isolated batch')),batch_factory=Batch)
+                              lambda context,item:Batch(context,item).run(),batch_factory=Mock(side_effect=AssertionError('must use account owner')))
         self.assertEqual(called,[1,2,3])
         failure=result['queue_jobs'][0]['result']
         self.assertEqual(failure['status'],'failed')
@@ -270,7 +270,7 @@ class QueueTests(unittest.TestCase):
                      'private@example.test 13800000000 '+('错'*3000),
                      'result':{'contact':{'lastName':'private-contact'},'payment_url':'private-payment',
                                'qr_data':'private-qr'}}]}
-        result,_=self.execute([target('parallel',concurrency=2)],Mock(),batch_factory=Batch)
+        result,_=self.execute([target('parallel',concurrency=2)],lambda context,item:Batch(context,item).run(),batch_factory=Mock(side_effect=AssertionError('must use account owner')))
         message=result['queue_jobs'][0]['result']['message']
         self.assertEqual(message,'私有认证字段已省略。')
         self.assertLessEqual(len(message),2000)
@@ -291,7 +291,7 @@ class QueueTests(unittest.TestCase):
             def run(inner):
                 return {'success':False,'status':'parallel_complete','message':'官网明确返回的失败原因',
                         'attempts':[{'status':'failed','error':'较早的子路失败原因'}]}
-        result,_=self.execute([target('parallel',concurrency=2)],Mock(),batch_factory=Batch)
+        result,_=self.execute([target('parallel',concurrency=2)],lambda context,item:Batch(context,item).run(),batch_factory=Mock(side_effect=AssertionError('must use account owner')))
         self.assertEqual(result['queue_jobs'][0]['result']['message'],'官网明确返回的失败原因')
 
     def test_parallel_unknown_submission_keeps_guard_and_does_not_promote_other_failure(self):
@@ -304,7 +304,7 @@ class QueueTests(unittest.TestCase):
                     {'status':'failed','error':'另一子路门店无货'},
                     {'status':'submission_unknown','order_submitted':True}]}
         result,_=self.execute([target('parallel',concurrency=2,retry_count=3),target('later','R002')],
-                              Mock(),batch_factory=Batch)
+                              lambda context,item:Batch(context,item).run(),batch_factory=Mock(side_effect=AssertionError('must use account owner')))
         self.assertEqual(calls,[True])
         unknown=result['queue_jobs'][0]['result']
         self.assertEqual(unknown['status'],'submission_unknown')
@@ -384,49 +384,36 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(b[0]['result']['status'],'cancelled')
         self.assertFalse(b[0]['result']['started'])
 
-    def test_parallel_targets_preserve_routes_and_share_actual_process_cap(self):
-        class TrackedSlots(ProcessSlots):
-            def __init__(self):
-                super().__init__(2);self.active=0;self.maximum=0;self.lock=threading.Lock()
-            def acquire(self,channel):
-                release=super().acquire(channel)
-                with self.lock:
-                    self.active+=1;self.maximum=max(self.maximum,self.active)
-                def tracked_release():
-                    with self.lock:self.active-=1
-                    release()
-                return tracked_release
-        instance=QueuedCheckout(self.service,{'queue_targets':[target('a',concurrency=3),target('b','R002',concurrency=3)],
-                    'queue_mode':'parallel','queue_max_concurrency':2},
-                    worker_command=[sys.executable,str(self.script)],backoff_seconds=0)
-        slots=TrackedSlots();instance.slots=slots
-        result=instance.run()
-        self.assertEqual(slots.maximum,2)
-        self.assertEqual(slots.active,0)
-        self.assertEqual(len(result['pending_orders']),6)
-        self.assertEqual({x['pickup_store_id'] for x in result['pending_orders']},{'R001','R002'})
-        self.service.check_account.assert_not_called()
-        self.assertNotIn('never-copy',self.channel.output.getvalue())
+    def test_requested_parallelism_keeps_one_account_route_without_extra_orders(self):
+        called=[];active=0;maximum=0
+        def executor(context,item):
+            nonlocal active,maximum
+            active+=1;maximum=max(maximum,active)
+            called.append((item['queue_job_id'],item['concurrency'],item['requested_concurrency'],item['quantity'],item['retry_count']))
+            time.sleep(.02);active-=1
+            return {'success':True,'status':'pending_payment','order_number':'W1234567'+str(len(called))}
+        result,instance=self.execute([target('a',concurrency=3),target('b','R002',concurrency=3)],executor,
+            params={'queue_mode':'parallel','queue_max_concurrency':2},
+            batch_factory=Mock(side_effect=AssertionError('no isolated bag mutation')))
+        self.assertEqual(maximum,1);self.assertEqual(instance.limit,1)
+        self.assertEqual(called,[('a',1,3,1,0),('b',1,3,1,0)])
+        self.assertEqual(len(result['pending_orders']),2)
+        self.assertTrue(all(event['result']['effective_concurrency']==1 for event in self.finished()))
 
-    def test_hot_increase_waits_until_normal_serial_job_finishes(self):
-        state={'normal_active':False,'parallel_started':False}
-        def parent_executor(context,item):
-            state['normal_active']=True
-            self.channel.send('queue_add',queue_max_concurrency=3,
-                              queue_targets=[target('b','R002'),target('c','R003')])
-            time.sleep(.12)
-            self.assertFalse(state['parallel_started'])
-            state['normal_active']=False
+    def test_hot_increase_does_not_overlap_account_bag_or_invent_retries(self):
+        called=[];active=False
+        def executor(context,item):
+            nonlocal active
+            self.assertFalse(active);active=True
+            called.append(item['queue_job_id'])
+            if len(called)==1:
+                self.channel.send('queue_add',queue_max_concurrency=3,
+                    queue_targets=[target('b','R002'),target('c','R003')])
+            time.sleep(.02);active=False
             return {'success':False,'status':'failed'}
-        class Batch:
-            def __init__(inner,context,item,**options):
-                inner.item=item
-            def run(inner):
-                self.assertFalse(state['normal_active'])
-                state['parallel_started']=True
-                return {'success':False,'status':'parallel_complete','attempts':[],'pending_orders':[]}
-        result,_=self.execute([target('a')],parent_executor,batch_factory=Batch)
-        self.assertTrue(state['parallel_started'])
+        result,instance=self.execute([target('a')],executor,
+            batch_factory=Mock(side_effect=AssertionError('no isolated bag mutation')))
+        self.assertEqual(called,['a','b','c']);self.assertEqual(instance.limit,1)
         self.assertEqual(len(result['queue_jobs']),3)
 
     def test_validation_rejects_invalid_target_before_auth(self):

@@ -1,5 +1,5 @@
 //! Per-account idle preheat. Login or pickup preparation; orders are never submitted.
-use crate::{activity, engine::{Engine, Snapshot, TaskHost, task_has_unknown_submission, ready_purchase}};
+use crate::{activity, engine::{Engine, Snapshot, TaskHost, task_has_unknown_submission, ready_purchase, waiting_preparation}};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::{Path, PathBuf},
@@ -142,6 +142,12 @@ fn blocked_reason(snapshot: &Snapshot, account: &str) -> Option<&'static str> {
 }
 
 fn next_check(snapshot: &Snapshot, run: &Run, settings: &Settings, started_at: u64) -> u64 {
+    if run.flow == "pickup_prepare" && run.status == "preparation_expired" {
+        // Expiry is not a failed purchase. Keep a fresh preparation while idle,
+        // instead of leaving a five-minute gap until the ten-minute idle timer.
+        return started_at.max(settings.enabled_at_ms).max(last_order_activity(snapshot, &run.account_id))
+            .saturating_add(u64::from(settings.interval_minutes) * 60_000);
+    }
     started_at.max(settings.enabled_at_ms).max(last_order_activity(snapshot, &run.account_id))
         .max(run.last_checked_at_ms).max(run.last_warm_at_ms)
         .saturating_add(u64::from(settings.interval_minutes) * 60_000)
@@ -173,13 +179,16 @@ impl Maintenance {
                             && *stamp < task.updated_at.saturating_add(1).saturating_mul(1000))
                         .unwrap_or_else(|| task.updated_at.saturating_mul(1000));
                     run.status = result["status"].as_str().filter(|status|
-                        matches!(*status, "healthy" | "prepared" | "waiting_stock" | "requires_login" | "blocked" | "failed")
+                        matches!(*status, "healthy" | "prepared" | "waiting_stock" | "requires_login" | "blocked" | "failed" | "preparation_expired")
                             && !(run.flow == "pickup_prepare" && *status == "healthy"))
                         .unwrap_or(if task.status == "succeeded" && run.flow == "login" { "healthy" } else { "failed" }).into();
+                    let handed_off = task.action == "purchase" && task.prepared_handoff.is_some();
+                    if handed_off { run.status = "handed_off".into(); }
                     run.preparation_stage = result["preparation_stage"].as_str().map(str::to_owned);
                     run.order_ready = result["order_ready"] == true && result["review_verified"] == true && run.status == "prepared";
                     run.message = result["message"].as_str().unwrap_or(&task.stage).chars().take(400).collect();
-                    run.requires_login = result["requires_login"] == true;
+                    if handed_off { run.message = "自提准备已交由真实购买，结果见对应购买任务。".into(); }
+                    run.requires_login = !handed_off && result["requires_login"] == true;
                     run.cooldown_until_ms = 0;
                     if task.status == "interrupted" || task.status == "cancelled" {
                         run.message = "上次空闲预热已中断，下单优先；未重放购买。".into();
@@ -273,7 +282,7 @@ impl Maintenance {
         let settings = self.settings.lock().unwrap().clone();
         if !settings.enabled { return; }
         // One browser at a time for idle maintenance; purchase dispatch takes priority.
-        if snapshot.tasks.iter().any(|task| task.action == "session_maintain" && active(&task.status)) { return; }
+        if snapshot.tasks.iter().any(|task| task.action == "session_maintain" && active(&task.status) && !waiting_preparation(task)) { return; }
         for run in settings.last_runs {
             if run.status == "running" || run.next_check_at_ms > current { continue; }
             if blocked_reason(&snapshot, &run.account_id).is_some() { continue; }
@@ -427,6 +436,50 @@ mod tests {
         assert!(error.is_none());
         assert_eq!(loaded.flow, "browser_login");
         assert_eq!(loaded.enabled_at_ms, 1234);
+    }
+
+    #[test]
+    fn handed_off_preparation_reports_purchase_instead_of_failed_maintenance() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (engine, account) = fixture_engine(temporary.path());
+        let service = fixture_service(temporary.path(),1000);
+        service.refresh(&engine.snapshot());
+        let mut purchase = fixture_task(&account,"purchase","succeeded",900);
+        purchase.prepared_handoff = Some(json!({"source":"manual"}));
+        purchase.result = Some(json!({"success":true,"status":"pending_payment","order_number":"W-fixture"}));
+        {
+            let mut settings = service.settings.lock().unwrap();
+            let run = &mut settings.last_runs[0];
+            run.flow = "pickup_prepare".into(); run.status = "running".into(); run.task_id = Some(purchase.id.clone());
+        }
+        let mut snapshot = engine.snapshot(); snapshot.tasks.push(purchase);
+        service.refresh(&snapshot);
+        let settings = service.settings.lock().unwrap();
+        assert_eq!(settings.last_runs[0].status,"handed_off");
+        assert!(settings.last_runs[0].message.contains("真实购买"));
+        assert!(!settings.last_runs[0].requires_login);
+        assert_eq!(settings.last_runs[0].next_check_at_ms,1_500_000);
+    }
+
+    #[test]
+    fn expired_preparation_rearms_without_the_ten_minute_gap_but_new_purchase_resets_idle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (engine, account) = fixture_engine(temporary.path());
+        let service = fixture_service(temporary.path(), 1000);
+        service.refresh(&engine.snapshot());
+        let mut settings = Settings::default();
+        settings.flow = "pickup_prepare".into();
+        let mut run = service.settings.lock().unwrap().last_runs[0].clone();
+        run.flow = "pickup_prepare".into();
+        run.status = "preparation_expired".into();
+        run.last_checked_at_ms = 901_000;
+        run.last_warm_at_ms = 901_000;
+        let mut snapshot = engine.snapshot();
+        assert_eq!(next_check(&snapshot,&run,&settings,1000),601_000);
+        snapshot.tasks.push(fixture_task(&account,"purchase","succeeded",900));
+        assert_eq!(next_check(&snapshot,&run,&settings,1000),1_500_000);
+        run.status = "failed".into();
+        assert_eq!(next_check(&snapshot,&run,&settings,1000),1_501_000);
     }
 
     #[test]

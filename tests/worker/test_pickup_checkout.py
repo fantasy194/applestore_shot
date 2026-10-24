@@ -61,6 +61,10 @@ class RecoveryPickupFlow(PickupFlow):
 class PickupCheckoutTests(TestCase):
     def setUp(self):
         fixtures.AutoCheckoutTests.setUp(self)
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        clock = patch('pickup_options.pickup_calendar_now', return_value=datetime(2026,10,16,9,tzinfo=ZoneInfo('Asia/Shanghai')))
+        clock.start(); self.addCleanup(clock.stop)
         self.service.fulfillment_mode = 'RETAIL'
         self.config = {**deepcopy(CONFIG), 'pickup': {'search': '成都', 'store_name': '测试门店'}}
         checkout_options.save_config(self.service.checkout, self.config)

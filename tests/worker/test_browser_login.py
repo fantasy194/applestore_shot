@@ -5,6 +5,95 @@ import browser_login
 
 
 class BrowserLoginTests(unittest.TestCase):
+    def scoped_network(self):
+        context=Mock()
+        page=Mock(url='https://secure9.www.apple.com.cn/shop/signIn')
+        main=Mock(page=page)
+        main.is_detached.return_value=False
+        page.main_frame=main
+        page.frames=[main]
+        state=browser_login.observe_login_network(context,Mock(),page=page)
+        callbacks={call.args[0]:call.args[1] for call in context.on.call_args_list}
+        navigation=page.on.call_args.args[1]
+        return page,main,state,callbacks,navigation
+
+    def test_scoped_auth_ignores_other_tabs_hidden_frames_and_stale_documents(self):
+        page,main,state,events,navigate=self.scoped_network()
+        foreign=Mock(page=Mock())
+        foreign.is_detached.return_value=False
+        hidden=Mock(page=page,url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        hidden.is_detached.return_value=False
+        hidden.frame_element.return_value.is_visible.return_value=False
+        page.frames.append(hidden)
+        for frame in (foreign,hidden):
+            request=Mock(frame=frame,url='https://secure9.www.apple.com.cn/shop/signIn/idms/authx')
+            events['request'](request)
+            events['response'](Mock(request=request,status=541))
+            state['refresh']()
+            self.assertIsNone(state['blocked_status'])
+        stale=Mock(frame=main,url='https://secure9.www.apple.com.cn/shop/signIn/idms/authx')
+        events['request'](stale)
+        navigate(main)
+        events['response'](Mock(request=stale,status=541))
+        state['refresh']()
+        self.assertIsNone(state['blocked_status'])
+        self.assertFalse(state['pending'])
+
+    def test_scoped_visible_auth_failure_is_applied_outside_event_callback(self):
+        page,main,state,events,_=self.scoped_network()
+        auth=Mock(page=page,url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        auth.is_detached.return_value=False
+        auth.frame_element.return_value.is_visible.return_value=True
+        page.frames.append(auth)
+        request=Mock(frame=auth,url='https://idmsa.apple.com.cn/appleauth/auth/signin/complete')
+        events['request'](request)
+        events['response'](Mock(request=request,status=401))
+        auth.frame_element.assert_not_called()
+        self.assertFalse(state['authentication_failed'])
+        state['refresh']()
+        self.assertTrue(state['authentication_failed'])
+        self.assertTrue(state['credential_rejected'])
+
+    def test_scoped_main_authx_rejection_remains_blocked_after_account_response(self):
+        page,main,state,events,_=self.scoped_network()
+        request=Mock(frame=main,url='https://secure9.www.apple.com.cn/shop/signIn/idms/authx')
+        events['request'](request)
+        events['response'](Mock(request=request,status=541))
+        state['refresh']()
+        events['response'](Mock(request=Mock(frame=main,url='https://secure9.www.apple.com.cn/shop/account/home'),status=200))
+        state['refresh']()
+        self.assertEqual(state['blocked_status'],541)
+
+    def test_current_rejection_before_natural_navigation_is_not_discarded_as_stale(self):
+        page,main,state,events,navigate=self.scoped_network()
+        request=Mock(frame=main,url='https://secure9.www.apple.com.cn/shop/signIn/idms/authx')
+        events['request'](request)
+        events['response'](Mock(request=request,status=541))
+        navigate(main)
+        state['refresh']()
+        self.assertEqual(state['blocked_status'],541)
+
+    def test_verified_visible_iframe_rejection_survives_hidden_or_detached_after_response(self):
+        for status in (401,541):
+            for detached in (False,True):
+                with self.subTest(status=status,detached=detached):
+                    page,main,state,events,_=self.scoped_network()
+                    frame=Mock(page=page,url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+                    frame.is_detached.return_value=False
+                    frame.frame_element.return_value.is_visible.return_value=True
+                    page.frames.append(frame)
+                    state['refresh']()  # Current official frame is visibly active.
+                    request=Mock(frame=frame,url='https://idmsa.apple.com.cn/appleauth/auth/signin/complete')
+                    events['request'](request)
+                    events['response'](Mock(request=request,status=status))
+                    frame.frame_element.return_value.is_visible.return_value=False
+                    frame.is_detached.return_value=detached
+                    state['refresh']()
+                    if status==401:
+                        self.assertTrue(state['credential_rejected'])
+                    else:
+                        self.assertEqual(state['blocked_status'],541)
+
     def test_background_trust_detection_never_clicks_the_official_choice(self):
         frame = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
         frame.frame_element.return_value.is_visible.return_value = True
@@ -66,7 +155,7 @@ class BrowserLoginTests(unittest.TestCase):
         self.assertIsNone(state['error'])
         self.assertFalse(state['pending'])
 
-    def test_541_keeps_manual_window_open_until_official_navigation_recovers(self):
+    def test_541_manual_rejection_matches_automatic_without_resubmitting(self):
         page = Mock(url='https://secure9.www.apple.com.cn/shop/signIn/account', frames=[])
         page.evaluate.return_value = 'fixture-agent'
         context = Mock(pages=[page])
@@ -80,10 +169,11 @@ class BrowserLoginTests(unittest.TestCase):
             page.url = 'https://secure9.www.apple.com.cn/shop/account/home'
             network.update(error=None, blocked_status=None)
         page.wait_for_timeout.side_effect = recover
-        result = browser_login.wait_for_account_page(Mock(contexts=[context]), process, service, 10,
-                                                      network, settle_seconds=0)
-        self.assertEqual(result[1], 'fixture-agent')
-        self.assertIn('窗口保持打开', service.stage.call_args.args[0])
+        with self.assertRaises(browser_login.BrowserSessionError) as error:
+            browser_login.wait_for_account_page(Mock(contexts=[context]), process, service, 10,
+                                               network, settle_seconds=0)
+        self.assertEqual(error.exception.http_status, 541)
+        page.wait_for_timeout.assert_not_called()
         process.terminate.assert_not_called()
 
     def test_trust_question_in_official_frame_is_accepted_but_not_other_pages(self):

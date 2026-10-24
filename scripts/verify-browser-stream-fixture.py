@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'worker'), str(ROOT / 'worker/legacy')]
 from browser_cdp import connect_browser
 from browser_process import launch_browser
-from browser_remote import BrowserRemote
+from browser_remote import BrowserRemote, browser_page_target
 from platform_support import find_browser
 from protocol import Channel
 from playwright.sync_api import sync_playwright
@@ -61,10 +61,13 @@ def main():
                 context.route('**/*', lambda route: route.continue_() if route.request.url.startswith(origin) else route.abort())
                 page = context.pages[0]
                 page.goto(origin)
+                # A persistent profile can retain a newer login tab from an old task.
+                retained_tab = context.new_page()
+                retained_tab.goto(origin)
                 service = SimpleNamespace(task_dir=Path(directory) / 'task',
                     channel=Channel('fixture-account', 'fixture-task', io.StringIO()))
                 with BrowserRemote(service, allowed_page=lambda candidate: candidate.url.startswith(origin)) as remote:
-                    remote.attach_cdp(port)
+                    remote.attach_cdp(port, target_id=browser_page_target(page))
                     def request(path='/status', payload=None):
                         req = Request(f'http://127.0.0.1:{remote.server.server_port}' + path,
                             data=None if payload is None else json.dumps(payload).encode(),
@@ -94,7 +97,8 @@ def main():
                     current = request()['frame']
                     assert request('/input', {'type': 'text', 'text': 'stream fixture', 'sequence': current['sequence']})['accepted']
                     assert page.locator('#field').input_value() == 'stream fixture'
-                    report['passes'].append('normal_mouse_keyboard_events')
+                    assert retained_tab.locator('#field').input_value() == ''
+                    report['passes'].append('bound_page_input_leaves_old_tab_untouched')
                     # Typing is deliberately 100-200ms per character. The input
                     # owner must continue to serve independent live heartbeats
                     # throughout a command longer than the UI's five-second gate.
@@ -133,6 +137,23 @@ def main():
                         raise AssertionError('Old document input was accepted')
                     assert page.locator('#field').input_value() == ''
                     report['passes'].append('same_url_reload_rejects_old_input')
+                    page.close()
+                    end = time.monotonic() + 10
+                    while time.monotonic() < end:
+                        stopped = request()
+                        if not stopped['active']:
+                            break
+                        time.sleep(.1)
+                    assert not stopped['active'] and not stopped.get('frame')
+                    assert not retained_tab.is_closed()
+                    report['passes'].append('bound_page_close_never_falls_back_to_old_tab')
+                assert not (service.task_dir / 'browser-remote.json').exists()
+                # A second task on the retained tab still detects whole-browser
+                # disconnects; target binding must not mask a dead CDP connection.
+                page = retained_tab
+                with BrowserRemote(service, allowed_page=lambda candidate: candidate.url.startswith(origin)) as remote:
+                    remote.attach_cdp(port, target_id=browser_page_target(page))
+                    until(lambda state: state.get('frame_current') and state.get('frame'))
                     browser.new_browser_cdp_session().send('Browser.close')
                     end = time.monotonic() + 10
                     while time.monotonic() < end:

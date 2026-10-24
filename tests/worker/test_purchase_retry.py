@@ -291,25 +291,19 @@ class PurchaseRetryServiceTests(unittest.TestCase):
         self.assertEqual(purchase.call_count, 2)
         self.assertEqual(result['retry_summary']['retries_used'], 1)
 
-    def test_service_retries_whole_parallel_round_after_callable_cleanup(self):
-        sequence = []
-
-        def batch(_service, _params, *, preflight_complete):
-            self.assertTrue(preflight_complete)
-            number = len(sequence) // 2 + 1
-            sequence.append('start' + str(number))
-            try:
-                return {'success': number == 2, 'status': 'parallel_complete', 'attempts': [{'status': 'failed'}]}
-            finally:
-                sequence.append('cleaned' + str(number))
-
-        with patch('parallel_checkout.run_parallel_purchase', side_effect=batch), patch('pickup_options.validate_preset'), \
-                patch('purchase_retry._wait'):
-            result = self.service.run('purchase', {'sku': 'MLH74FE', 'quantity': 1, 'fulfillment': 'RETAIL',
-                                                  'concurrency': 3, 'retry_count': 1})
-        self.assertEqual(sequence, ['start1', 'cleaned1', 'start2', 'cleaned2'])
-        self.assertEqual(result['retry_summary']['attempts_made'], 2)
-        self.assertEqual(result['attempts'], [{'status': 'failed'}])
+    def test_service_retries_account_checkout_after_callable_cleanup(self):
+        sequence=[]
+        def checkout(sku,**options):
+            self.assertEqual((sku,options),('MLH74FE',{'quantity':1}))
+            number=len(sequence)//2+1;sequence.append('start'+str(number))
+            try:return {'success':number==2,'status':'failed' if number==1 else 'complete'}
+            finally:sequence.append('cleaned'+str(number))
+        with patch('duo_killer.purchase_sku',side_effect=checkout),patch('pickup_options.validate_preset'), \
+             patch('parallel_checkout.run_parallel_purchase',side_effect=AssertionError('single account owner required')),patch('purchase_retry._wait'):
+            result=self.service.run('purchase',{'sku':'MLH74FE','quantity':1,'fulfillment':'RETAIL','concurrency':3,'retry_count':1})
+        self.assertEqual(sequence,['start1','cleaned1','start2','cleaned2'])
+        self.assertEqual(result['retry_summary']['attempts_made'],2)
+        self.assertEqual(result['requested_concurrency'],3);self.assertEqual(result['effective_concurrency'],1)
 
     def test_invalid_retry_preparation_or_child_policy_is_rejected_before_auth_and_purchase(self):
         for extra in ({'retry_count': True}, {'retry_count': 11}, {'retry_count': 1, 'prepare_only': True},

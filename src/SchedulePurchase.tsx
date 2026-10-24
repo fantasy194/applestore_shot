@@ -27,7 +27,6 @@ const displayTime = (ms: number) =>
 export function SchedulePurchase({
   sku,
   quantity,
-  concurrency = 1,
   retryCount = 0,
   busy,
   task,
@@ -74,7 +73,7 @@ export function SchedulePurchase({
           ` · ${selected.fulfillment === "RETAIL" ? "指定门店自提" : "送货"}`}
         {(selected?.fulfillment === "RETAIL" ||
           (!selected && fulfillment === "RETAIL")) &&
-          ` · ${selected ? (selected.concurrency ?? 1) : concurrency} 路并发，每路按上述数量购买`}
+          " · 同账号顺序执行，每次1路，按上述数量购买"}
         {` · 失败额外重试 ${selected ? (selected.retry_count ?? 0) : retryCount} 次，最多共 ${(selected ? (selected.retry_count ?? 0) : retryCount) + 1} 轮`}
       </p>
       {selected && task ? (
@@ -116,7 +115,7 @@ export function SchedulePurchase({
               fulfillment,
               scheduled_at: at,
               retry_count: retryCount,
-              ...(fulfillment === "RETAIL" ? { concurrency } : {}),
+              ...(fulfillment === "RETAIL" ? { concurrency: 1 } : {}),
             });
           }}
         >

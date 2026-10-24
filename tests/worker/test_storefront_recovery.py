@@ -479,17 +479,19 @@ class StorefrontRecoveryTests(unittest.TestCase):
             browser = Mock(contexts=[context])
             playwright = Mock()
             playwright.chromium.connect_over_cdp.return_value = browser
-            process = Mock(pid=12345)
+            process = Mock(pid=12345, persistent=True)
             process.poll.return_value = None
+            context.new_page.return_value = Mock()
+            context.new_page.return_value.is_closed.return_value = False
             service = Mock(auth=auth, root=root, account='owner@example.test', headless_browser=False)
             events = []
             state = {'pending': {}, 'error': None}
 
-            def observe(*args):
+            def observe(*args, **kwargs):
                 events.append('listening')
                 return state
 
-            def open_login(*args):
+            def open_login(*args, **kwargs):
                 events.append('open')
                 return ACCOUNT
 
@@ -512,6 +514,12 @@ class StorefrontRecoveryTests(unittest.TestCase):
             self.assertIn('about:blank', launch.call_args.args[0])
             self.assertNotIn(ACCOUNT, launch.call_args.args[0])
             save.assert_not_called()
+            process.release.assert_called_once()
+            process.terminate.assert_not_called()
+            process.kill.assert_not_called()
+            context.new_page.return_value.close.assert_called_once()
+            page.close.assert_not_called()
+            browser.new_browser_cdp_session.assert_not_called()
             self.assertTrue(marker.exists())
             self.assertEqual(maintenance.read_text(encoding='utf-8'), 'fixture-cooldown')
             self.assertIn('owner@example.test', auth.read_text(encoding='utf-8'))

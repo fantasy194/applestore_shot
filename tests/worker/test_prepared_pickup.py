@@ -7,6 +7,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 import requests
+import checkout_options
 import duo_killer as shop
 from protocol import Channel, Cancelled
 import test_pickup_checkout as pickup_fixtures
@@ -20,21 +21,38 @@ class PreparedPickupTests(TestCase):
     review_flow = pickup_fixtures.PickupReviewTests.review_flow
 
     def prepared_flow(self, on_reply=None, refresh=None):
+        # Each fixture represents a new task, including subtests using one Service.
+        self.service._prepared_claim = None
+        self.service.prepared_claim_config_hash = None
+        self.service.submitted = False
         self.service.preparing = True
         self.service.keep_prepared_pickup = True
         self.service.purchase_selection = ('MK2M4CH/A', 1)
         flow = self.review_flow()
         flow.session = object()
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'search':
+                flow.current_response_body = deepcopy(flow.model)
+        flow.action = action
         self.wait_calls = []
 
         def reply(kind, label, **fields):
             self.assertEqual(flow.submissions, 0)
-            self.assertEqual(kind, 'confirm')
-            self.assertEqual(fields['details']['operation'], 'prepared_pickup')
-            self.assertEqual(fields['details']['store'], '测试门店')
+            self.assertEqual(kind, 'prepared_purchase')
+            self.assertEqual(fields['prepared']['preparation_stage'], 'review')
+            self.assertIn('R580', fields['prepared']['authorized_store_ids'])
             self.assertEqual(fields['timeout'], 300)
             self.wait_calls.extend(flow.calls)
-            return on_reply(flow) if on_reply else True
+            answer = on_reply(flow) if on_reply else True
+            if answer is not True:
+                return answer
+            return {'prepared_claim': {'v': 1, 'account_id': self.service.channel.account_id,
+                'prepared_task_id': self.service.channel.task_id, 'request_id': fields['_request_id'],
+                'source': 'manual', 'requested_at_ms': 1, 'claimed_at_ms': 1},
+                'params': getattr(self, 'claim_purchase_params',
+                                  {'sku': 'MK2M4CH', 'quantity': 1, 'fulfillment': 'RETAIL'})}
 
         self.service.channel.prompt.side_effect = reply
 
@@ -77,8 +95,179 @@ class PreparedPickupTests(TestCase):
         self.assertEqual(progress[0]['status'], 'prepared')
         self.assertEqual(progress[-1]['status'], 'pending_payment')
 
-    def test_end_preparation_and_non_boolean_reply_never_create_an_order(self):
-        for answer in (False, 'true', 1, None):
+    def test_healthy_prepared_resume_never_authenticates(self):
+        flow = self.prepared_flow()
+        with patch('apple_login.AppleStoreLogin.login') as login:
+            self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        login.assert_not_called()
+        self.assertEqual(flow.submissions, 1)
+
+    def test_current_action_identity_proof_outranks_cookie_name_heuristic(self):
+        from purchase_session import record_action_session
+        self.service.ensure_auth_file()
+        record_action_session(self.service)
+        with requests.Session() as session, patch.object(shop, 'login') as login:
+            self.assertFalse(shop.ensure_strong_login(session))
+        login.assert_not_called()
+
+    def test_expired_or_wrong_account_action_proof_cannot_skip_missing_cookie_check(self):
+        from purchase_session import record_action_session
+        self.service.ensure_auth_file()
+        for invalid in ('expired', 'other_account'):
+            with self.subTest(invalid=invalid):
+                record_action_session(self.service, now_ms=0 if invalid == 'expired' else None)
+                if invalid == 'other_account':
+                    self.service._purchase_session_proof['account'] = 'other@example.test'
+                with requests.Session() as session, \
+                        patch.object(shop, 'login', side_effect=ValueError('synthetic missing session')) as login:
+                    with self.assertRaisesRegex(ValueError, 'synthetic missing session'):
+                        shop.ensure_strong_login(session)
+                login.assert_called_once()
+
+    def test_prepared_official_signin_recovers_once_in_same_flow(self):
+        flow = self.prepared_flow()
+        flow.session = requests.Session()
+        self.addCleanup(flow.session.close)
+        original_page = flow.page.side_effect
+        reply = {}
+        def page(url, stage, *, fresh=False):
+            original_page(url, stage, fresh=fresh)
+            reply['document'] = flow.page_response
+            flow.url = 'https://secure11.www.apple.com.cn/shop/signIn?dynamic=fixture'
+            flow.page_response = requests.Response()
+            flow.page_response.url = flow.url
+        flow.page.side_effect = page
+        with patch('apple_login.load_credentials', return_value=('fixture@example.test', 'synthetic')), \
+                patch('apple_login.AppleStoreLogin.login', side_effect=lambda *a, **kw: reply['document']) as login, \
+                patch.object(shop, 'add_to_bag') as add:
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        login.assert_called_once()
+        self.assertEqual(login.call_args.kwargs['signin_url'],
+                         'https://secure11.www.apple.com.cn/shop/signIn?dynamic=fixture')
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
+        add.assert_not_called()
+
+    def test_prepared_refresh_timeout_does_not_start_authentication(self):
+        flow = self.prepared_flow()
+        flow.page.side_effect = requests.Timeout('synthetic read timeout')
+        with patch('apple_login.AppleStoreLogin.login') as login, self.assertRaises(requests.Timeout):
+            self.run_flow(flow, prepare=True)
+        login.assert_not_called()
+        self.assertEqual(flow.submissions, 0)
+
+    def test_name_only_scope_requires_current_selection_and_matching_query(self):
+        for change in ('selection_missing', 'name_changed', 'query_changed', 'result_id_changed'):
+            with self.subTest(change=change):
+                # Produce the proof through real fixed fulfillment, not a
+                # fabricated result id or a persisted prepared marker.
+                self.config['pickup'] = {'search': '成都', 'store_name': '测试门店'}
+                checkout_options.save_config(self.service.checkout, self.config)
+                self.service.keep_prepared_pickup = False
+                self.service.submitted = False
+                self.service._prepared_claim = None
+                flow = self.review_flow()
+                original_action = flow.action
+                def action(module, name, data=None):
+                    original_action(module, name, data)
+                    if name == 'search':
+                        flow.current_response_body = deepcopy(flow.model)
+                flow.action = action
+                result = self.run_flow(flow, prepare=True)
+                if change == 'selection_missing':
+                    self.service.pickup_selected = None
+                elif change == 'result_id_changed':
+                    result['pickup_store_id'] = 'R999'
+                else:
+                    self.config['pickup']['store_name' if change == 'name_changed' else 'search'] = '其他区域'
+                    checkout_options.save_config(self.service.checkout, self.config)
+                self.service.channel.prompt.reset_mock()
+                self.assertFalse(self.service.wait_prepared_pickup(result, timeout=300))
+                self.assertTrue(self.service.prepared_handoff_unavailable)
+                self.service.channel.prompt.assert_not_called()
+
+    def test_unprovable_name_only_scope_returns_ordinary_prepared_result(self):
+        flow = self.prepared_flow()
+        original_wait = self.service.wait_prepared_pickup
+        def wait(result, timeout):
+            self.service.pickup_selected = None
+            return original_wait(result, timeout=timeout)
+        with patch.object(self.service, 'wait_prepared_pickup', side_effect=wait):
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'prepared')
+        self.assertTrue(result['review_verified'])
+        self.assertEqual(flow.submissions, 0)
+        flow.page.assert_not_called()
+        self.service.channel.prompt.assert_not_called()
+
+    def priority_prepared_flow(self, target):
+        self.config['pickup'] = {'selection_mode': 'priority', 'search': '成都',
+            'stores': [{'store_id': 'R580', 'store_name': '测试门店', 'search': '成都'},
+                       {'store_id': 'R581', 'store_name': '第二门店', 'search': '成都'}]}
+        checkout_options.save_config(self.service.checkout, self.config)
+        self.claim_purchase_params = {'sku': 'MK2M4CH', 'quantity': 1, 'fulfillment': 'RETAIL',
+            'pickup_policy': {'selection_mode': 'priority', 'stores': [{'store_id': target,
+                              'store_name': '测试门店' if target == 'R580' else '第二门店', 'search': '成都'}]}}
+        flow = self.prepared_flow()
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'continueFromBillingToReview':
+                flow.model['checkout']['review']['pickupContactReview']['pickupContactInfo']['d'] = deepcopy(self.config['contact'])
+            # A priority search must have its own fresh response object.
+            flow.current_response_body = deepcopy(flow.model)
+        flow.action = action
+        return flow
+
+    def test_same_store_scope_subset_preserves_hot_review_with_new_effective_hash(self):
+        flow = self.priority_prepared_flow('R580')
+        self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual([name for _, name, _ in flow.calls[len(self.wait_calls):]],
+                         ['continueFromReviewToProcess'])
+
+    def test_authorized_other_store_edits_original_flow_and_discards_old_review_proof(self):
+        flow = self.priority_prepared_flow('R581')
+        original_page, original_action = flow.page.side_effect, flow.action
+        def page(url, stage, *, fresh=False):
+            original_page(url, stage, fresh=fresh)
+            flow.current_response_body['checkout']['review']['fulfillmentReview']['a'] = {
+                'edit': {'url': '/fixture/edit-pickup'}}
+        def action(module, name, data=None):
+            if (module, name) == ('checkout.review.fulfillmentReview', 'edit'):
+                self.assertIsNone(self.service.prepared_order)
+                self.assertIsNone(self.service.pickup_selected)
+                flow.calls.append((module, name, data))
+                body = option_fixtures.fulfillment_model(mixed=False)
+                body = json.loads(json.dumps(body, ensure_ascii=False).replace('R580', 'R581').replace('测试门店', '第二门店'))
+                flow.update(body)
+            else:
+                original_action(module, name, data)
+                if name == 'continueFromBillingToReview' and self.service._prepared_claim is not None:
+                    flow.model = json.loads(json.dumps(flow.model, ensure_ascii=False)
+                                            .replace('R580', 'R581').replace('测试门店', '第二门店'))
+        flow.page.side_effect, flow.action = page, action
+        session = flow.session
+        with patch.object(shop, 'add_to_bag') as add:
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(result['pickup_store_id'], 'R581')
+        self.assertEqual(flow.submissions, 1)
+        self.assertIs(flow.session, session)
+        self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
+        self.assertEqual(sum(name == 'edit' for _, name, _ in flow.calls), 1)
+        add.assert_not_called()
+
+    def test_unauthorized_store_claim_rejected_before_fresh_request(self):
+        flow = self.priority_prepared_flow('R999')
+        with self.assertRaisesRegex(ValueError, '超出原准备授权'):
+            self.run_flow(flow, prepare=True)
+        flow.page.assert_not_called()
+        self.assertEqual(flow.submissions, 0)
+
+    def test_end_preparation_never_creates_an_order(self):
+        for answer in (False, None):
             with self.subTest(answer=answer):
                 flow = self.prepared_flow(on_reply=lambda flow: answer)
                 result = self.run_flow(flow, prepare=True)
@@ -150,7 +339,7 @@ class PreparedPickupTests(TestCase):
                 self.assertEqual(flow.submissions, 0)
                 self.assertFalse((self.root / 'prepared_checkout.json').exists())
 
-    def test_hidden_store_after_wait_rechecks_cart_without_adding_again(self):
+    def test_hidden_store_without_official_edit_never_rebuilds_checkout(self):
         flow = self.prepared_flow()
         original_page = flow.page.side_effect
         def page(url, stage, *, fresh=False):
@@ -164,11 +353,11 @@ class PreparedPickupTests(TestCase):
                           'actions': {'a': {'checkout': {'url': '/fixture/checkout'}}}}}
         flow.page.side_effect = page
         with patch.object(shop, 'add_to_bag') as add:
-            result = self.run_flow(flow, prepare=True)
-        self.assertEqual(result['status'], 'pending_payment')
-        self.assertEqual(flow.submissions, 1)
-        self.assertEqual(flow.page.call_count, 2)
-        self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 2)
+            with self.assertRaisesRegex(ValueError, '未提供原结算'):
+                self.run_flow(flow, prepare=True)
+        self.assertEqual(flow.submissions, 0)
+        self.assertEqual(flow.page.call_count, 1)
+        self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
         add.assert_not_called()
 
     def test_hidden_store_uses_official_edit_without_reusing_a_merged_review(self):
@@ -332,7 +521,6 @@ class PartialPickupPreparationTests(TestCase):
         return flow
 
     def test_unavailable_preparation_keeps_partial_stage_without_store_or_review_proof(self):
-        self.service.keep_prepared_pickup = True
         flow = self.blocked_flow()
         result = self.run_flow(flow, prepare=True)
         self.assertEqual(result['status'], 'waiting_stock')
@@ -348,6 +536,117 @@ class PartialPickupPreparationTests(TestCase):
         self.assertEqual(marker['preparation_stage'], 'fulfillment')
         self.assertIsNone(self.service.pickup_selected)
         self.service.channel.prompt.assert_not_called()
+
+    def test_name_only_disabled_store_identity_is_from_unique_current_query_response(self):
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
+        flow = pickup_fixtures.PickupFlow()
+        original = flow.action
+        def action(module, name, data=None):
+            original(module, name, data)
+            if name in ('checkout', 'search'):
+                flow.require('checkout.fulfillment.pickupTab.pickup.storeLocator')[
+                    'searchResults']['d']['retailStores'][0]['storeDisabled'] = True
+            if name == 'search':
+                flow.current_response_body = deepcopy(flow.model)
+        flow.action = action
+        result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'waiting_stock')
+        self.assertFalse(result['review_verified'])
+        self.assertIsNone(self.service.pickup_selected)
+        self.assertIsNone(self.service.pickup_selection_scope)
+        self.assertEqual(self.service.pickup_identity_scope, {'search': '成都', 'store_name': '测试门店',
+            'store_id': 'R580', 'config_fingerprint': checkout_options.config_fingerprint(self.service.checkout)})
+        self.service.channel.prompt.side_effect = None
+        self.service.channel.prompt.return_value = False
+        self.assertFalse(self.service.wait_prepared_pickup(result, timeout=300))
+        fields = self.service.channel.prompt.call_args.kwargs
+        self.assertEqual(fields['prepared']['authorized_store_ids'], ['R580'])
+        self.assertFalse(fields['prepared']['review_verified'])
+        self.assertEqual(flow.submissions, 0)
+
+    def test_old_response_or_ambiguous_name_never_supplies_partial_identity_scope(self):
+        for stale in (True, False):
+            with self.subTest(stale=stale):
+                flow = pickup_fixtures.PickupFlow()
+                original = flow.action
+                def action(module, name, data=None):
+                    original(module, name, data)
+                    if name in ('checkout', 'search'):
+                        rows = flow.require('checkout.fulfillment.pickupTab.pickup.storeLocator')[
+                            'searchResults']['d']['retailStores']
+                        rows[0]['storeDisabled'] = True
+                        if not stale and name == 'search':
+                            rows.append({**rows[0], 'storeId': 'R581'})
+                            flow.current_response_body = deepcopy(flow.model)
+                flow.action = action
+                if stale:
+                    self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'waiting_stock')
+                else:
+                    with self.assertRaisesRegex(ValueError, '多家同名'):
+                        self.run_flow(flow, prepare=True)
+                self.assertIsNone(self.service.pickup_identity_scope)
+                self.assertEqual(flow.submissions, 0)
+
+    def test_partial_keep_ready_retains_original_flow_until_purchase_or_expiry(self):
+        self.config['pickup']['store_id'] = 'R580'
+        checkout_options.save_config(self.service.checkout, self.config)
+        self.service.keep_prepared_pickup = True
+        flow = self.blocked_flow()
+        def wait(result, timeout):
+            self.assertEqual(timeout, 300)
+            self.assertFalse(result['review_verified'])
+            self.assertEqual(result['preparation_stage'], 'fulfillment')
+            self.assertIsNone(self.service.pickup_selected)
+            self.assertEqual(flow.submissions, 0)
+            self.service.prepared_expired = True
+            return False
+        with patch.object(self.service, 'wait_prepared_pickup', side_effect=wait), \
+                patch.object(shop, 'add_to_bag') as add:
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'preparation_expired')
+        self.assertFalse(result['order_submitted'])
+        self.assertFalse((self.root / 'prepared_checkout.json').exists())
+        add.assert_not_called()
+        self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
+
+    def test_partial_takeover_continues_original_checkout_without_readding(self):
+        self.config['pickup']['store_id'] = 'R580'
+        checkout_options.save_config(self.service.checkout, self.config)
+        self.service.preparing = True
+        self.service.keep_prepared_pickup = True
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
+        flow = self.blocked_flow()
+        session = flow.session
+        def reply(kind, label, **fields):
+            self.assertEqual(kind, 'prepared_purchase')
+            self.assertEqual(fields['prepared']['preparation_stage'], 'fulfillment')
+            self.assertFalse(fields['prepared']['review_verified'])
+            self.assertFalse(fields['prepared']['order_ready'])
+            self.assertEqual(flow.submissions, 0)
+            # Stock changes at Apple's original flow, not in a new cart.
+            flow.action = pickup_fixtures.PickupFlow.action.__get__(flow)
+            return {'prepared_claim': {'v': 1, 'account_id': self.service.channel.account_id,
+                'prepared_task_id': self.service.channel.task_id, 'request_id': fields['_request_id'],
+                'source': 'manual', 'requested_at_ms': 1, 'claimed_at_ms': 1},
+                'params': {'sku': 'MK2M4CH', 'quantity': 1, 'fulfillment': 'RETAIL'}}
+        self.service.channel.prompt.side_effect = reply
+        def page(url, stage, *, fresh=False):
+            self.assertTrue(fresh)
+            body = option_fixtures.fulfillment_model(mixed=False)
+            body['checkout']['fulfillment']['item-0'] = deepcopy(flow.item)
+            flow.model = deepcopy(body)
+            flow.current_response_body = deepcopy(body)
+        flow.page = Mock(side_effect=page)
+        with patch.object(shop, 'add_to_bag') as add:
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertTrue(result['prepared_handoff'])
+        self.assertEqual(flow.submissions, 1)
+        self.assertIs(flow.session, session)
+        self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
+        self.assertIsNone(self.service.prepared_order)
+        flow.page.assert_called_once()
+        add.assert_not_called()
 
     def test_real_purchase_still_stops_on_no_inventory(self):
         flow = self.blocked_flow()

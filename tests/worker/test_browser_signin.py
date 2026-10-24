@@ -24,7 +24,7 @@ class Field:
             self.on_click()
 
     def get_attribute(self, name):
-        return self.maxlength if name == 'maxlength' else None
+        return {'maxlength':self.maxlength,'autocomplete':self.autocomplete}.get(name)
 
     def input_value(self, **_):
         return self.value
@@ -110,8 +110,8 @@ class Frame:
     def get_by_role(self, role, name=None):
         if role == 'alert':
             return Locator(self.alerts)
-        kind = 'button' if role == 'button' else 'account'
-        return Locator([field for field in self.fields if field.kind == kind and name.search(field.name)])
+        kinds = ('button',) if role == 'button' else ('account','otp')
+        return Locator([field for field in self.fields if field.kind in kinds and name.search(field.name)])
 
     def get_by_label(self, name):
         return Locator([field for field in self.fields if name.search(field.name)])
@@ -267,6 +267,32 @@ class BrowserSigninTests(unittest.TestCase):
         self.assertEqual(self.assistant.step(self.page, self.network), 'waiting')
         self.service.channel.prompt.assert_called_once()
         self.service.browser_password.assert_not_called()
+
+    def test_accessible_named_six_digit_single_field_uses_app_code_without_autocomplete(self):
+        self.otp_form()
+        field=Field(self.page.auth,'otp',name='Verification code',maxlength='6')
+        self.page.auth.fields=[field,Field(self.page.auth,'identity',self.service.account)]
+        self.assertEqual(self.assistant.step(self.page,self.network),'acted')
+        self.assertEqual(field.value,'012345')
+        self.service.channel.prompt.assert_called_once()
+
+    def test_named_otp_requires_unique_six_digit_capacity(self):
+        for maximum,count in (('8',1),('6',2)):
+            with self.subTest(maximum=maximum,count=count):
+                self.setUp()
+                self.otp_form()
+                self.page.auth.fields=[Field(self.page.auth,'otp',name='Verification code',maxlength=maximum) for _ in range(count)]
+                self.assertEqual(self.assistant.step(self.page,self.network),'unrecognized')
+                self.service.channel.prompt.assert_not_called()
+
+    def test_hidden_previous_account_frame_cannot_interrupt_current_app_otp(self):
+        field=self.otp_form()
+        old=Frame(self.page,'https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        old.visible=False
+        old.fields=[Field(old,'account','other@example.test',name='Apple Account')]
+        self.page.frames.append(old)
+        self.assertEqual(self.assistant.step(self.page,self.network),'acted')
+        self.assertEqual(field.value,'012345')
 
     def test_otp_heading_before_fields_uses_recognition_budget_without_prompt(self):
         self.otp_form()

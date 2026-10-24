@@ -284,7 +284,7 @@ async function scope(page: Page, name: "通用" | "甲" | "乙") {
 async function expectSaved(
   page: Page,
   name: "通用" | "甲" | "乙",
-  overrides: { start?: string; street?: string; mode?: string } = {},
+  overrides: { street?: string; mode?: string } = {},
 ) {
   await expect(page.getByLabel("详细地址", { exact: true })).toHaveValue(
     overrides.street || `${name}保存的街道 100 号`,
@@ -298,15 +298,11 @@ async function expectSaved(
     `2. Apple ${name}第二店`,
   ]);
   await expect(
+    page.getByRole("note", { name: "自提时段规则", exact: true }),
+  ).toContainText("今天起7个自然日内最早有效自提时段");
+  await expect(
     page.getByRole("combobox", { name: "自提时段规则", exact: true }),
-  ).toHaveText("指定时间窗口");
-  await expect(page.getByLabel("可接受开始时间", { exact: true })).toHaveValue(
-    overrides.start ||
-      (name === "通用" ? "10:00" : name === "甲" ? "11:00" : "12:00"),
-  );
-  await expect(page.getByLabel("可接受结束时间", { exact: true })).toHaveValue(
-    "18:00",
-  );
+  ).toHaveCount(0);
   await expect(
     page.getByRole("combobox", { name: "取货联系人来源", exact: true }),
   ).toHaveText(
@@ -354,18 +350,16 @@ test("保存后切页和刷新均从按需详情恢复自提时段与送货地�
   await fixture(page);
   await page.goto("/#/settings", { waitUntil: "domcontentloaded" });
   await expectSaved(page, "通用");
-  await page.getByLabel("可接受开始时间", { exact: true }).fill("13:30");
   await page.getByRole("button", { name: "保存自提预设", exact: true }).click();
   await expect
     .poll(() =>
       page.evaluate(
         (id) =>
-          (window as any).savedSettingsFixture()[id].pickup.time_slot_rule
-            .start,
+          (window as any).savedSettingsFixture()[id].pickup.time_slot_rule,
         LOCAL,
       ),
     )
-    .toBe("13:30");
+    .toEqual({ mode: "earliest", fallback: "earliest" });
   await page.getByLabel("详细地址", { exact: true }).fill("通用新街道 202 号");
   await page.getByRole("button", { name: "保存地址预设", exact: true }).click();
   await expect
@@ -379,12 +373,10 @@ test("保存后切页和刷新均从按需详情恢复自提时段与送货地�
   await page.getByRole("link", { name: "账号工作台", exact: true }).click();
   await page.getByRole("link", { name: "本地配置", exact: true }).click();
   await expectSaved(page, "通用", {
-    start: "13:30",
     street: "通用新街道 202 号",
   });
   await page.reload({ waitUntil: "domcontentloaded" });
   await expectSaved(page, "通用", {
-    start: "13:30",
     street: "通用新街道 202 号",
   });
   expect(

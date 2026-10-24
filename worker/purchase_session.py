@@ -44,20 +44,28 @@ def verify_account_session(service, *, force_browser=False):
 
 def _read_or_restore(service):
     from browser_login import BrowserSessionError
+    auth=json.loads(Path(service.auth).read_text(encoding='utf-8'))
+    cookies=auth.get('cookies') if isinstance(auth,dict) else None
+    if isinstance(cookies,dict) and not any(isinstance(rows,list) and rows for rows in cookies.values()):
+        return _restore_browser(service)
     with requests.Session() as session:
-        duo_killer.load_auth(session, json.loads(Path(service.auth).read_text(encoding='utf-8')))
-        try:
-            result = duo_killer.account_info(session, reauthenticate=False)
-        except (ValueError, requests.RequestException):
-            result = None
-        if isinstance(result, dict) and result.get('success') is True and result.get('logged_in') is True:
-            if str(result.get('apple_id', '')).strip().casefold() != service.account.strip().casefold():
+        duo_killer.load_auth(session,auth)
+        # Timeouts, TLS failures, blocked responses and unknown account models
+        # provide no evidence that the existing login expired. Never turn those
+        # failures into a credential submission.
+        result=duo_killer.account_info(session,reauthenticate=False)
+        if isinstance(result,dict) and result.get('success') is True and result.get('logged_in') is True:
+            if str(result.get('apple_id','')).strip().casefold()!=service.account.strip().casefold():
                 raise BrowserSessionError('APPLE_ACCOUNT_MISMATCH',
-                    '官网当前登录账号与任务账号不一致，未开始购买。',
-                    status='failed', requires_login=False)
+                    '官网当前登录账号与任务账号不一致，未开始购买。',status='failed',requires_login=False)
             duo_killer.save_auth(session)
-            return {**result, 'status': 'healthy'}
-    return _restore_browser(service)
+            return {**result,'status':'healthy'}
+        if (isinstance(result,dict) and result.get('success') is True
+                and result.get('logged_in') is False and result.get('reauthentication_required') is True):
+            return _restore_browser(service)
+    raise BrowserSessionError('PURCHASE_SESSION_UNVERIFIED',
+        '官网当前会话暂时无法核验，已保留登录状态；未重新登录或开始购买。',
+        status='failed',requires_login=False)
 
 
 def _restore_browser(service):
@@ -85,6 +93,18 @@ def session_ready(service, *, now_ms=None):
             and all(proof.get(key) == value for key, value in _identity(service).items())
             and type(proof.get('verified_at_ms')) is int
             and 0 <= current - proof['verified_at_ms'] < RECENT_MS)
+
+
+def action_session_ready(service):
+    """Current account owner proof, including its exclusive queue executor."""
+    if session_ready(service):return True
+    owner=getattr(service,'_purchase_session_owner',None)
+    if owner is None:return False
+    proof=getattr(owner,'_purchase_session_proof',None)
+    # This target and its configured retries already passed owner admission.
+    # A wave refresh only happens after active targets have drained.
+    return (isinstance(proof,dict)
+        and all(proof.get(key)==value for key,value in _identity(service).items()))
 
 
 def ensure_purchase_session(service):

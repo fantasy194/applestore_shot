@@ -595,9 +595,9 @@ class BrowserInitializationTests(unittest.TestCase):
                                 for call in process_factory.call_args_list))
             self.assertEqual(marker.read_text(), "keep")
             self.assertEqual(browser.new_browser_cdp_session.return_value.send.call_count, 2)
-            context.new_page.assert_called_once()
+            self.assertEqual(context.new_page.call_count, 2)
             self.assertEqual(page.close.call_count, 2)
-            restored_page.close.assert_called_once_with()
+            restored_page.close.assert_not_called()  # Its old tab was not the new controlled task page.
             launcher.launch.assert_not_called()
             launcher.launch_persistent_context.assert_not_called()
 
@@ -620,6 +620,7 @@ class BrowserInitializationTests(unittest.TestCase):
             context.pages = [restored_page, page]
             context.cookies.return_value = []
             restored_page.goto.return_value.status = 200
+            context.new_page.return_value = restored_page
             with self.assertRaisesRegex(LoginError, "尚未取得"):
                 client.initialize_browser_context()
             browser.new_browser_cdp_session.return_value.send.assert_called_once_with("Browser.close")

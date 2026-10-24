@@ -50,6 +50,7 @@ import { PwaAccess, PwaSettingsPage } from "./PwaAccess";
 import { PurchaseQueue, logsHref } from "./PurchaseQueue";
 import { ActivityLogs } from "./ActivityLogs";
 import { RemoteBrowser } from "./RemoteBrowser";
+import { PurchaseTiming } from "./PurchaseTiming";
 import {
   active,
   LOCAL_ID,
@@ -107,7 +108,7 @@ function WorkspaceApp() {
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState("");
   const [dispatching, setDispatching] = useState(false);
-  const [concurrency, setConcurrency] = useState(1);
+  const concurrency = 1;
   const [retryCount, setRetryCount] = useState(0);
   const [invalidPurchaseNumbers, setInvalidPurchaseNumbers] = useState<
     string[]
@@ -258,7 +259,8 @@ function WorkspaceApp() {
           task.status !== "scheduled" &&
           !(
             !task.order_submitted &&
-            (task.action === "session_maintain" ||
+            (task.prompt?.kind === "prepared_purchase" ||
+              task.action === "session_maintain" ||
               (task.action === "login" && task.warm_only === true))
           )),
     );
@@ -437,7 +439,7 @@ function WorkspaceApp() {
         onTask={async (taskId, targetAccount) => {
           const state = await bridge.snapshot();
           setSnapshot(state);
-          const selected = state.tasks.find(
+          const selected = snapshot.tasks.find(
             (task) => task.id === taskId && task.account_id === targetAccount,
           );
           if (selected) openTask(selected);
@@ -902,28 +904,10 @@ function WorkspaceApp() {
                                 purchaseValidity("quantity", valid)
                               }
                             />
-                            <NumberField
-                              label="自提并发路数"
-                              min={1}
-                              max={10}
-                              required
-                              disabled={purchaseBusy}
-                              value={concurrency}
-                              onChange={setConcurrency}
-                              onValidityChange={(valid) =>
-                                purchaseValidity("concurrency", valid)
-                              }
-                              hint={
-                                <>
-                                  默认 1 路，每路购买 {quantity}{" "}
-                                  件，最多可能生成{" "}
-                                  {Number.isInteger(concurrency)
-                                    ? concurrency
-                                    : 0}{" "}
-                                  笔订单。送货使用单路。
-                                </>
-                              }
-                            />
+                            <p className="muted">
+                              同账号顺序下单，每次购买 {quantity}{" "}
+                              件；不同账号可同时执行。
+                            </p>
                             <NumberField
                               label="下单失败重试次数"
                               min={0}
@@ -1174,10 +1158,35 @@ function WorkspaceApp() {
                                   ? "准备完成，未下单"
                                   : task.result?.status === "pending_payment"
                                     ? "已取得订单号"
-                                    : stateNames[task.status]}
+                                    : task.prompt?.kind === "prepared_purchase"
+                                      ? "等待购买触发"
+                                      : stateNames[task.status]}
                       </span>
                     </div>
                     <p className="task-account">{format(account.email)}</p>
+                    {task.prepared_handoff?.source === "scheduled" &&
+                      task.prepared_handoff?.prepared_task_id !== task.id &&
+                      snapshot.tasks.some(
+                        (candidate) =>
+                          candidate.id ===
+                            task.prepared_handoff?.prepared_task_id &&
+                          candidate.account_id === task.account_id,
+                      ) && (
+                        <button
+                          className="ui-action-link"
+                          onClick={() => {
+                            const target = snapshot.tasks.find(
+                              (candidate) =>
+                                candidate.id ===
+                                  task.prepared_handoff?.prepared_task_id &&
+                                candidate.account_id === task.account_id,
+                            );
+                            if (target) openTask(target);
+                          }}
+                        >
+                          查看实际下单任务
+                        </button>
+                      )}
                     <RemoteBrowser bridge={bridge} task={task} />
                     {task.prompt ? (
                       <PromptForm
@@ -1258,6 +1267,7 @@ function WorkspaceApp() {
                         查看此任务完整日志
                       </a>
                     </details>
+                    <PurchaseTiming performance={task.result?.performance} />
                     {task.result &&
                       (task.status === "succeeded" ||
                         [
@@ -1318,7 +1328,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.12</span>
+          <span>DUO Killer · 0.1.13</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (
@@ -1673,9 +1683,9 @@ function SessionMaintenance({
       />
       <p className="ui-caption">
         {flow === "pickup_prepare"
-          ? "按各账号的商品、数量和自提偏好准备结算；可能加购，不提交订单。浏览器按需无头运行。"
+          ? "按各账号的商品、数量和自提偏好准备结算；可能加购，不提交订单。有货后接手原准备继续购买。"
           : flow === "browser_login"
-            ? "保留账号和浏览器登录资料，使用现有凭证恢复官网登录；不加购、不下单。浏览器按需无头运行。"
+            ? "保留账号和浏览器登录资料，使用现有凭证恢复官网登录；不加购、不下单。"
             : "自动维护账号会话，失效时使用保存的凭证登录；不加购、不下单。"}
       </p>
       <p className="ui-caption">
@@ -2250,6 +2260,22 @@ function PromptForm({
   const canSavePassword =
     storage?.available === true && storage.persistent === true;
   const encryptedStorage = storage?.backend === "encrypted_file";
+  if (prompt.kind === "prepared_purchase") {
+    const prepared = prompt.prepared;
+    return (
+      <section className="prompt-form" aria-label="自提准备状态">
+        <h3>{prepared?.order_ready ? "自提准备就绪" : "已保留自提准备"}</h3>
+        <p>
+          尚未创建订单。发现授权门店有货或点击购买时，将优先接手本次准备。
+          {prepared?.preparation_stage === "fulfillment" &&
+            "下单时仍需确认门店及有效时段。"}
+        </p>
+        <button type="button" className="secondary" onClick={onCancel}>
+          结束准备
+        </button>
+      </section>
+    );
+  }
   return (
     <form
       className="prompt-form"

@@ -41,7 +41,7 @@ class PickupModeSwitchTests(TestCase):
         self.assertEqual(fixed['pickup']['store_id'], 'R999')
         for data in (original, fixed, validate_preset(restored)):
             self.assertEqual(data['contact'], CONTACT)
-            self.assertEqual(data['pickup']['time_slot_rule'], RULE)
+            self.assertEqual(data['pickup']['time_slot_rule'], {'mode':'earliest','fallback':'earliest'})
             self.assertEqual(data['pickup']['contact_mode'], 'official')
             self.assertEqual(data['pickup']['id_last4'], 'A123')
 

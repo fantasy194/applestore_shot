@@ -411,7 +411,7 @@ test("监控运行时仍可查询官网门店，查询不会修改目标或中�
     "自定义 SKU",
   );
   await search.getByLabel("商品 SKU", { exact: true }).fill("MQ9R3CH");
-  await search.getByLabel("每路购买数量", { exact: true }).fill("2");
+  await search.getByLabel("每次购买数量", { exact: true }).fill("2");
   await search.getByLabel("门店搜索城市 / 邮编").fill("上海");
   await search.getByRole("button", { name: "从官网读取门店" }).click();
   await expect(
@@ -445,7 +445,7 @@ test("监控运行时仍可查询官网门店，查询不会修改目标或中�
   expect(await page.evaluate(() => (window as any).cancelled)).toEqual([]);
 });
 
-test("读取官网门店后加入目标并保存账号与并发配置", async ({ page }) => {
+test("读取官网门店后加入目标并保存账号，实际购买固定单路", async ({ page }) => {
   await fixture(page);
   await page.goto("/#/monitor", { waitUntil: "domcontentloaded" });
   await expect(page.locator(".inventory-target")).toHaveCount(2);
@@ -459,20 +459,12 @@ test("读取官网门店后加入目标并保存账号与并发配置", async ({
   for (const card of await page.locator(".inventory-target").all())
     await card.getByText("抢购设置", { exact: true }).click();
   await expect(
-    page
-      .locator(".inventory-target")
-      .first()
-      .getByRole("spinbutton", { name: "并发路数", exact: true }),
-  ).toHaveValue("3");
-  await expect(
-    page
-      .locator(".inventory-target")
-      .nth(1)
-      .getByRole("spinbutton", { name: "并发路数", exact: true }),
-  ).toHaveValue("1");
-  await expect(
-    target.getByRole("spinbutton", { name: "并发路数", exact: true }),
-  ).toHaveValue("1");
+    page.getByRole("spinbutton", { name: "并发路数", exact: true }),
+  ).toHaveCount(0);
+  for (const card of await page.locator(".inventory-target").all())
+    await expect(card).toContainText(
+      "同账号顺序执行，每次1路；不同账号可并行。",
+    );
   await expect(
     target.getByRole("spinbutton", { name: "下单失败重试次数", exact: true }),
   ).toHaveValue("0");
@@ -493,9 +485,6 @@ test("读取官网门店后加入目标并保存账号与并发配置", async ({
     "测试账号 · own**@example.test",
   );
   await target
-    .getByRole("spinbutton", { name: "并发路数", exact: true })
-    .fill("2");
-  await target
     .getByRole("spinbutton", { name: "下单失败重试次数", exact: true })
     .fill("2");
   await target.getByRole("checkbox", { name: "有货立即自提抢购" }).check();
@@ -514,7 +503,7 @@ test("读取官网门店后加入目标并保存账号与并发配置", async ({
     store_name: "Apple 测试三店",
     account_id: "a",
     auto_purchase: true,
-    concurrency: 2,
+    concurrency: 1,
     retry_count: 2,
     quantity: 1,
   });
@@ -529,7 +518,7 @@ test("人工自提默认一路", async ({ page }) => {
   await page.goto("/");
   await expect(
     page.getByRole("spinbutton", { name: "自提并发路数", exact: true }),
-  ).toHaveValue("1");
+  ).toHaveCount(0);
   await expect(
     page.getByRole("spinbutton", { name: "下单失败重试次数", exact: true }),
   ).toHaveValue("0");
@@ -576,17 +565,12 @@ test("自提定时默认一路", async ({ page }) => {
   ).toBe(0);
 });
 
-test("人工自提可显式设置三路，展示各路结果并使用对应付款任务", async ({
-  page,
-}) => {
+test("新购买固定单路，历史多路结果保留并使用对应付款任务", async ({ page }) => {
   await fixture(page);
   await page.goto("/");
   await expect(
     page.getByRole("spinbutton", { name: "自提并发路数", exact: true }),
-  ).toHaveValue("1");
-  await page
-    .getByRole("spinbutton", { name: "自提并发路数", exact: true })
-    .fill("3");
+  ).toHaveCount(0);
   await page
     .getByRole("button", { name: "立即下单（自提）", exact: true })
     .click();
@@ -597,8 +581,40 @@ test("人工自提可显式设置三路，展示各路结果并使用对应付�
     sku: "MLH74FE",
     quantity: 1,
     fulfillment: "RETAIL",
-    concurrency: 3,
+    concurrency: 1,
   });
+  // Preserve rendering and payment ownership for genuine historical multi-lane
+  // records; no current purchase request may create these lanes.
+  await page.evaluate(() =>
+    (window as any).reportPurchase({
+      result: {
+        success: true,
+        status: "parallel_complete",
+        concurrency: 3,
+        attempts: [
+          {
+            attempt: 1,
+            task_id: "00000000-0000-4000-8000-000000000001",
+            status: "pending_payment",
+            result: {
+              success: true,
+              status: "pending_payment",
+              order_number: "W12345678",
+              amount_due: "RMB 69",
+              pickup_store: "Apple 测试一店",
+            },
+          },
+          {
+            attempt: 2,
+            task_id: "00000000-0000-4000-8000-000000000002",
+            status: "submission_unknown",
+            error: "提交结果未知，请查询订单",
+            order_submitted: true,
+          },
+        ],
+      },
+    }),
+  );
   await expect(
     page.getByRole("heading", { name: "第 1 路 · 待付款" }),
   ).toBeVisible();
@@ -612,12 +628,12 @@ test("人工自提可显式设置三路，展示各路结果并使用对应付�
   expect(qr.params.source_task).toBe("00000000-0000-4000-8000-000000000001");
 });
 
-test("自提定时保留配置路数，送货不附加并发", async ({ page }) => {
+test("自提定时固定单路，送货不附加并发", async ({ page }) => {
   await fixture(page);
   await page.goto("/");
-  await page
-    .getByRole("spinbutton", { name: "自提并发路数", exact: true })
-    .fill("2");
+  await expect(
+    page.getByRole("spinbutton", { name: "自提并发路数", exact: true }),
+  ).toHaveCount(0);
   await chooseOption(
     page.getByRole("combobox", { name: "定时收货方式", exact: true }),
     "自提（本地预设门店）",
@@ -628,7 +644,7 @@ test("自提定时保留配置路数，送货不附加并发", async ({ page }) 
   );
   expect(purchase.params).toMatchObject({
     fulfillment: "RETAIL",
-    concurrency: 2,
+    concurrency: 1,
   });
   expect(purchase.params.scheduled_at).toBeGreaterThan(Date.now());
 });
@@ -1070,3 +1086,53 @@ test("队列全部失败时保留失败说明且不显示虚构待付款订单",
     current.getByRole("img", { name: /支付宝付款二维码/ }),
   ).toHaveCount(0);
 });
+
+for (const width of [320, 390]) {
+  test(`${width}px 监控单路说明无自由并发输入，编辑旧目标保留数量和重试`, async ({
+    page,
+  }) => {
+    await fixture(page);
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto("/#/monitor", { waitUntil: "domcontentloaded" });
+    const target = page.locator(".inventory-target").first();
+    await target.getByText("抢购设置", { exact: true }).click();
+    await expect(target).toContainText(
+      "同账号顺序执行，每次1路；不同账号可并行。",
+    );
+    await expect(
+      target.getByRole("spinbutton", { name: "并发路数", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      target.getByRole("spinbutton", { name: "下单失败重试次数", exact: true }),
+    ).toHaveValue("2");
+    const armed = target.getByRole("checkbox", {
+      name: "有货立即自提抢购",
+      exact: true,
+    });
+    await armed.uncheck();
+    await armed.check();
+    await page.getByRole("button", { name: "保存配置", exact: true }).click();
+    await expect(
+      page.getByRole("status").filter({ hasText: "监控配置已保存" }),
+    ).toBeVisible();
+    const saved = await page.evaluate(
+      () =>
+        (window as any).started.findLast(
+          (call: any) => call.action === "inventory_settings_save",
+        ).params.config,
+    );
+    expect(saved.targets[0]).toMatchObject({
+      concurrency: 1,
+      quantity: 1,
+      retry_count: 2,
+      account_id: "a",
+      auto_purchase: true,
+    });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    await target.screenshot({
+      path: `artifacts/goal-0113-single-lane-monitor-${width}.png`,
+    });
+  });
+}

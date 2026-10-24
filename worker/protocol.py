@@ -17,6 +17,10 @@ class Cancelled(BaseException):
     pass
 
 
+class PromptExpired(ValueError):
+    """A bounded preparation expired without purchase authorization."""
+
+
 class PromptClosed(ValueError):
     """The process owning a prompt ended; no user reply was synthesized."""
 
@@ -213,12 +217,14 @@ class Channel:
             self.cancelled.set()
             self.responses.put(None)
 
-    def prompt(self, kind, label, *, timeout=None, _alive=None, **fields):
+    def prompt(self, kind, label, *, timeout=None, _alive=None, _request_id=None, **fields):
         self.checkpoint()
         if _alive is not None and not _alive():
             raise PromptClosed('认证步骤已结束。')
         deadline = time.monotonic() + timeout if timeout is not None else None
-        request_id = str(uuid.uuid4())
+        request_id = _request_id or str(uuid.uuid4())
+        if not isinstance(request_id,str) or not 1 <= len(request_id) <= 200:
+            raise ValueError('交互标识无效。')
         if kind == 'code' and self._checkout_auth_lease is not None:
             fields['checkout_auth_lease'] = self._checkout_auth_lease
         self.emit('prompt', prompt=dict(id=request_id, kind=kind, label=label, **fields))
@@ -235,10 +241,10 @@ class Channel:
                 self.checkpoint()
                 if _alive is not None and (deadline is None or time.monotonic() < deadline):
                     continue
-                raise ValueError('准备等待已超时，请重新准备；未提交订单。') from None
+                raise PromptExpired('准备等待已超时，请重新准备；未提交订单。') from None
             self.checkpoint()
             if deadline is not None and time.monotonic() >= deadline:
-                raise ValueError('准备等待已超时，请重新准备；未提交订单。')
+                raise PromptExpired('准备等待已超时，请重新准备；未提交订单。')
             if response and response.get('request_id') == request_id:
                 return response.get('value')
 

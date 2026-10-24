@@ -7,9 +7,11 @@ async function fixture(
     monitoring?: boolean;
     saveFails?: boolean;
     settingsFail?: boolean;
+    legacyRule?: "latest" | "window";
   } = {},
 ) {
-  await page.addInitScript(({ monitoring, saveFails, settingsFail }) => {
+  await page.addInitScript((options) => {
+    const { monitoring, saveFails, settingsFail, legacyRule } = options;
     const root = window as any;
     const account = {
       id: "a",
@@ -18,7 +20,30 @@ async function fixture(
       preset_sku: "MLH74FE",
       preset_quantity: 2,
     };
-    let checkout: any = { pickup: { search: "201101" }, contact: {} };
+    let checkout: any = {
+      pickup: {
+        search: "201101",
+        ...(legacyRule
+          ? {
+              contact_mode: "official",
+              time_slot_rule: {
+                mode: legacyRule,
+                start: "13:00",
+                end: "18:00",
+                fallback: "stop",
+              },
+            }
+          : {}),
+      },
+      contact: legacyRule
+        ? {
+            lastName: "测试",
+            firstName: "取货人",
+            emailAddress: "pickup@example.test",
+            fullDaytimePhone: "13800138000",
+          }
+        : {},
+    };
     let inventory: any = {
       interval_seconds: 1,
       proxy: {
@@ -193,7 +218,7 @@ async function addStores(page: Page, names = ["Apple 第一店", "Apple 第二�
     .click();
 }
 
-test("多选门店按点击顺序加入并可重排删除，窗口规则可免本地联系人保存", async ({
+test("多选门店按点击顺序加入并可重排删除，统一7日最早时段可免本地联系人保存", async ({
   page,
 }) => {
   await fixture(page);
@@ -213,16 +238,12 @@ test("多选门店按点击顺序加入并可重排删除，窗口规则可免�
   await list.getByRole("button", { name: "下移 Apple 第一店" }).click();
   await list.getByRole("button", { name: "删除预选 Apple 第三店" }).click();
   await expect(list.locator("article strong")).toHaveText(["1. Apple 第一店"]);
-  await chooseOption(
+  await expect(
+    page.getByRole("note", { name: "自提时段规则", exact: true }),
+  ).toContainText("今天起7个自然日内最早有效自提时段");
+  await expect(
     page.getByRole("combobox", { name: "自提时段规则", exact: true }),
-    "指定时间窗口",
-  );
-  await page.getByLabel("可接受开始时间").fill("10:30");
-  await page.getByLabel("可接受结束时间").fill("15:00");
-  await chooseOption(
-    page.getByRole("combobox", { name: "无匹配时段", exact: true }),
-    "尝试下一预选门店，全部无匹配时停止",
-  );
+  ).toHaveCount(0);
   await expect(
     page.getByRole("combobox", { name: "取货联系人来源", exact: true }),
   ).toHaveText("优先使用本次官网保存的联系人");
@@ -246,19 +267,16 @@ test("多选门店按点击顺序加入并可重排删除，窗口规则可免�
       { store_id: "R001", store_name: "Apple 第一店", search: "201101" },
     ],
     time_slot_rule: {
-      mode: "window",
-      start: "10:30",
-      end: "15:00",
-      fallback: "stop",
+      mode: "earliest",
+      fallback: "earliest",
     },
   });
   expect(params.contact).toBeUndefined();
   await page.getByRole("link", { name: "账号工作台", exact: true }).click();
   await page.getByRole("link", { name: "本地配置", exact: true }).click();
   await expect(
-    page.getByRole("combobox", { name: "自提时段规则", exact: true }),
-  ).toHaveText("指定时间窗口");
-  await expect(page.getByLabel("可接受开始时间")).toHaveValue("10:30");
+    page.getByRole("note", { name: "自提时段规则", exact: true }),
+  ).toContainText("支持明天或以后取货");
   await expect(page.getByLabel("预选自提门店顺序")).toContainText("R001");
   expect(
     await page.evaluate(() => document.documentElement.scrollWidth),
@@ -270,16 +288,15 @@ test("多选门店按点击顺序加入并可重排删除，窗口规则可免�
 });
 
 for (const monitoring of [true, false]) {
-  test(`先保存偏好再联动监控，保留其他配置及已有路数：monitoring=${monitoring}`, async ({
+  test(`先保存偏好再联动监控，保留其他配置并固定本账号单路：monitoring=${monitoring}`, async ({
     page,
   }) => {
     await fixture(page, { monitoring });
     await page.goto("/#/settings", { waitUntil: "domcontentloaded" });
     await addStores(page, ["Apple 第二店", "Apple 第一店"]);
-    await chooseOption(
-      page.getByRole("combobox", { name: "自提时段规则", exact: true }),
-      "最晚可用日期与时段",
-    );
+    await expect(
+      page.getByRole("note", { name: "自提时段规则", exact: true }),
+    ).toContainText("包含今天及随后6天");
     await page
       .getByRole("button", { name: "监控预选门店，有货自动下单" })
       .click();
@@ -320,7 +337,7 @@ for (const monitoring of [true, false]) {
       sku: "MLH74FE",
       quantity: 2,
       auto_purchase: true,
-      concurrency: 2,
+      concurrency: 1,
       retry_count: 1,
     });
     expect(
@@ -383,3 +400,65 @@ test("固定模式也可先保存门店偏好，手机页面无横向溢出", as
     await page.evaluate(() => document.documentElement.scrollWidth),
   ).toBeLessThanOrEqual(390);
 });
+
+for (const [width, legacyRule] of [
+  [320, "latest"],
+  [390, "window"],
+] as const) {
+  test(`${width}px 旧${legacyRule}配置统一7自然日最早规则，保存保留门店与联系人`, async ({
+    page,
+  }) => {
+    await fixture(page, { legacyRule });
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto("/#/settings", { waitUntil: "domcontentloaded" });
+    await expect(
+      page.getByRole("note", { name: "自提时段规则", exact: true }),
+    ).toContainText("今天起7个自然日内最早有效自提时段");
+    await expect(
+      page.getByRole("combobox", { name: "自提时段规则", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByLabel("可接受开始时间", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByLabel("可接受结束时间", { exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("combobox", { name: "无匹配时段", exact: true }),
+    ).toHaveCount(0);
+    await page.getByLabel("自提门店", { exact: true }).fill("Apple 固定店");
+    await page
+      .getByRole("button", { name: "保存自提预设", exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (window as any).savedCheckout().pickup.time_slot_rule,
+        ),
+      )
+      .toEqual({ mode: "earliest", fallback: "earliest" });
+    const saved = await page.evaluate(() => (window as any).savedCheckout());
+    expect(saved.pickup.store_name).toBe("Apple 固定店");
+    expect(saved.pickup.contact_mode).toBe("official");
+    expect(saved.contact).toEqual({
+      lastName: "测试",
+      firstName: "取货人",
+      emailAddress: "pickup@example.test",
+      fullDaytimePhone: "13800138000",
+    });
+    await expect(
+      page.getByRole("combobox", { name: "取货联系人来源", exact: true }),
+    ).toHaveText("优先使用本次官网保存的联系人");
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    await page
+      .locator(".pickup-preferences")
+      .screenshot({ path: `artifacts/goal-0113-pickup-policy-${width}.png` });
+    await page
+      .getByRole("note", { name: "自提时段规则", exact: true })
+      .screenshot({
+        path: `artifacts/goal-0113-pickup-time-note-${width}.png`,
+      });
+  });
+}

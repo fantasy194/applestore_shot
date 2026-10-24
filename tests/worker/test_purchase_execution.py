@@ -22,17 +22,22 @@ class SharedPurchaseExecutionTests(unittest.TestCase):
                 execute_purchase_attempt(service,params)
             purchase.assert_called_once_with('MK2P4CH',quantity=2)
 
-    def test_isolated_queue_and_manual_parallel_receive_same_authorized_params(self):
-        params={'sku':'MK2P4CH','quantity':2,'fulfillment':'RETAIL','concurrency':2,
+    def test_manual_and_queue_preserve_quantity_retry_but_use_one_account_route(self):
+        params={'sku':'MK2P4CH','quantity':2,'fulfillment':'RETAIL','concurrency':4,'retry_count':2,
                 'pickup_policy':{'stores':[{'store_id':'R001'}]}}
         service=Mock()
-        with patch('parallel_checkout.run_parallel_purchase',return_value={'status':'parallel_complete'}) as manual:
-            execute_purchase_attempt(service,params)
-        queue=Mock(return_value={'status':'parallel_complete'})
-        execute_purchase_attempt(service,params,isolated=True,parallel_executor=queue)
-        self.assertEqual(manual.call_args.args,queue.call_args.args)
-        self.assertTrue(manual.call_args.kwargs['preflight_complete'])
-        self.assertEqual(params['concurrency'],2)
+        with patch('duo_killer.purchase_sku',return_value={'success':True}) as purchase, \
+                patch('parallel_checkout.run_parallel_purchase') as parallel:
+            direct=execute_purchase_attempt(service,params)
+        purchase.assert_called_once_with('MK2P4CH',quantity=2);parallel.assert_not_called()
+        queue=Mock(return_value={'success':True})
+        queued=execute_purchase_attempt(service,params,serial_executor=queue)
+        self.assertEqual(queue.call_args.args[1]['concurrency'],1)
+        self.assertEqual(queue.call_args.args[1]['retry_count'],2)
+        self.assertEqual(queue.call_args.args[1]['quantity'],2)
+        self.assertEqual(direct['effective_concurrency'],queued['effective_concurrency'])
+        self.assertEqual(direct['requested_concurrency'],4)
+        self.assertEqual(params['concurrency'],4)
 
     def test_prepare_only_never_dispatches_isolated_or_parallel_checkout(self):
         service=Mock(automatic_checkout=True)

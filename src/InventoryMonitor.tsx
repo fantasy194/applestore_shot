@@ -295,7 +295,7 @@ export function InventoryMonitor({
     change({
       ...config,
       targets: config.targets.map((target) =>
-        target.id === id ? { ...target, ...patch } : target,
+        target.id === id ? { ...target, ...patch, concurrency: 1 } : target,
       ),
     });
   }
@@ -647,7 +647,7 @@ export function InventoryMonitor({
                             (product) =>
                               product.sku === target.sku.replace(/\/A$/, ""),
                           )?.name || target.sku}{" "}
-                          · {target.sku} · 每路 {target.quantity} 件
+                          · {target.sku} · 每次 {target.quantity} 件
                         </span>
                         <small>
                           {target.store_id} · {target.location}
@@ -676,7 +676,7 @@ export function InventoryMonitor({
                     </p>
                     <p className="monitor-target-summary muted">
                       {target.auto_purchase
-                        ? `自动抢购 · ${format(snapshot.accounts.find((account) => account.id === target.account_id)?.name || "未选账号")} · ${target.concurrency ?? 1} 路`
+                        ? `自动抢购 · ${format(snapshot.accounts.find((account) => account.id === target.account_id)?.name || "未选账号")} · 同账号顺序执行`
                         : "仅监控"}
                     </p>
                     <details className="ui-disclosure monitor-target-settings">
@@ -717,20 +717,9 @@ export function InventoryMonitor({
                             updateTarget(target.id, { account_id: value })
                           }
                         />
-                        <NumberField
-                          label="并发路数"
-                          min={1}
-                          max={10}
-                          required
-                          value={target.concurrency ?? 1}
-                          disabled={busy || running}
-                          onValidityChange={(valid) =>
-                            numberValidity(`${target.id}:concurrency`, valid)
-                          }
-                          onChange={(value) =>
-                            updateTarget(target.id, { concurrency: value })
-                          }
-                        />
+                        <p className="ui-caption">
+                          同账号顺序执行，每次1路；不同账号可并行。
+                        </p>
                         <NumberField
                           label="下单失败重试次数"
                           min={0}
@@ -813,7 +802,7 @@ export function InventoryMonitor({
                 />
               </label>
               <NumberField
-                label="每路购买数量"
+                label="每次购买数量"
                 min={1}
                 max={99}
                 required
@@ -1035,7 +1024,7 @@ export function InventoryMonitor({
               监控期间目标配置锁定，官网门店查询仍可使用。请保持本地服务运行及电脑唤醒；服务重启后须重新开始监控。
             </p>
             <p className="muted">
-              自动抢购按账号自提偏好选择门店和时段，每路按所设数量购买，可能生成多笔待付款订单。确认未提交的失败才重试，已有订单或提交未知时停止。
+              自动抢购按账号自提偏好选择门店和时段，每次按所设数量购买。同账号顺序执行，不同账号可并行。确认未提交的失败才重试，已有订单或提交未知时停止。
             </p>
             <a className="ui-action-link" href="#/settings">
               自提门店与时段偏好

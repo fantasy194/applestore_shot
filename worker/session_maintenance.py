@@ -23,7 +23,7 @@ def record_maintenance_result(service, result, *, cooling=False, warm_only=False
 def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='login', sku=None, count=None):
     if preheat_flow not in ('login', 'pickup_prepare', 'browser_login'):
         raise ValueError('预热流程无效。')
-    browser_mode = 'headless' if getattr(service, 'headless_browser', False) is True else 'visible'
+    browser_mode = 'background' if getattr(service, 'headless_browser', False) is True else 'visible'
     path = service.root / 'session-maintenance.json'
     stamp = int(now() * 1000)
     if path.exists():
@@ -43,6 +43,8 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
     try:
         if preheat_flow == 'pickup_prepare':
             prepared = service.warm_pickup_prepare(sku, count)
+            if isinstance(getattr(service,'_prepared_claim',None),dict) or prepared.get('status')=='preparation_expired':
+                return prepared
             # Only an explicitly verified Review is a complete preparation. Stock-out
             # may preserve a useful Fulfillment session but is never healthy/order-ready.
             full = (prepared.get('success') is True and prepared.get('status') == 'prepared'
@@ -74,6 +76,8 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
                       **{key: checked[key] for key in ('error_code', 'http_status', 'browser_started', 'browser_connected')
                          if key in checked}}
     except Exception as error:
+        if isinstance(getattr(service,'_prepared_claim',None),dict):
+            raise
         http_status = getattr(error, 'http_status', None) or getattr(error, 'status', None)
         if http_status is None and isinstance(error, requests.RequestException) and error.response is not None:
             http_status = error.response.status_code

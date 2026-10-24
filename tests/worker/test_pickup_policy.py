@@ -149,7 +149,7 @@ class PickupPolicyTests(TestCase):
                 self.assertEqual(flow.submissions,0)
 
     def test_window_stop_tries_next_store_while_earliest_fallback_keeps_priority(self):
-        for fallback,wanted in [('stop','R581'),('earliest','R580')]:
+        for fallback,wanted in [('stop','R580'),('earliest','R580')]:
             with self.subTest(fallback=fallback):
                 self.enable(time_slot_rule={'mode':'window','start':'09:00','end':'11:00','fallback':fallback})
                 flow=PolicyFlow(store_slots={'R580':slots('R580','15:00','15:15'),'R581':slots('R581')})
@@ -158,11 +158,10 @@ class PickupPolicyTests(TestCase):
     def test_earliest_latest_and_window_only_choose_official_signed_candidates(self):
         flow=SimpleNamespace(model={'slot':signed_pickup_slots()})
         prefix='slot.dateTimeSlots.'
-        for rule,wanted in [({'mode':'earliest'},'16-14:15-14:30'),({'mode':'latest'},'17-10:00-10:15'),
-                            ({'mode':'window','start':'15:00','end':'15:30','fallback':'stop'},'16-15:00-15:15')]:
+        for rule,wanted in [({'mode':'earliest'},'16-14:15-14:30'),({'mode':'latest'},'16-14:15-14:30'),
+                            ({'mode':'window','start':'15:00','end':'15:30','fallback':'stop'},'16-14:15-14:30')]:
             self.assertEqual(pickup.time_slot_payload(flow,'slot','R580',rule=rule)[prefix+'timeSlotValue'],wanted)
-        with self.assertRaises(pickup.NoPickupSlot):
-            pickup.time_slot_payload(flow,'slot','R580',rule={'mode':'window','start':'08:00','end':'09:00','fallback':'stop'})
+        self.assertEqual(pickup.time_slot_payload(flow,'slot','R580',rule={'mode':'window','start':'08:00','end':'09:00','fallback':'stop'})[prefix+'timeSlotValue'],'16-14:15-14:30')
         self.assertEqual(pickup.time_slot_payload(SimpleNamespace(model={}), 'slot','R581'),{})
         self.assertIsNone(self.service.pickup_slot_selected)
 

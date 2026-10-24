@@ -216,7 +216,8 @@ def main(package):
                                  params={'pickup_only': True, 'pickup': pickup})
             clean_config = wait(empty_contact)['result']['config']
             assert clean_config['pickup']['stores'] == pickup['stores']
-            assert clean_config['pickup']['time_slot_rule'] == pickup['time_slot_rule']
+            # Old window preferences normalize to the shared seven-day earliest rule.
+            assert clean_config['pickup']['time_slot_rule'] == {'mode': 'earliest', 'fallback': 'earliest'}
             assert clean_config['pickup']['contact_mode'] == 'official'
             assert not clean_config.get('contact')
             preserved = call('start_task', accountId=a['id'], action='address_save',

@@ -72,8 +72,8 @@ def validate_target(value):
         raise ValueError('队列目标必须是对象。')
     target = {key: child for key, child in value.items() if key in (
         'queue_job_id', 'id', 'queue_assignment', 'sku', 'quantity', 'fulfillment',
-        'pickup_store_id', 'pickup_store_name', 'pickup_location', 'concurrency',
-        'retry_count', 'checked_at_ms', 'inventory_trigger', 'target_id', 'pickup_policy')}
+        'pickup_store_id', 'pickup_store_name', 'pickup_location', 'concurrency', 'requested_concurrency',
+        'retry_count', 'checked_at_ms', 'stock_detected_at_ms', 'queued_at_ms', 'dispatched_at_ms', 'inventory_trigger', 'target_id', 'pickup_policy','purchase_group_id')}
     identity = target.get('queue_job_id', target.get('id'))
     if not isinstance(identity, str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,100}', identity):
         raise ValueError('队列任务标识无效。')
@@ -82,6 +82,9 @@ def validate_target(value):
     if type(assignment) is not int or not 0 <= assignment <= 18_446_744_073_709_551_615:
         raise ValueError('队列分配代数无效。')
     target['queue_assignment'] = assignment
+    group=target.get('purchase_group_id')
+    if group is not None and (not isinstance(group,str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}',group)):
+        raise ValueError('购买目标标识无效。')
     sku = target.get('sku')
     if not isinstance(sku, str) or not re.fullmatch(r'[A-Za-z0-9]{5,30}(?:/[Aa])?', sku):
         raise ValueError('队列商品 SKU 无效。')
@@ -97,7 +100,8 @@ def validate_target(value):
             raise ValueError('队列门店名称或城市邮编无效。')
         target[key] = text.strip()
     target['fulfillment'] = 'RETAIL'
-    target['concurrency'] = concurrency(target)
+    target['requested_concurrency'] = concurrency({'concurrency':target.get('requested_concurrency',target.get('concurrency',1))})
+    target['concurrency'] = 1
     target['retry_count'] = retry_count(target)
     if 'pickup_policy' in target:
         target['pickup_policy'] = normalize_queue_pickup_policy(target['pickup_policy'])
@@ -166,6 +170,7 @@ class TargetChannel:
         self.base_channel = owner.channel
         self.base_service = owner.service
         self.assignment = owner.jobs[identity]['target']['queue_assignment']
+        self.purchase_group_id = owner.jobs[identity]['target'].get('purchase_group_id')
         self.context = None
 
     def checkpoint(self):
@@ -192,11 +197,11 @@ class TargetChannel:
                         result = {**result, 'pending_orders':list(by_number.values())}
                     self.owner.jobs[self.identity]['progress'] = copy.deepcopy(result)
                 self.owner.channel.emit('queue_progress', queue_job_id=self.identity, result=result,
-                                        queue_assignment=self.assignment,
+                                        queue_assignment=self.assignment,purchase_group_id=self.purchase_group_id,
                                         order_submitted=self.context.submitted is True)
         else:
-            self.owner.channel.emit(kind, queue_job_id=self.identity,
-                                    queue_assignment=self.assignment, **payload)
+            payload.update(queue_job_id=self.identity,queue_assignment=self.assignment,purchase_group_id=self.purchase_group_id)
+            self.owner.channel.emit(kind, **payload)
 
     def prompt(self, kind, label, **fields):
         # Channel has one current prompt; serialize interactions across jobs.
@@ -212,7 +217,7 @@ class TargetChannel:
                 raise PromptClosed('认证步骤已结束。')
             timeout = fields.pop('timeout', None)
             deadline = time.monotonic() + timeout if timeout is not None else None
-            request_id = str(uuid.uuid4())
+            request_id = fields.pop('_request_id',None) or str(uuid.uuid4())
             self.owner.channel.emit('prompt', prompt={
                 'id': request_id, 'kind': kind,
                 'label': f'[队列 {self.identity[:8]}] {label}', **fields,
@@ -300,7 +305,7 @@ class QueuedCheckout:
         mode = params.get('queue_mode', 'sequential')
         if type(limit) is not int or not 1 <= limit <= 10 or mode not in ('sequential', 'parallel'):
             raise ValueError('队列模式或并发任务数无效（1–10）。')
-        self.limit = limit if mode == 'parallel' else 1
+        self.limit = 1
         initial = params.get('queue_targets', [])
         if not isinstance(initial, list) or len(initial) > MAX_BUFFERED:
             raise ValueError('队列目标数过多或格式无效。')
@@ -332,7 +337,7 @@ class QueuedCheckout:
             attempts = []
             for identity, job in self.jobs.items():
                 result = job.get('result') or job.get('progress') or {}
-                jobs.append({'queue_job_id': identity, 'queue_assignment':job['target']['queue_assignment'],
+                jobs.append({'queue_job_id': identity, 'queue_assignment':job['target']['queue_assignment'],'purchase_group_id':job['target'].get('purchase_group_id'),
                              'sku':job['target']['sku'], 'quantity':job['target']['quantity'],
                              'store_id':job['target']['pickup_store_id'],
                              'store_name':job['target']['pickup_store_name'],
@@ -388,9 +393,12 @@ class QueuedCheckout:
             if job['acked']:
                 return
             result['queue_assignment'] = job['target']['queue_assignment']
+            result['purchase_group_id'] = job['target'].get('purchase_group_id')
+            result['effective_concurrency']=1
+            result['requested_concurrency']=job['target'].get('requested_concurrency',1)
             job.update(result=result, status=result['status'], acked=True)
         self.channel.emit('queue_finished', queue_job_id=identity, result=result,
-                          queue_assignment=job['target']['queue_assignment'],
+                          queue_assignment=job['target']['queue_assignment'],purchase_group_id=job['target'].get('purchase_group_id'),
                           order_submitted=result.get('order_submitted') is True)
 
     def _context(self, identity):
@@ -506,7 +514,7 @@ class QueuedCheckout:
         thread = threading.Thread(target=self._run_target, args=(identity, context), daemon=True)
         self.running[identity] = thread
         self.channel.emit('queue_started', queue_job_id=identity,
-                          queue_assignment=job['target']['queue_assignment'])
+                          queue_assignment=job['target']['queue_assignment'],purchase_group_id=job['target'].get('purchase_group_id'))
         thread.start()
 
     def _drain_completed(self):
@@ -545,7 +553,7 @@ class QueuedCheckout:
                         mode = command.get('queue_mode')
                         if mode not in (None, 'sequential', 'parallel'):
                             raise ValueError('队列热更新模式无效。')
-                        self.limit = 1 if mode == 'sequential' else limit
+                        self.limit = 1
                     self._add(command.get('queue_targets', []))
             elif kind == 'queue_cancel':
                 identity = command.get('queue_job_id')

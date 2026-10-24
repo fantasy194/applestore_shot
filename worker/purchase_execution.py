@@ -11,7 +11,12 @@ def execute_purchase_attempt(service, params, *, isolated=False, parallel_execut
     from parallel_checkout import concurrency, run_parallel_purchase
     from service import quantity
     count = quantity(params)
-    routes = concurrency(params)
+    requested_routes = concurrency({'concurrency':params.get('requested_concurrency',params.get('concurrency',1))})
+    concurrency(params)
+    # One account owns one mutable Apple bag/Checkout. Route count never
+    # becomes extra purchases or an implicit retry budget.
+    routes = 1
+    params = {**params,'concurrency':1}
     preparing = params.get('prepare_only') is True
     retail = params.get('fulfillment', 'HOME') == 'RETAIL'
     if preparing:
@@ -24,8 +29,14 @@ def execute_purchase_attempt(service, params, *, isolated=False, parallel_execut
         if not retail or params.get('_parallel_child') is True:
             raise ValueError('隔离并发下单仅适用于父任务的正式自提购买。')
         if parallel_executor is not None:
-            return parallel_executor(service, params)
-        return run_parallel_purchase(service, params, preflight_complete=True)
-    if serial_executor is not None:
-        return serial_executor(service, params)
-    return duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=count)
+            result = parallel_executor(service, params)
+        else:
+            result = run_parallel_purchase(service, params, preflight_complete=True)
+    elif serial_executor is not None:
+        result = serial_executor(service, params)
+    else:
+        result = duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=count)
+    if isinstance(result,dict):
+        result['requested_concurrency']=requested_routes
+        result['effective_concurrency']=1
+    return result

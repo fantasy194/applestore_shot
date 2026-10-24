@@ -200,12 +200,15 @@ class BrowserSigninAssistant:
         if isinstance(body, str) and re.search(r'captcha|图形验证|人机验证|verify you are human', body[:16000], re.I):
             raise _error('BROWSER_LOGIN_SECURITY_CHALLENGE', '官网要求安全验证，自动认证无法继续。')
         split_fields = _visible(frame.locator('input[id^="char"][maxlength="1"], input[inputmode="numeric"][maxlength="1"], input[autocomplete="one-time-code"][maxlength="1"]'))
-        fields = split_fields if len(split_fields) == 6 else _visible(frame.locator('input[autocomplete="one-time-code"]'))
+        fields = split_fields if len(split_fields) == 6 else _visible(frame.locator(
+            'input[autocomplete="one-time-code"]').or_(frame.get_by_role('textbox', name=VERIFICATION_NAMES)))
         if len(fields) == 1 and fields[0].get_attribute('maxlength') == '1':
             return 'unrecognized'
         if len(fields) not in (1, 6):
             # The challenge heading can precede its inputs during rendering.
             # Use the wait loop's bounded recognition budget before failing.
+            return 'unrecognized'
+        if len(fields) == 1 and fields[0].get_attribute('autocomplete') != 'one-time-code' and fields[0].get_attribute('maxlength') != '6':
             return 'unrecognized'
         # A fresh browser can already be on the OTP step. In that case require
         # its exact rendered account rather than guessing from the profile.
@@ -224,10 +227,9 @@ class BrowserSigninAssistant:
                 finally:
                     self.otp_wait_seconds += time.monotonic() - started
                 check()
-                for current in page.frames:
-                    if _auth_frame(current) or current == page.main_frame:
-                        account_fields, _ = _fields(current)
-                        self._identity(current, account_fields)
+                for current in _account_auth_frames(page) + [page.main_frame]:
+                    account_fields, _ = _fields(current)
+                    self._identity(current, account_fields)
                 if not isinstance(code, str) or re.fullmatch(r'[0-9]{6}', code) is None:
                     raise _error('BROWSER_LOGIN_CODE_INVALID', '请输入六位数字验证码；本次未向官网提交。')
                 for field, original in zip(fields, handles):

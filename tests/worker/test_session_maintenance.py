@@ -33,6 +33,23 @@ class SessionMaintenanceTests(unittest.TestCase):
         vault.get.return_value = None
         return Service(channel, self.service.root, self.service.root, 'fixture@example.test', vault)
 
+    def test_claimed_purchase_result_and_exception_are_not_maintenance_failures(self):
+        self.service._prepared_claim={'v':1}
+        result={'success':True,'status':'pending_payment','order_number':'W12345678','performance':{'handoff_at_ms':10}}
+        self.service.warm_pickup_prepare.return_value=result
+        self.assertIs(maintain_session(self.service,preheat_flow='pickup_prepare'),result)
+        self.assertFalse((self.service.root/'session-maintenance.json').exists())
+        self.service.warm_pickup_prepare.side_effect=ValueError('real purchase failure')
+        with self.assertRaisesRegex(ValueError,'real purchase failure'):
+            maintain_session(self.service,preheat_flow='pickup_prepare')
+        self.assertFalse((self.service.root/'session-maintenance.json').exists())
+
+    def test_expired_preparation_does_not_write_failure_cooldown(self):
+        result={'success':True,'status':'preparation_expired','order_submitted':False}
+        self.service.warm_pickup_prepare.return_value=result
+        self.assertIs(maintain_session(self.service,preheat_flow='pickup_prepare'),result)
+        self.assertFalse((self.service.root/'session-maintenance.json').exists())
+
     def test_browser_login_recovery_flow_reuses_profile_without_warm_bag_or_visible_window(self):
         service = self.real_service()
         service.ensure_auth_file()
@@ -55,7 +72,7 @@ class SessionMaintenanceTests(unittest.TestCase):
         warm.assert_not_called()
         purchase.assert_not_called()
         self.assertEqual(result['preheat_flow'], 'browser_login')
-        self.assertEqual(result['browser_mode'], 'headless')
+        self.assertEqual(result['browser_mode'], 'background')
         self.assertEqual(marker.read_text(encoding='utf-8'), 'preserve')
         self.assertFalse(service.headless_browser)
 
@@ -100,7 +117,7 @@ class SessionMaintenanceTests(unittest.TestCase):
         service.channel.prompt.assert_not_called()
         self.assertEqual(first['status'], 'requires_login')
         self.assertEqual(first['error_code'], 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
-        self.assertEqual(first['browser_mode'], 'headless')
+        self.assertEqual(first['browser_mode'], 'background')
         self.assertEqual(second['cooldown_until_ms'], first['cooldown_until_ms'])
         self.assertFalse(service.headless_browser)
 
@@ -296,7 +313,7 @@ class SessionMaintenanceTests(unittest.TestCase):
         self.assertEqual(Service.warm_pickup_prepare(self.service, 'MK2P4CH/A', 2), result)
         self.service.run.assert_called_once_with('purchase', {
             'sku': 'MK2P4CH/A', 'quantity': 2, 'fulfillment': 'RETAIL', 'prepare_only': True,
-            'keep_ready': False, 'concurrency': 1, 'retry_count': 0})
+            'keep_ready': True, 'concurrency': 1, 'retry_count': 0})
         self.assertEqual(self.service.action, 'session_maintain')
         for sku, count in ((None, 1), ('', 1), ('MK2P4CH', True), ('MK2P4CH', 0), ('MK2P4CH', 1000)):
             self.service.run.reset_mock()
@@ -339,7 +356,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                 self.assertTrue(service.preparing)
                 self.assertTrue(service.headless_browser)
                 self.assertTrue(service.automatic_checkout)
-                self.assertFalse(service.keep_prepared_pickup)
+                self.assertTrue(service.keep_prepared_pickup)
                 self.assertEqual(service.fulfillment_mode, 'RETAIL')
                 self.assertEqual(checkout_options.read_config(service.checkout)['pickup']['stores'], config['pickup']['stores'])
                 return {'success': True, 'status': 'waiting_stock', 'preparation_stage': 'fulfillment',
@@ -354,7 +371,7 @@ class SessionMaintenanceTests(unittest.TestCase):
             browser.assert_called_once_with(service, timeout=120, maintenance=True, storefront=True, recover=True, automatic=True)
             purchase.assert_called_once()
             self.assertEqual(result['status'], 'waiting_stock')
-            self.assertEqual(result['browser_mode'], 'headless')
+            self.assertEqual(result['browser_mode'], 'background')
             self.assertFalse(service.headless_browser)
             self.assertFalse(result['order_ready'])
             self.assertEqual(service.action, 'session_maintain')

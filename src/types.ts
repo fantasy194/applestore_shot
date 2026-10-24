@@ -33,12 +33,32 @@ export type Action =
 export type Data = Record<string, any>;
 export interface Prompt {
   id: string;
-  kind: "password" | "code" | "text" | "select" | "confirm";
+  kind:
+    | "password"
+    | "code"
+    | "text"
+    | "select"
+    | "confirm"
+    | "prepared_purchase";
   label: string;
   default?: any;
   options?: { value: any; label: string }[];
   actions?: { value: string; label: string }[];
   details?: Data;
+  prepared?: {
+    v: number;
+    sku: string;
+    quantity: number;
+    fulfillment: "RETAIL";
+    config_fingerprint: string;
+    config_file_sha256: string;
+    authorized_store_ids: string[];
+    prepared_at_ms: number;
+    expires_at_ms: number;
+    preparation_stage: "review" | "fulfillment";
+    review_verified: boolean;
+    order_ready: boolean;
+  };
   account?: string;
   credential_storage?: {
     backend: "encrypted_file" | "windows" | "macos" | null;
@@ -58,6 +78,7 @@ export interface Task {
   action: Action;
   /** Explicit login preheat may yield to a purchase; ordinary login may not. */
   warm_only?: boolean;
+  prepared_handoff?: Data;
   status: string;
   stage: string;
   created_at: number;
