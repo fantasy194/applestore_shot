@@ -58,6 +58,15 @@ if 'config' in args and '--environment' in args:
     print('UNRELATED_SECRET=synthetic-environment-secret')
 if 'up' in args:
     assert Path(registry).is_dir(), 'registry directory was not prepared'
+if 'run' in args and '/vault-init.py' in args:
+    import subprocess
+    mounts = [args[i + 1] for i, item in enumerate(args) if item == '--volume']
+    script = next(item.rsplit(':', 2)[0] for item in mounts if item.endswith(':/vault-init.py:ro'))
+    result = subprocess.run([sys.executable, script,
+                             '--key-file', str(Path.cwd() / 'secrets/duo-vault.key'),
+                             '--vault-dir', str(Path.cwd() / 'fixture-volume/.credentials'),
+                             '--uid', str(os.getuid()), '--gid', str(os.getgid())])
+    sys.exit(result.returncode)
 if 'up' in args and os.environ.get('MOCK_UP_FAILURE'):
     print('fixture application not healthy', file=sys.stderr)
     sys.exit(17)
@@ -115,6 +124,57 @@ print('fixture download 100%', file=sys.stderr)
         self.assertEqual(calls[start][calls[start].index('--pull') + 1], 'never')
         self.assertFalse(any('down' in args or '--volumes' in args for args in calls))
         self.assertFalse(list(self.deploy.rglob('*.download.*')))
+        self.assertEqual((self.deploy / 'secrets/duo-vault.key').stat().st_size, 32)
+        self.assertTrue((self.deploy / 'compose.vault.yaml').is_file())
+        start_args = calls[start]
+        self.assertIn('compose.vault.yaml', start_args)
+
+    def test_vault_key_survives_reinstall_and_is_only_mounted_to_app(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        key = self.deploy / 'secrets/duo-vault.key'
+        original = key.read_bytes()
+        self.assertEqual(key.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(key.parent.stat().st_mode & 0o777, 0o700)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(key.read_bytes(), original)
+        self.assertIn('Existing vault key retained.', result.stdout)
+        overlay = (self.deploy / 'compose.vault.yaml').read_text()
+        self.assertNotIn('browser:', overlay)
+        self.assertIn('/run/secrets/duo_vault_key', overlay)
+
+    def test_missing_vault_key_with_ciphertext_never_regenerates_or_starts(self):
+        vault = self.deploy / 'fixture-volume/.credentials'
+        vault.mkdir(parents=True)
+        ciphertext = vault / 'synthetic.enc'
+        ciphertext.write_bytes(b'synthetic encrypted fixture')
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('restore the original key', result.stderr)
+        self.assertFalse((self.deploy / 'secrets/duo-vault.key').exists())
+        self.assertEqual(ciphertext.read_bytes(), b'synthetic encrypted fixture')
+        self.assertFalse(any('up' in args for args in self.docker_calls()))
+
+    def test_explicit_vault_opt_out_does_not_create_key_or_overlay(self):
+        result = self.run_installer(DUO_ENABLE_VAULT='0')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.deploy / 'secrets/duo-vault.key').exists())
+        self.assertFalse((self.deploy / 'compose.vault.yaml').exists())
+
+    def test_existing_vault_key_with_unsafe_permissions_is_not_replaced(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        key = self.deploy / 'secrets/duo-vault.key'
+        original = key.read_bytes()
+        key.chmod(0o644)
+        self.calls.write_text('')
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('repair permissions explicitly', result.stderr)
+        self.assertEqual(key.read_bytes(), original)
+        self.assertNotIn(original.hex(), result.stdout + result.stderr)
+        self.assertFalse(any('up' in args for args in self.docker_calls()))
 
     def test_existing_custom_configuration_and_data_are_unchanged(self):
         files = {

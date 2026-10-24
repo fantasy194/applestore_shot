@@ -97,11 +97,19 @@ class Fixture:
                     'Menu fetch did not use the current homepage key')
             self.menu_requests.append(True)
             route.fulfill(status=200, content_type='application/json',
-                body=json.dumps({'links': [{'type': 'signIn', 'url': ENTRY}]}))
+                body=json.dumps({'links': (
+                    [{'type': 'signOut', 'url': '/shop/signOut'},
+                     {'type': 'account', 'url': 'https://secure8.www.apple.com.cn/shop/account/home?ctx=current-menu'}]
+                    if self.mode in ('signed_in', 'signed_in_redirect') else
+                    [{'type': 'signIn', 'url': ENTRY}] * (2 if self.mode == 'duplicate_menu' else 1))}))
         elif request.method == 'GET' and path == '/shop/signIn':
             require(request.url == ENTRY, 'Dynamic login query or host was changed')
-            require(request.headers.get('referer') == HOME, 'Dynamic login lost its homepage Referer')
+            if self.mode != 'signed_in_redirect':
+                require(request.headers.get('referer') == HOME, 'Dynamic login lost its homepage Referer')
             self.signin_requests.append(True)
+            if self.mode == 'signed_in_redirect':
+                route.fulfill(status=200, content_type='text/html', body='<html>Local login requires attention</html>')
+                return
             route.fulfill(status=200, content_type='text/html; charset=utf-8', body='''<html><body>
                 Local synthetic login<script>
                 setTimeout(async () => {
@@ -115,7 +123,13 @@ class Fixture:
                 'Set-Cookie': 'as_ltn_cn=authenticated-local-fixture; Domain=.apple.com.cn; Path=/; Secure'})
         elif request.method == 'GET' and path == '/shop/account/home':
             self.account_requests.append((host, time.monotonic()))
-            route.fulfill(status=200, content_type='text/html', body='<html>Local verified account fixture</html>')
+            if self.mode == 'signed_in_redirect':
+                route.fulfill(status=200, content_type='text/html',
+                    body='<html><script>location.replace(' + json.dumps(ENTRY) + ')</script></html>')
+            else:
+                headers = ({'Set-Cookie': 'as_ltn_cn=authenticated-local-fixture; Domain=.apple.com.cn; Path=/; Secure'}
+                           if self.mode == 'signed_in' else {})
+                route.fulfill(status=200, headers=headers, content_type='text/html', body='<html>Local verified account fixture</html>')
         else:
             self.unexpected.append('unrecognized-method-or-path')
             route.abort()
@@ -205,11 +219,18 @@ class Fixture:
                 require(error is not None and error.http_status == 541, 'HTTP 541 was not retained')
                 require(self.marker.exists() and self.cooldown.exists(), 'Failed recovery removed markers')
                 require(not self.imports and len(self.navigations) == 1, 'Blocked recovery retried or imported')
+            elif self.mode == 'signed_in_redirect':
+                require(error is not None and error.code == 'STOREFRONT_SESSION_REQUIRES_ATTENTION',
+                        'An authenticated menu redirect must stop before automation: ' + str(getattr(error, 'code', None)))
+                require(self.marker.exists() and self.cooldown.exists(), 'Failed read removed markers')
+                require(not self.imports and not self.authx_requests, 'Redirect unexpectedly authenticated or imported')
+                require(len(self.menu_requests) == len(self.account_requests) == len(self.signin_requests) == 1,
+                        'Authenticated-menu read retried')
             else:
                 require(error is None and result.get('logged_in') is True, 'Fixture login did not complete')
                 require(len(self.imports) == 1 and len(self.account_requests) == 1, 'Account was not verified exactly once')
                 require(not self.marker.exists() and not self.cooldown.exists(), 'Verified success retained recovery markers')
-                if self.mode in ('manual', 'background_recovery'):
+                if self.mode in ('manual', 'background_recovery', 'duplicate_menu'):
                     require(len(self.menu_requests) == len(self.signin_requests) == len(self.authx_requests) == 1,
                             'Manual recovery did not follow one current menu/authx transaction')
                     require(self.account_requests[0][0] == 'secure8.www.apple.com.cn', 'Account verification changed the dynamic host')
@@ -218,13 +239,21 @@ class Fixture:
                     require([path for _, _, path in self.navigations] == [
                         '/', '/shop/bag', '/', '/shop/signIn', '/', '/shop/account/home'],
                         'Manual recovery navigation order changed')
+                elif self.mode == 'signed_in':
+                    require(len(self.menu_requests) == 1 and not self.signin_requests and not self.authx_requests,
+                            'Existing browser login unnecessarily authenticated')
+                    require([path for _, _, path in self.navigations] == [
+                        '/', '/shop/bag', '/', '/shop/account/home'],
+                        'Existing browser login did not follow its menu account link once')
+                    require(self.account_requests[0][0] == 'secure8.www.apple.com.cn',
+                            'Existing browser login changed the dynamic account host')
                 else:
                     require(not self.menu_requests and not self.signin_requests and not self.authx_requests,
                             'Maintenance started authentication')
                     require([path for _, _, path in self.navigations] == ['/', '/shop/bag', '/shop/account/home'],
                             'Maintenance skipped the browser context refresh')
             return {'scenario': self.mode, 'actual_chrome_cdp': True,
-                'production_manual_branch': self.mode in ('manual', 'blocked'), 'fixture_forced_headless': self.mode in ('manual', 'blocked'),
+                'production_manual_branch': self.mode in ('manual', 'blocked', 'duplicate_menu', 'signed_in', 'signed_in_redirect'), 'fixture_forced_headless': self.mode in ('manual', 'blocked', 'duplicate_menu', 'signed_in', 'signed_in_redirect'),
                 'production_background_recovery': self.mode in ('background_recovery', 'background_blocked'),
                 'navigation_paths': [path for _, _, path in self.navigations],
                 'menu_fetch_count': len(self.menu_requests), 'signin_count': len(self.signin_requests),
@@ -242,7 +271,8 @@ class Fixture:
 
 def main():
     with tempfile.TemporaryDirectory(prefix='storefront-recovery-fixture-') as directory:
-        cases = [Fixture(Path(directory), mode).run() for mode in ('manual', 'maintenance', 'blocked', 'background_recovery', 'background_blocked')]
+        cases = [Fixture(Path(directory), mode).run() for mode in ('manual', 'maintenance', 'blocked', 'background_recovery', 'background_blocked',
+                'duplicate_menu', 'signed_in', 'signed_in_redirect')]
     report = {'success': True, 'scope': 'isolated local browser fixture; synthetic session import; no real Apple service',
               'python_http_forbidden': True, 'browser_routes_intercepted': True,
               'browser_dns_disabled': True, 'platform': platform.system(), 'architecture': platform.machine(),

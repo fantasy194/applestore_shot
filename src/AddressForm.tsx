@@ -14,12 +14,14 @@ const addressFields = [
 export function AddressForm({
   account,
   busy,
+  ready = true,
   result,
   region,
   start,
 }: {
   account: Account;
   busy: boolean;
+  ready?: boolean;
   result?: Data;
   region?: Data;
   start: (action: Action, params?: Data) => Promise<void>;
@@ -50,12 +52,13 @@ export function AddressForm({
     if (region && Object.keys(region).length)
       setForm((f) => ({ ...f, delivery: { ...f.delivery, ...region } }));
   }, [savedRegion]);
+  const disabled = busy || !ready;
   return (
     <section className="section">
       <div className="section-title">
         <h2>快捷送货地址</h2>
         {account.id !== LOCAL_ID && !account.pending && (
-          <button disabled={busy} onClick={() => start("region")}>
+          <button disabled={disabled} onClick={() => start("region")}>
             <MapPin size={15} />
             读取官网地区
           </button>
@@ -75,6 +78,7 @@ export function AddressForm({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          if (disabled) return;
           start("address_save", form);
         }}
       >
@@ -85,7 +89,7 @@ export function AddressForm({
                 {label}
                 <input
                   required
-                  disabled={busy}
+                  disabled={disabled}
                   type={
                     key === "emailAddress"
                       ? "email"
@@ -115,7 +119,7 @@ export function AddressForm({
               id={streetId}
               aria-describedby={`${streetId}-hint`}
               required
-              disabled={busy}
+              disabled={disabled}
               rows={2}
               autoComplete="shipping street-address"
               placeholder="例如：中山路 88 号，阳光花园 3 栋 2 单元 601 室"
@@ -129,7 +133,7 @@ export function AddressForm({
             />
           </div>
         </div>
-        <button className="primary" disabled={busy} type="submit">
+        <button className="primary" disabled={disabled} type="submit">
           保存地址预设
         </button>
       </form>

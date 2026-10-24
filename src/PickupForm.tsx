@@ -170,6 +170,7 @@ export function PickupForm({
     return saved;
   }
   async function run(monitor: boolean) {
+    if (disabled) return;
     setSaving(true);
     setError("");
     setNotice("");

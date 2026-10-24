@@ -1295,7 +1295,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.6</span>
+          <span>DUO Killer · 0.1.7</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (
@@ -2227,6 +2227,10 @@ function PromptForm({
         })
       : undefined;
   const password = prompt.kind === "password";
+  const storage = prompt.credential_storage;
+  const canSavePassword =
+    storage?.available === true && storage.persistent === true;
+  const encryptedStorage = storage?.backend === "encrypted_file";
   return (
     <form
       className="prompt-form"
@@ -2234,7 +2238,8 @@ function PromptForm({
         e.preventDefault();
         let answer: unknown = value;
         if (confirmation) answer = true;
-        else if (password) answer = { password: value, remember };
+        else if (password)
+          answer = { password: value, remember: canSavePassword && remember };
         else if (prompt.kind === "select")
           answer = prompt.options?.find((_, i) => String(i) === value)?.value;
         submit(answer);
@@ -2348,16 +2353,26 @@ function PromptForm({
           {password && (
             <>
               <p className="muted">
-                密码按账号在本次服务运行中复用。保存由系统凭据保险库决定；容器未配置可用保险库时，重启后需重新输入。
+                {canSavePassword
+                  ? encryptedStorage
+                    ? "勾选后按账号加密保存，服务重启或升级后仍可复用；未勾选则仅在本次服务运行中复用。"
+                    : "勾选后保存到系统凭据保险库；未勾选则仅在本次服务运行中复用。"
+                  : storage?.error
+                    ? "密码保存暂不可用，请检查服务端密码存储配置。本次输入仍可在服务运行期间复用。"
+                    : "此服务尚未启用密码保存。本次输入仅在服务运行期间复用，重启后需重新输入。"}
               </p>
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={remember}
-                  onChange={(e) => setRemember(e.target.checked)}
-                />
-                保存到系统凭据保险库
-              </label>
+              {canSavePassword && (
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={remember}
+                    onChange={(e) => setRemember(e.target.checked)}
+                  />
+                  {encryptedStorage
+                    ? "加密保存密码，重启后继续使用"
+                    : "保存到系统凭据保险库"}
+                </label>
+              )}
             </>
           )}
         </>

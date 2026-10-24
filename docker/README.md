@@ -64,7 +64,7 @@ docker compose -f compose.yaml -f compose.autoupdate.yaml up -d --no-deps --no-b
 
 ## 数据与密码
 
-自 0.1.6 起，在应用密码提示或预填字段中输入的密码会按账号保留在应用服务内存中，供后续登录、下单、队列和后台恢复共用。明确密码拒绝、忘记密码或移除账号会清除这份缓存；网络失败与 541 不当作密码错误。重启 app 会清空内存缓存，Linux 没有可用系统保险库时需再次输入；浏览器中直接输入的密码不会被应用采集。原 `/data` 中的浏览器资料、Cookie 和设备信任继续保存，缓存不替代官网对会话的核验。
+自 0.1.6 起，在应用密码提示或预填字段中输入的密码会按账号保留在应用服务内存中，供后续登录、下单、队列和后台恢复共用。明确密码拒绝、忘记密码或移除账号会清除这份缓存；网络失败与 541 不当作密码错误。重启 app 会清空内存缓存；启用下述持久密码库并勾选保存后，后续任务可从加密库恢复，否则需再次输入；浏览器中直接输入的密码不会被应用采集。原 `/data` 中的浏览器资料、Cookie 和设备信任继续保存，缓存不替代官网对会话的核验。
 
 空闲预热的“官网登录恢复（保留账号）”复用人工恢复使用的官方动态登录入口，但后台统一以无头模式运行；“预热登录”和“提前准备自提”也受同一启动限制。三种模式保持原账号资料，后台遇到验证码或安全挑战停止并提示人工，不切换为可见窗口。人工发起的官网登录和恢复仍提供远程窗口。
 
@@ -72,7 +72,30 @@ docker compose -f compose.yaml -f compose.autoupdate.yaml up -d --no-deps --no-b
 
 账号、每账号的 Chrome 配置、Cookie、购买队列、日志和加密设置保存在 `iphoneduo_app-data` 数据卷的 `/data` 下。重新构建、重启以及普通 `docker compose down` 均保留数据。`docker compose down -v` 会删除数据，正常更新不要使用 `-v`。
 
-Docker 使用独立数据卷，不导入当前 Windows 服务的数据，也不复制当前浏览器资料。Windows 的 DPAPI 和系统凭据库无法直接移植到 Linux；请在容器页面重新添加账号和登录。当前系统凭据保险库仅支持 Windows/macOS，容器中登录时不要勾选“保存密码”；Chrome 资料及已验证会话仍按原实现持久化。
+Docker 使用独立数据卷，不导入当前 Windows 服务的数据，也不复制当前浏览器资料。Windows 的 DPAPI 和系统凭据库无法直接移植到 Linux；请在容器页面重新添加账号和登录。Windows/macOS 继续使用各自系统保险库；自 0.1.7 起容器支持独立主密钥的加密密码库，Chrome 资料及已验证会话仍按原实现持久化。
+
+### 容器持久密码库（0.1.7）
+
+[安装器](../scripts/install-docker.sh)默认初始化并启用 [compose.vault.yaml](../compose.vault.yaml)。只有用户勾选保存时才写入密码；未勾选仍仅在当前服务运行期间复用。密文按账号保存在原 `/data/.credentials` 中，32 字节主密钥单独保存在部署目录 `secrets/duo-vault.key`，仅只读挂载给 app 的 `/run/secrets/duo_vault_key`，不交给 browser。目录为 `0700`、密钥文件为 `0400`，属主 UID/GID 为 `1000:1000`；Compose 本地文件 secret 不会自动改变宿主文件权限，也不替代应用加密。
+
+新安装自动完成上述步骤。已有官方部署重新运行安装器后可启用；自定义 Compose 会保留，需要手动合并。手工启用时，先确认没有正在下单或等待确认的任务，保留原部署目录、Compose 项目及全部覆盖文件。以下示例在原基础及自动更新覆盖文件之上增加密码库；有其他覆盖文件时也须继续携带：
+
+```sh
+mkdir -p secrets docker
+# 先将本仓库 docker/init-vault.py 与 compose.vault.yaml 更新到部署目录。
+docker compose -f compose.yaml -f compose.autoupdate.yaml run --rm --no-deps \
+  --user 0 --entrypoint python \
+  --volume "$PWD/secrets:/vault-host" \
+  --volume "$PWD/docker/init-vault.py:/vault-init.py:ro" \
+  app /vault-init.py --key-file /vault-host/duo-vault.key --vault-dir /data/.credentials
+
+docker compose -f compose.yaml -f compose.autoupdate.yaml -f compose.vault.yaml \
+  up -d --no-deps --no-build --wait app
+```
+
+初始化使用 app 镜像里的 Python，不要求宿主安装 Python，不读取账号密码。重复执行保留原密钥；检测到密文存在但主密钥遗失时会停止，不能静默重新生成。已有密钥权限不符时也会停止，确认文件归属后再显式修正。安装器可用 `DUO_ENABLE_VAULT=0` 选择不启用；它不会删除已有密钥或密码库。
+
+后续所有 Compose 更新必须继续使用 `-f compose.vault.yaml`。Watchtower 会保留 app 的只读 secret 挂载，普通重启和镜像更新不会更换主密钥。请将主密钥另行安全备份，并与数据卷分开保管；恢复已保存密码同时需要原密钥和密文。密钥不可放入 `.env`、镜像、Git 或日志。宿主机管理员仍能读取密钥；本功能防止只拿到数据卷副本时直接读取密码。忘记密码或移除账号同时删除保存项，不清除浏览器资料。Docker secrets 是只读文件挂载，详见 [Docker 官方说明](https://docs.docker.com/compose/how-tos/use-secrets/)。
 
 可在根目录创建 `.env`（不会进入镜像）调整端口或访问密码：
 

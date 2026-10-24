@@ -29,6 +29,7 @@ import { PickupForm } from "./PickupForm";
 import { SelectField } from "./SelectField";
 import { NumberField } from "./NumberField";
 import { InventoryMonitor } from "./InventoryMonitor";
+import { useTaskDetails } from "./useTaskDetails";
 
 export type Route =
   | "workspace"
@@ -154,7 +155,7 @@ function TaskStatus({ task, cancel }: { task?: Task; cancel: () => void }) {
   );
 }
 export function LocalSettings({
-  snapshot,
+  snapshot: wireSnapshot,
   bridge,
   refresh,
   initialAccount = LOCAL_ID,
@@ -162,10 +163,34 @@ export function LocalSettings({
   const { format } = useAccountPrivacy();
   const [scope, setScope] = useState(initialAccount);
   const [requestId, setRequestId] = useState("");
+  const [readFailure, setReadFailure] = useState("");
   const account =
     scope === LOCAL_ID
-      ? snapshot.defaults || localDefaults
-      : snapshot.accounts.find((a) => a.id === scope) || localDefaults;
+      ? wireSnapshot.defaults || localDefaults
+      : wireSnapshot.accounts.find((a) => a.id === scope) || localDefaults;
+  const wireTasks = wireSnapshot.tasks
+    .filter((task) => task.account_id === account.id)
+    .sort(
+      (a, b) =>
+        (b.execution_started_at_ms ?? b.created_at * 1000) -
+          (a.execution_started_at_ms ?? a.created_at * 1000) ||
+        b.updated_at - a.updated_at,
+    );
+  const configTask = wireTasks.find(
+    (task) =>
+      ["address_read", "address_save"].includes(task.action) &&
+      task.status === "succeeded",
+  );
+  // A historic region lookup must not overwrite a newer saved address on reopen.
+  const regionTask = wireTasks
+    .slice(0, configTask ? wireTasks.indexOf(configTask) : wireTasks.length)
+    .find((task) => task.action === "region" && task.status === "succeeded");
+  const { snapshot, detailError } = useTaskDetails(
+    wireSnapshot,
+    bridge,
+    [configTask?.id, regionTask?.id].filter((id): id is string => !!id),
+    "",
+  );
   const tasks = snapshot.tasks.filter((t) => t.account_id === account.id);
   const recent = (actions: Action[]) =>
     tasks
@@ -175,25 +200,37 @@ export function LocalSettings({
       );
   const addressTasks = recent(["address_read", "address_save", "region"]);
   const requested = tasks.find((t) => t.id === requestId);
-  const result = (
-    requested?.status === "succeeded" && requested.result?.config
-      ? requested
-      : recent(["address_read", "address_save"]).find(
-          (t) => t.status === "succeeded",
-        )
-  )?.result;
+  const result = tasks.find((task) => task.id === configTask?.id)?.result;
+  const validConfig =
+    !!result?.config &&
+    typeof result.config === "object" &&
+    !Array.isArray(result.config);
+  const readFailed =
+    readFailure === account.id ||
+    (requested?.action === "address_read" &&
+      ["failed", "cancelled", "interrupted"].includes(requested.status)) ||
+    (!!configTask &&
+      !tasks.find((task) => task.id === configTask.id)?.is_summary &&
+      !validConfig);
+  const configReady = !readFailed && validConfig;
   const [dispatching, setDispatching] = useState(false);
   const [error, setError] = useState("");
   const busy =
     dispatching ||
     tasks.some((task) => active(task) && task.action !== "inventory_monitor");
   async function start(action: Action, params: Data = {}) {
+    if (action === "address_save" && !configReady) {
+      setError("请先读取已保存的本地配置，再修改保存。");
+      return;
+    }
     setError("");
+    if (action === "address_read") setReadFailure("");
     setDispatching(true);
     try {
       setRequestId(await bridge.start(account.id, action, params));
       await refresh();
     } catch (e) {
+      if (action === "address_read") setReadFailure(account.id);
       setError(String(e));
     } finally {
       setDispatching(false);
@@ -203,7 +240,7 @@ export function LocalSettings({
     <main className="local-page">
       <header className="local-heading">
         <h1>本地配置</h1>
-        <p>提前设置地址和购买偏好，保存在本机。</p>
+        <p>提前设置地址和购买偏好，保存在应用服务端，刷新页面后可恢复。</p>
       </header>
       <SelectField
         className="scope-select"
@@ -238,14 +275,31 @@ export function LocalSettings({
         bridge={bridge}
         refresh={refresh}
       />
+      {!configReady && (
+        <div
+          className="local-task muted"
+          role={readFailed ? "alert" : "status"}
+        >
+          <span>
+            {readFailed
+              ? "本地配置读取失败，保存已暂停，请重新读取。"
+              : detailError.id === configTask?.id
+                ? "本地配置详情暂时无法读取，正在重试；保存已暂停。"
+                : "正在读取已保存的本地配置…"}
+          </span>
+          <button disabled={busy} onClick={() => start("address_read")}>
+            重新读取本地配置
+          </button>
+        </div>
+      )}
       <AddressForm
         key={`address-${account.id}`}
         account={account}
         busy={busy}
+        ready={configReady}
         result={result || undefined}
         region={
-          recent(["region"]).find((t) => t.status === "succeeded")?.result
-            ?.region
+          tasks.find((task) => task.id === regionTask?.id)?.result?.region
         }
         start={start}
       />
@@ -253,7 +307,7 @@ export function LocalSettings({
         key={`pickup-${account.id}`}
         account={account}
         bridge={bridge}
-        busy={busy}
+        busy={busy || !configReady}
         result={result || undefined}
         start={start}
         refresh={refresh}

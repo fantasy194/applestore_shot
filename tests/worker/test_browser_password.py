@@ -155,6 +155,66 @@ class BrowserPasswordTests(unittest.TestCase):
                 if not rejected:
                     self.channel.emit.assert_not_called()
 
+    def test_prompt_storage_capability_is_safe_with_mock_and_real_status(self):
+        self.channel.prompt.return_value = {'password': 'fixture', 'remember': False}
+        self.service.browser_password(allow_prompt=True)
+        status = self.channel.prompt.call_args.kwargs['credential_storage']
+        self.assertEqual(status, {'backend': None, 'available': False, 'persistent': False, 'error': 'unavailable'})
+        self.service.password = None
+        self.vault.status.return_value = {'backend': 'encrypted_file', 'available': True,
+                                         'persistent': True, 'error': None, 'private': 'must-not-be-shared'}
+        self.service.credentials(self.service.auth)
+        status = self.channel.prompt.call_args.kwargs['credential_storage']
+        self.assertTrue(status['persistent'])
+        self.assertNotIn('private', status)
+
+    def test_explicit_password_rejection_invalidates_matching_persistence_once(self):
+        self.service.password = 'rejected-fixture'
+        self.service.reject_password()
+        self.vault.invalidate.assert_called_once_with('fixture-account', 'rejected-fixture')
+        self.service.reject_password()
+        self.vault.invalidate.assert_called_once()
+
+    def test_encrypted_vault_is_shared_by_successful_login_next_task_and_forget(self):
+        import os
+        from credentials import Vault
+        root = self.service.root
+        key = root / 'synthetic-host-key'
+        key.write_bytes(os.urandom(32))
+        key.chmod(0o600)
+        environment = {'DUO_VAULT_KEY_FILE': str(key), 'DUO_VAULT_DIR': str(root / 'vault')}
+        with patch.dict(os.environ, environment), patch('credentials.sys.platform', 'linux'):
+            self.service.vault = Vault()
+            self.channel.prompt.return_value = {'password': '  saved-fixture  ', 'remember': True}
+            self.assertEqual(self.service.browser_password(allow_prompt=True), '  saved-fixture  ')
+            self.assertIsNone(self.service.vault.get('fixture-account'))
+            with patch.object(self.service, 'check_account', return_value={'success': True, 'logged_in': True}):
+                self.service.run('me', {})
+            next_service = Service(self.channel, root, root, 'owner@example.test', Vault())
+            self.channel.prompt.reset_mock()
+            self.assertEqual(next_service.browser_password(allow_prompt=True), '  saved-fixture  ')
+            self.channel.prompt.assert_not_called()
+            from browser_login import BrowserSessionError
+            next_service.cleanup_credentials(BrowserSessionError('APPLE_SESSION_BLOCKED', 'fixture', status='blocked'))
+            self.assertEqual(Vault().get('fixture-account'), '  saved-fixture  ')
+            next_service.browser_password(allow_prompt=False)
+            next_service.reject_password()
+            self.assertIsNone(Vault().get('fixture-account'))
+            next_service.vault.save('fixture-account', 'replacement')
+            next_service.run('forget_password', {})
+            self.assertIsNone(Vault().get('fixture-account'))
+
+    def test_unsuccessful_task_and_unchecked_remember_never_save(self):
+        self.service.password = 'fixture-password'
+        self.service.remember = True
+        with patch('session_maintenance.maintain_session', return_value={'success': False, 'status': 'blocked'}):
+            self.service.run('session_maintain', {})
+        self.vault.save.assert_not_called()
+        self.service.remember = False
+        with patch.object(self.service, 'check_account', return_value={'success': True, 'logged_in': True}):
+            self.service.run('me', {})
+        self.vault.save.assert_not_called()
+
     def test_parallel_child_cannot_authenticate_or_read_the_parent_password(self):
         from browser_login import BrowserSessionError
         self.service._parallel_child = True

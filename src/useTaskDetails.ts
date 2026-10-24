@@ -67,9 +67,13 @@ export function useTaskDetails(
         });
         if (
           mounted.current &&
+          detail.id === target.id &&
+          detail.account_id === target.account_id &&
           latest.current.wanted.some(
             (task) =>
-              task.id === detail.id && task.account_id === detail.account_id,
+              task.id === detail.id &&
+              task.account_id === detail.account_id &&
+              task.detail_revision === detail.detail_revision,
           )
         ) {
           const next = new Map(cached.current);

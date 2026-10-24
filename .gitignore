@@ -31,6 +31,8 @@ warm_empty_bag.json
 .env
 .env.*
 .tools/
+secrets/
+.credentials/
 .pnpm-store/
 .local-data/
 .local-runtime/

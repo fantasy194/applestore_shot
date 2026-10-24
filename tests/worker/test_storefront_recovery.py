@@ -53,7 +53,8 @@ class StorefrontRecoveryTests(unittest.TestCase):
         context.add_cookies.assert_not_called()
 
     def test_invalid_menu_never_falls_back_to_fixed_account_or_login_url(self):
-        invalid = ([], [{'type': 'signIn', 'url': ENTRY}] * 2,
+        invalid = ([], [{'type': 'signIn', 'url': ENTRY},
+                        {'type': 'signIn', 'url': ENTRY + '&other=1'}],
                    [{'type': 'signIn', 'url': 'https://example.test/shop/signIn'}],
                    [{'type': 'signIn', 'url': 'https://www.apple.com.cn.example.test/shop/signIn'}],
                    [{'type': 'signIn', 'url': 'http://www.apple.com.cn/shop/signIn'}],
@@ -78,18 +79,62 @@ class StorefrontRecoveryTests(unittest.TestCase):
                     browser_login.open_storefront_login(context, Mock())
                 self.assertEqual(len(page.goto.call_args_list), 3)
 
-    def test_menu_signout_requires_valid_cookie_and_does_not_clear_browser_state(self):
+    def test_authenticated_menu_reads_its_current_account_link_once(self):
+        target = 'https://secure8.www.apple.com.cn/shop/account/home?ctx=menu-fixture'
+        links = [{'type': 'signOut', 'url': '/shop/signOut'},
+                 {'type': 'account', 'url': target}]
         for cookie in (COOKIE, {**COOKIE, 'expires': time.time() - 30},
                        {**COOKIE, 'domain': '.example.test'}):
             with self.subTest(cookie=cookie):
-                context, page = self.context([{'type': 'signOut', 'url': '/shop/signOut'}], [cookie])
+                context, page = self.context(links, [cookie])
                 if cookie is COOKIE:
-                    self.assertEqual(browser_login.open_storefront_login(context, Mock()), ACCOUNT)
+                    result = browser_login.open_storefront_login(context, Mock())
+                    self.assertEqual(result, target)
+                    self.assertTrue(result.read_only)
                 else:
-                    with self.assertRaises((ValueError, apple_login.LoginError)):
+                    with self.assertRaisesRegex(ValueError, '本次未重新提交认证'):
                         browser_login.open_storefront_login(context, Mock())
-                self.assertNotIn(ACCOUNT, [c.args[0] for c in page.goto.call_args_list])
+                self.assertEqual([c.args[0] for c in page.goto.call_args_list],
+                                 [HOME, HOME + 'shop/bag', HOME, target])
+                self.assertEqual(page.goto.call_args.kwargs.get('referer'), HOME)
                 context.clear_cookies.assert_not_called()
+                context.add_cookies.assert_not_called()
+
+    def test_authenticated_menu_can_refresh_cookie_without_new_login(self):
+        links = [{'type': 'signOut', 'url': '/shop/signOut'},
+                 {'type': 'account', 'url': ACCOUNT}]
+        context, page = self.context(links)
+        def goto(url, **kwargs):
+            page.url = url
+            if url == ACCOUNT:
+                context.cookies.return_value = [COOKIE]
+            return Mock(status=200)
+        page.goto.side_effect = goto
+        self.assertEqual(browser_login.open_storefront_login(context, Mock()), ACCOUNT)
+        self.assertEqual(page.goto.call_count, 4)
+
+    def test_authenticated_menu_missing_ambiguous_or_unsafe_account_link_stops(self):
+        for account_links in ([], [{'type': 'account', 'url': ACCOUNT},
+                                  {'type': 'account', 'url': ACCOUNT + '?other=1'}],
+                              [{'type': 'account', 'url': 'https://example.test/shop/account/home'}],
+                              [{'type': 'account', 'url': '/shop/signIn/account'}]):
+            with self.subTest(account_links=account_links):
+                context, page = self.context([{'type': 'signOut'}] + account_links, [COOKIE])
+                with self.assertRaises(ValueError):
+                    browser_login.open_storefront_login(context, Mock())
+                self.assertEqual(page.goto.call_count, 3)
+
+    def test_authenticated_menu_read_redirect_to_login_never_reauthenticates(self):
+        context, page = self.context([{'type': 'signOut'},
+                                      {'type': 'account', 'url': ACCOUNT}], [COOKIE])
+        def goto(url, **kwargs):
+            page.url = ENTRY if url == ACCOUNT else url
+            return Mock(status=200)
+        page.goto.side_effect = goto
+        with self.assertRaisesRegex(ValueError, '本次未重新提交认证'):
+            browser_login.open_storefront_login(context, Mock())
+        self.assertEqual(page.goto.call_count, 4)
+        page.locator.assert_not_called()
 
     def test_bag_auth_challenge_is_preserved_without_fetching_new_menu(self):
         context, page = self.context()
@@ -121,13 +166,41 @@ class StorefrontRecoveryTests(unittest.TestCase):
             {'type': 'signIn', 'url': ENTRY}]), ENTRY)
         self.assertEqual(apple_login.storefront_signin_entry(HOME, [
             {'type': 'signIn', 'url': '/shop/signIn?ssi=relative'}]), HOME + 'shop/signIn?ssi=relative')
-        for links in (None, {}, 'invalid', [], [{'type': 'signIn', 'url': ENTRY}] * 2):
+        for links in (None, {}, 'invalid', [], [
+                {'type': 'signIn', 'url': ENTRY}, {'type': 'signIn', 'url': ENTRY + '&other=1'}]):
             with self.subTest(links=links), self.assertRaises(apple_login.LoginError):
                 apple_login.storefront_signin_entry(HOME, links)
         self.assertEqual(apple_login.storefront_api_key(
             "<meta content='public-fixture' name='globalnav-store-key'>"), 'public-fixture')
         with self.assertRaises(apple_login.LoginError):
             apple_login.storefront_api_key('<html>no public key</html>')
+
+    def test_duplicate_current_destinations_are_one_login_transaction(self):
+        # The flyout can repeat a target; duplicate rows are not two authorizations.
+        for links in ([{'type': 'signIn', 'url': ENTRY}] * 2,
+                      [{'type': 'signIn', 'url': '/shop/signIn?ssi=relative'},
+                       {'type': 'signIn', 'url': HOME + 'shop/signIn?ssi=relative'}]):
+            with self.subTest(links=links):
+                expected = apple_login.storefront_signin_entry(HOME, links)
+                context, page = self.context(links)
+                browser_login.open_storefront_login(context, Mock())
+                self.assertEqual(page.goto.call_args.args[0], expected)
+                self.assertEqual(page.goto.call_count, 4)
+                self.assertEqual(page.evaluate.call_count, 1)
+
+    def test_ambiguous_or_unsafe_rows_cannot_hide_behind_a_valid_destination(self):
+        for other in ({'type': 'signOut', 'url': '/shop/signOut'},
+                      {'type': 'signIn', 'url': ENTRY + '&other=1'},
+                      {'type': 'signIn', 'url': 'https://example.test/shop/signIn'},
+                      {'type': 'signIn', 'url': '/shop/signIn/account'},
+                      {'type': 'signIn', 'url': ' /shop/signIn'},
+                      {'type': 'signIn', 'url': '/shop/signIn\n'},
+                      {'type': 'signIn'}, {'type': 'signIn', 'url': None}):
+            with self.subTest(other=other):
+                context, page = self.context([{'type': 'signIn', 'url': ENTRY}, other])
+                with self.assertRaises(ValueError):
+                    browser_login.open_storefront_login(context, Mock())
+                self.assertEqual(page.goto.call_count, 3)
 
     def waiting(self, network=None, *, timeout=9, hook=None, cookie=COOKIE):
         clock = [0.0]
@@ -145,6 +218,33 @@ class StorefrontRecoveryTests(unittest.TestCase):
 
         page.wait_for_timeout.side_effect = pump
         return clock, context, page, process, state, timeout
+
+    def test_authenticated_menu_wait_never_probes_or_authenticates_after_delayed_redirect(self):
+        def redirect(now, page, state):
+            if now >= .5:
+                page.url = ENTRY
+        clock, context, page, process, state, timeout = self.waiting(hook=redirect)
+        page.url = ACCOUNT
+        assistant = Mock()
+        with patch('browser_login.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('browser_signin.step_browser_signin') as signin:
+            with self.assertRaisesRegex(ValueError, '本次未重新提交认证'):
+                browser_login.wait_for_account_page(Mock(contexts=[context]), process,
+                    Mock(), timeout, state, account_url=ACCOUNT, account_read_only=True,
+                    assistant=assistant)
+        page.goto.assert_not_called()
+        signin.assert_not_called()
+
+    def test_authenticated_menu_wait_accepts_settled_account_without_second_read(self):
+        clock, context, page, process, state, timeout = self.waiting()
+        page.url = ACCOUNT
+        with patch('browser_login.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('browser_signin.step_browser_signin') as signin:
+            result = browser_login.wait_for_account_page(Mock(contexts=[context]), process,
+                Mock(), timeout, state, account_url=ACCOUNT, account_read_only=True, assistant=Mock())
+        self.assertEqual(result, ([COOKIE], 'fixture-user-agent'))
+        page.goto.assert_not_called()
+        signin.assert_not_called()
 
     def test_login_return_to_home_gets_one_settled_account_verification(self):
         clock, context, page, process, state, timeout = self.waiting()

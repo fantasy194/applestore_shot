@@ -40,6 +40,12 @@ export interface Prompt {
   actions?: { value: string; label: string }[];
   details?: Data;
   account?: string;
+  credential_storage?: {
+    backend: "encrypted_file" | "windows" | "macos" | null;
+    available: boolean;
+    persistent: boolean;
+    error?: string | null;
+  };
 }
 export interface Task {
   /** Web summaries omit logs and large results; explicit task reads return full detail. */

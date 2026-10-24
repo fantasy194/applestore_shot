@@ -1,0 +1,12 @@
+# Optional encrypted credential storage. Initialize the host key before use.
+services:
+  app:
+    environment:
+      DUO_VAULT_KEY_FILE: /run/secrets/duo_vault_key
+      DUO_VAULT_DIR: /data/.credentials
+    secrets:
+      - duo_vault_key
+
+secrets:
+  duo_vault_key:
+    file: ./secrets/duo-vault.key

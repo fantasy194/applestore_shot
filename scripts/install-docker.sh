@@ -8,6 +8,7 @@ duo_download_temp=''
 duo_config_temps=()
 duo_install_dir="${DUO_INSTALL_DIR:-$HOME/applestore_shot}"
 duo_download_base='https://raw.githubusercontent.com/fantasy194/applestore_shot/main'
+duo_enable_vault=${DUO_ENABLE_VAULT:-1}
 
 duo_message() {
   printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -137,7 +138,7 @@ duo_config_commit() {
 
 duo_stage='1/6 检查系统和 Docker'
 duo_message "$duo_stage"
-for duo_command in docker curl timeout mktemp sha256sum; do
+for duo_command in docker curl timeout mktemp sha256sum realpath; do
   if ! command -v "$duo_command" >/dev/null 2>&1; then
     printf '缺少命令：%s。请先安装 Docker Compose、curl 及 coreutils。\n' "$duo_command" >&2
     exit 1
@@ -160,14 +161,28 @@ duo_config_candidate compose.yaml \
   54ad9625e35ed9dcdc8170a6f81a8aef3a2e44d06b20d2f84e9576fd0b75cf2d \
   b60a581d3bed637cfd5206df68b08675c19053b9631f7a6fa5e8b58799fc40ed
 duo_compose_input=$duo_candidate
+duo_managed_base=1
+if [[ "$duo_compose_input" == compose.yaml ]]; then
+  duo_managed_base=0
+fi
 duo_download docker/chrome-seccomp.json
 
 duo_stage='3/6 配置自动更新并检查 Compose'
 duo_message "$duo_stage"
 duo_config_candidate compose.autoupdate.yaml \
   58820b5d79f5f382564529460af92566bd3ec35d5c9469c75d573c77e3b0d986 \
-  ec09a5e71fb433058bd4a18dfcfb23a9e7ca95b0ebd55d2fe35c6970bb44fa6c
+  ec09a5e71fb433058bd4a18dfcfb23a9e7ca95b0ebd55d2fe35c6970bb44fa6c \
+  f6f0b8400835c23683886b022eecc014e9575eb6287d010abdf579390dd080ab
 duo_overlay_input=$duo_candidate
+duo_vault_input=''
+if [[ "$duo_enable_vault" == 1 && "$duo_managed_base" == 1 ]]; then
+  duo_config_candidate compose.vault.yaml
+  duo_vault_input=$duo_candidate
+  duo_config_candidate docker/init-vault.py
+  duo_vault_init_input=$duo_candidate
+elif [[ "$duo_enable_vault" == 1 ]]; then
+  duo_message '自定义 Compose 保持原样；持久密码库需按 Docker 文档手动初始化并启用 compose.vault.yaml。'
+fi
 
 duo_compose=(docker compose --progress plain -f "$duo_compose_input" -f "$duo_overlay_input")
 # Resolve using Compose's own .env and shell precedence, including relative
@@ -197,6 +212,22 @@ duo_compose=(docker compose --progress plain -f compose.yaml -f compose.autoupda
 duo_stage='4/6 拉取应用、浏览器及 Watchtower 镜像（最多 20 分钟）'
 duo_message "$duo_stage"
 duo_run timeout --kill-after=10s 20m "${duo_compose[@]}" pull
+
+if [[ -n "$duo_vault_input" ]]; then
+  duo_stage='4/6 初始化或校验持久密码库主密钥'
+  duo_message "$duo_stage（不输出密钥，不替换已有密钥）"
+  mkdir -p -- secrets
+  duo_vault_script=$(realpath "$duo_vault_init_input")
+  duo_run timeout --kill-after=5s 30s "${duo_compose[@]}" run --rm --no-deps \
+    --user 0 --entrypoint python \
+    --volume "$PWD/secrets:/vault-host" --volume "$duo_vault_script:/vault-init.py:ro" \
+    app /vault-init.py --key-file /vault-host/duo-vault.key --vault-dir /data/.credentials
+  duo_run timeout --kill-after=5s 20s docker compose --progress plain \
+    -f compose.yaml -f compose.autoupdate.yaml -f "$duo_vault_input" config --quiet
+  duo_config_commit compose.vault.yaml "$duo_vault_input"
+  duo_config_commit docker/init-vault.py "$duo_vault_init_input"
+  duo_compose+=(-f compose.vault.yaml)
+fi
 
 duo_stage='5/6 启动服务并等待健康检查（最多 180 秒）'
 duo_message "$duo_stage"

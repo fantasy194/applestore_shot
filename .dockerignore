@@ -30,3 +30,6 @@
 !docker/*.py
 !docker/worker-launcher.sh
 !docker/browser-startapp.sh
+# Explicitly exclude runtime credential material even if future inputs expand.
+**/secrets/**
+**/.credentials/**

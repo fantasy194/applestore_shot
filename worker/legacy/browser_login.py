@@ -37,6 +37,11 @@ class BrowserSessionError(ValueError):
         self.browser_started, self.browser_connected = browser_started, browser_connected
 
 
+class _ReadOnlyStorefrontAccount(str):
+    """Keep the URL string API while carrying the authenticated-menu read boundary."""
+    read_only = True
+
+
 def signin_page(url):
     parsed = urlsplit(url)
     host = parsed.hostname or ''
@@ -170,7 +175,7 @@ def headless_auth_required():
 
 def open_storefront_login(context, service):
     """Use the current storefront menu entry, just like normal enrollment."""
-    from apple_login import HOME, LoginError, apple_url, storefront_api_key, storefront_signin_entry
+    from apple_login import HOME, LoginError, apple_url, storefront_api_key, storefront_menu_entry, storefront_signin_entry
 
     page = context.pages[-1] if context.pages else context.new_page()
     account_url = 'https://secure.www.apple.com.cn/shop/account/home'
@@ -218,9 +223,20 @@ def open_storefront_login(context, service):
         links = menu['body']['links']
         states = {link.get('type') for link in links if isinstance(link, dict)
                   and link.get('type') in ('signIn', 'signOut')}
-        if states == {'signOut'} and valid_store_session(context.cookies()):
-            # The official menu already recognizes this session. Only read its identity.
-            return account_url
+        if states == {'signOut'}:
+            # The menu recognizes the existing browser session, so it correctly
+            # has no signIn row. Read its current official account destination
+            # once; never synthesize a login URL or authenticate on this branch.
+            account_url = storefront_menu_entry(page.url, links, 'account', '/shop/account/home')
+            navigate(account_url, referer=HOME)
+            if (pending_auth_page(page) or trust_browser_if_offered(page, accept=False)
+                    or urlsplit(page.url).path != '/shop/account/home'
+                    or not valid_store_session(context.cookies())):
+                raise BrowserSessionError('STOREFRONT_SESSION_REQUIRES_ATTENTION',
+                    '官网菜单已识别登录，但账号会话尚需确认；已保留浏览器资料，本次未重新提交认证。',
+                    status='requires_login', requires_login=True,
+                    browser_started=True, browser_connected=True)
+            return _ReadOnlyStorefrontAccount(account_url)
         entry = storefront_signin_entry(page.url, links)
         navigate(entry, referer=HOME)
         return urljoin(entry, '/shop/account/home')
@@ -236,10 +252,10 @@ def valid_store_session(cookies):
 
 
 def wait_for_account_page(browser, process, service, timeout, network, *, remote=None, settle_seconds=2,
-                          headless=False, account_url=None, assistant=None):
+                          headless=False, account_url=None, assistant=None, account_read_only=False):
     deadline = time.monotonic() + timeout
     ready_since = None
-    account_requested = False
+    account_requested = account_read_only
     reported_541 = False
     authentication_seen = False
     unrecognized_since = None
@@ -252,7 +268,7 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
             if network.get('credential_rejected'):
                 service.reject_password()
             raise BrowserSessionError('BROWSER_LOGIN_AUTHENTICATION_FAILED' if network.get('credential_rejected') else 'BROWSER_LOGIN_REJECTED',
-                '官网未接受本次认证，请核对登录信息后手动重试；账号和保存密码已保留。',
+                '官网未接受本次认证，请核对登录信息后手动重试；账号和浏览器资料已保留。',
                 status='requires_login', requires_login=True,
                 browser_started=True, browser_connected=True)
         if headless and network.get('blocked_status') in (403, 429, 541):
@@ -274,12 +290,19 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
             pages.extend(context.pages)
         if not pages:
             raise ValueError('官网登录页面已关闭，未完成会话导入。')
+        if account_read_only and (any(pending_auth_page(page) or trust_browser_if_offered(page, accept=False)
+                                      for page in pages)
+                                  or urlsplit(pages[-1].url).path != '/shop/account/home'):
+            raise BrowserSessionError('STOREFRONT_SESSION_REQUIRES_ATTENTION',
+                '官网账号读取转入认证，已停止；账号和浏览器资料已保留，本次未重新提交认证。',
+                status='requires_login', requires_login=True,
+                browser_started=True, browser_connected=True)
         if remote is not None:
             remote.pump(pages[-1])
             if assistant is not None:
                 assistant.process_remote_request(remote)
         outcome = None
-        if assistant is not None and assistant.interrupted is not True and not network['error']:
+        if not account_read_only and assistant is not None and assistant.interrupted is not True and not network['error']:
             for page in reversed(pages):
                 if pending_auth_page(page):
                     if not authentication_seen:
@@ -315,7 +338,7 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                     else:
                         unrecognized_since = None
                     break
-        trust_pending = any(trust_browser_if_offered(page, accept=False) if headless and assistant is None
+        trust_pending = any(trust_browser_if_offered(page, accept=False) if account_read_only or (headless and assistant is None)
                             else trust_browser_if_offered(page, remote=remote) for page in pages)
         auth_pending = any(pending_auth_page(page) for page in pages)
         if headless and assistant is None and (trust_pending or auth_pending):
@@ -333,7 +356,7 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                     continue
                 parsed = urlsplit(page.url)
                 host = parsed.hostname or ''
-                if (parsed.scheme != 'https' or not host.endswith('.www.apple.com.cn')
+                if (parsed.scheme != 'https' or not re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn', host)
                         or parsed.path != '/shop/account/home'):
                     continue
                 cookies = context.cookies()
@@ -558,6 +581,8 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False):
                     wait_options = {'remote': remote, 'assistant': assistant}
                     if account_url is not None:
                         wait_options['account_url'] = account_url
+                        if getattr(account_url, 'read_only', False):
+                            wait_options['account_read_only'] = True
                     if headless:
                         wait_options['headless'] = True
                     cookies, agent = wait_for_account_page(browser, process, service, timeout, network, **wait_options)

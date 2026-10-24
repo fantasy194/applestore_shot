@@ -122,20 +122,39 @@ def storefront_api_key(html):
     return key[1]
 
 
+def storefront_menu_entry(home_url, links, kind, path):
+    """Select one current official destination, regardless of duplicate menu rows."""
+    if not isinstance(links, list):
+        raise LoginError("首页菜单未提供有效的链接，已停止。")
+    entries = set()
+    for link in links:
+        if not isinstance(link, dict) or link.get("type") != kind:
+            continue
+        value = link.get("url")
+        if (not isinstance(value, str) or not value or value != value.strip()
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            raise LoginError("首页菜单返回了非预期的商城入口。")
+        try:
+            entry = apple_url(urljoin(home_url, value))
+            parsed = urlsplit(entry)
+            if parsed.hostname == "idmsa.apple.com.cn" or parsed.path != path:
+                raise LoginError("首页菜单返回了非预期的商城入口。")
+        except ValueError:
+            raise LoginError("首页菜单返回了非预期的商城入口。") from None
+        entries.add(entry)
+    if len(entries) != 1:
+        raise LoginError("首页菜单未提供唯一的商城入口，已停止。")
+    return entries.pop()
+
+
 def storefront_signin_entry(home_url, links):
     if not isinstance(links, list):
-        raise LoginError("首页菜单未提供唯一的登录链接，已停止，未改走账户页。")
-    entries = [link.get("url") for link in links if isinstance(link, dict) and link.get("type") == "signIn"]
-    if len(entries) != 1 or not isinstance(entries[0], str) or not entries[0]:
-        raise LoginError("首页菜单未提供唯一的登录链接，已停止，未改走账户页。")
-    try:
-        entry = apple_url(urljoin(home_url, entries[0]))
-        parsed = urlsplit(entry)
-        if parsed.hostname == "idmsa.apple.com.cn" or parsed.path != "/shop/signIn":
-            raise LoginError("首页菜单返回了非预期的商城登录入口。")
-    except ValueError:
-        raise LoginError("首页菜单返回了非预期的商城登录入口。") from None
-    return entry
+        raise LoginError("首页菜单未提供有效的登录链接，已停止。")
+    states = {link.get("type") for link in links if isinstance(link, dict)
+              and link.get("type") in ("signIn", "signOut")}
+    if states != {"signIn"}:
+        raise LoginError("首页菜单未确认唯一的登录状态，已停止。")
+    return storefront_menu_entry(home_url, links, "signIn", "/shop/signIn")
 
 
 def json_scripts(html):
