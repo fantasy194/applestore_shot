@@ -34,10 +34,11 @@ srp.no_username_in_x()
 
 
 class LoginError(Exception):
-    def __init__(self, message, *, status=None, codes=()):
+    def __init__(self, message, *, status=None, codes=(), phase=None):
         super().__init__(message)
         self.status = status
         self.codes = tuple(codes)
+        self.phase = phase
 
 
 def browser_profile_path(auth_path=None):
@@ -726,6 +727,14 @@ class AppleStoreLogin:
             self.update_trust(trust_response)
 
     def discard_failed_login(self, error):
+        if isinstance(error, LoginError) and error.status == 541:
+            # The authx response has already updated this jar (including
+            # expirations/deletions). Keep that current state, never restore
+            # a pre-request snapshot or treat a merchant block as bad password.
+            if self.auth_path is not None:
+                from duo_killer import save_auth
+                save_auth(self.session, auth_path=self.auth_path)
+            return
         auth_names = {"as_ltn_cn", "as_cn", "as_disa", "as_rec", "myacinfo", "acn01"}
 
         def is_auth(name, domain):
@@ -859,7 +868,7 @@ class AppleStoreLogin:
                      'Apple 账号认证已完成；未记录响应正文或凭据。',
                      response.headers.get('Content-Type', ''), len(response.content))
             raise LoginError('Apple 账号认证已完成，但商城会话交换被拒绝（HTTP 541）。'
-                             '这不是验证码错误；商城登录尚未完成。', status=541)
+                             '这不是验证码错误；商城登录尚未完成。', status=541, phase='store_exchange')
         data = self.expect(response, (200,))
         head = data.get("head", {}) if isinstance(data, dict) else {}
         target = head.get("data", {}).get("url")

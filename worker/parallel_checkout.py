@@ -20,7 +20,8 @@ import threading
 import time
 import uuid
 
-from protocol import Cancelled, PromptClosed
+from protocol import (Cancelled, PromptClosed, CHECKOUT_BROWSER_REQUEST, CHECKOUT_BROWSER_RESPONSE,
+                      checkout_private_read, checkout_private_write, checkout_private_remove, checkout_browser_error, checkout_browser_diagnostics)
 from platform_support import private_fd
 
 
@@ -36,6 +37,25 @@ SESSION_AUTH_MESSAGE = '当前购买会话尚未完成认证；本次未自动�
 # authentication ownership here, across batches, while purchases stay parallel.
 _AUTHENTICATION_LOCK = threading.RLock()
 _AUTHENTICATION_LEASES = {}
+
+
+class _CheckoutLeaseChannel:
+    """Keep browser OTP on its queue target and revoke it with its child."""
+    def __init__(self, channel, alive):
+        self.channel, self.alive = channel, alive
+
+    def __getattr__(self, name):
+        return getattr(self.channel, name)
+
+    def checkpoint(self):
+        self.channel.checkpoint()
+        if not self.alive():
+            raise PromptClosed('当前结账认证已结束。')
+
+    def prompt(self, kind, label, **fields):
+        prior = fields.pop('_alive', None)
+        fields['_alive'] = lambda: self.alive() and (prior is None or prior())
+        return self.channel.prompt(kind, label, **fields)
 
 
 def concurrency(params):
@@ -348,6 +368,9 @@ class PurchaseBatch:
                     except (ValueError, TypeError):
                         queue_event({'type': 'invalid'})
                         break
+                    # Register ownership before handing the event to the main
+                    # loop: its consumer may run only after this child has exited.
+                    self._register_browser_request(item, event)
                     if not self._private_authentication_event(item, event):
                         queue_event(event)
             except (OSError, UnicodeError, ValueError):
@@ -366,12 +389,42 @@ class PurchaseBatch:
                 done.set()
         threading.Thread(target=collect, daemon=True).start()
 
+    def _register_browser_request(self, item, event):
+        if (not isinstance(event, dict) or event.get('v') != 1
+                or event.get('account_id') != self.channel.account_id
+                or event.get('task_id') != item['task_id'] or event.get('type') != 'prompt'):
+            return
+        prompt = event.get('prompt')
+        if (not isinstance(prompt, dict) or prompt.get('kind') != '_checkout_browser_recovery'
+                or not isinstance(prompt.get('id'), str) or not 1 <= len(prompt['id']) <= 200):
+            return
+        with _AUTHENTICATION_LOCK:
+            if not self._owns_authentication(item, prompt.get('checkout_auth_lease')):
+                return
+            directory = Path(item['root']) / 'accounts' / self.channel.account_id / 'tasks' / item['task_id']
+            registered = (directory / CHECKOUT_BROWSER_REQUEST, prompt.get('payload_sha256'))
+            previous = item.get('_checkout_browser_request')
+            if previous is not None and previous != registered:
+                return
+            try:
+                checkout_private_read(directory, CHECKOUT_BROWSER_REQUEST, prompt.get('payload_sha256'))
+            except (OSError, ValueError):
+                return
+            item['_checkout_browser_request'] = registered
+
     def _release_authentication(self, item):
         with _AUTHENTICATION_LOCK:
             owned = _AUTHENTICATION_LEASES.get(self.channel.account_id)
             if owned is not None and owned[0] is self and owned[1] == item['id']:
                 _AUTHENTICATION_LEASES.pop(self.channel.account_id, None)
             item.pop('_checkout_auth_lease', None)
+            self._clear_browser_recovery(item)
+
+    def _clear_browser_recovery(self, item):
+        for key in ('_checkout_browser_file', '_checkout_browser_request'):
+            created = item.pop(key, None)
+            if created is not None:
+                checkout_private_remove(*created)
 
     def _owns_authentication(self, item, lease):
         with _AUTHENTICATION_LOCK:
@@ -385,7 +438,7 @@ class PurchaseBatch:
                 or event.get('task_id') != item['task_id']):
             return False
         kind = event.get('type')
-        if kind not in ('checkout_auth_release', 'credential_rejected', 'checkout_auth_failed'):
+        if kind not in ('checkout_auth_release', 'credential_rejected', 'checkout_auth_failed', 'checkout_browser_consumed'):
             return False
         with _AUTHENTICATION_LOCK:
             if self._owns_authentication(item, event.get('checkout_auth_lease')):
@@ -394,6 +447,8 @@ class PurchaseBatch:
                     self.credential_owner.reject_password()
                 elif kind == 'checkout_auth_failed':
                     self.service.authentication_failed = True
+                elif kind == 'checkout_browser_consumed':
+                    self._clear_browser_recovery(item)
                 else:
                     self._release_authentication(item)
         return True
@@ -467,6 +522,50 @@ class PurchaseBatch:
                 self._release_authentication(item)
                 raise
             return
+        if kind == '_checkout_browser_recovery':
+            lease = prompt.get('checkout_auth_lease')
+            alive = lambda: child.poll() is None and self._owns_authentication(item, lease)
+            if (not alive() or item['order_submitted'] or item.get('_checkout_browser_recovery_used') is True):
+                self._send_reply(item, prompt, {'error': 'CHECKOUT_BROWSER_RECOVERY_DENIED'})
+                return
+            item['_checkout_browser_recovery_used'] = True
+            owner = self.credential_owner
+            if (owner.channel.account_id != self.channel.account_id
+                    or owner.account.strip().casefold() != self.service.account.strip().casefold()
+                    or getattr(owner, '_parallel_child', False) is True):
+                self._send_reply(item, prompt, {'error': 'CHECKOUT_BROWSER_RECOVERY_OWNER'})
+                return
+            directory = Path(item['root']) / 'accounts' / self.channel.account_id / 'tasks' / item['task_id']
+            try:
+                payload = checkout_private_read(directory, CHECKOUT_BROWSER_REQUEST, prompt.get('payload_sha256'))
+                item['_checkout_browser_request'] = (directory / CHECKOUT_BROWSER_REQUEST, prompt['payload_sha256'])
+                # A shadow routes only this target's OTP while preserving the
+                # original owner account/profile. Credential rejection and cache
+                # invalidation always reach the original service.
+                shadow = copy.copy(owner)
+                shadow.channel = _CheckoutLeaseChannel(self.channel, alive)
+                shadow.submitted = False
+                shadow._parallel_child = False
+                shadow._checkout_auth_active = False
+                shadow.browser_password = owner.browser_password
+                shadow.reject_password = owner.reject_password
+                previous_requested = owner.authentication_requested
+                with shadow.checkout_authentication():
+                    result = shadow.recover_checkout_authentication(payload)
+                owner.authentication_requested = previous_requested
+                if not alive():
+                    raise PromptClosed('当前结账认证已结束。')
+                path, digest = checkout_private_write(directory, CHECKOUT_BROWSER_RESPONSE, result)
+                item['_checkout_browser_file'] = (path, digest)
+                if not self._send_reply(item, prompt, {'lease': lease, 'basename': CHECKOUT_BROWSER_RESPONSE, 'sha256': digest}):
+                    self._clear_browser_recovery(item)
+            except Cancelled:
+                self._clear_browser_recovery(item)
+                raise
+            except Exception as error:
+                self._clear_browser_recovery(item)
+                self._send_reply(item, prompt, checkout_browser_error(error))
+            return
         checkout_code = kind == 'code' and self._owns_authentication(item, prompt.get('checkout_auth_lease'))
         if kind == 'password' or kind == 'code' and not checkout_code:
             self._stop_attempt(item)
@@ -530,6 +629,7 @@ class PurchaseBatch:
             if not isinstance(result, dict):
                 raise ValueError('并发子任务返回了无效结果。')
             item['result'] = result
+            item.update(checkout_browser_diagnostics(result))
             if _pending(result):
                 item['status'] = 'pending_payment'
                 item['order_submitted'] = True
@@ -545,8 +645,10 @@ class PurchaseBatch:
                         'submission_unknown' if item['order_submitted'] else
                         'cancelled' if kind == 'cancelled' else 'failed',
                         error=str(event.get('message', '本次尝试未完成。'))[:2000], terminal=True)
+            diagnostic = checkout_browser_diagnostics(event)
+            item.update(diagnostic)
             guarded_auth = AUTH_GUARD in item['error'] or '并发会话需要验证' in item['error']
-            if kind == 'error' and guarded_auth and not item['order_submitted']:
+            if kind == 'error' and guarded_auth and not item['order_submitted'] and not diagnostic:
                 checkout_auth = item.get('_authentication_scope') == 'checkout'
                 item.update(error_code='CHECKOUT_REAUTH_REQUIRED' if checkout_auth
                             else 'PARALLEL_SESSION_REAUTH_REQUIRED',
@@ -588,7 +690,10 @@ class PurchaseBatch:
             except subprocess.TimeoutExpired:
                 pass
             if child.stdin:
-                child.stdin.close()
+                try:
+                    child.stdin.close()
+                except (OSError, ValueError):
+                    pass  # A dead OTP consumer may already have broken its pipe.
         # Private stdout is drained before ownership ends. In particular a
         # preceding credential rejection cannot be skipped by process cleanup.
         for item in self.attempts:

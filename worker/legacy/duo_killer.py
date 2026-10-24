@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -230,7 +231,8 @@ def expiry_details(expires, now):
             "expires_in": ("剩余 " if remaining > 0 else "已过期 ") + format_duration(remaining)}
 
 
-def save_auth(session):
+def save_auth(session, *, auth_path=None):
+    destination = Path(auth_path) if auth_path is not None else AUTH_PATH
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     data = {"headers": {k: v for k, v in session.headers.items()
                         if k.lower() in ("user-agent", "accept-language")},
@@ -247,11 +249,11 @@ def save_auth(session):
                                           **({"expires_after": c.get_nonstandard_attr(
                                               "expires_after", "未知（缺少下发记录）")}
                                              if c.expires is not None else {})})
-    existing = json.loads(AUTH_PATH.read_text(encoding="utf-8")) if AUTH_PATH.exists() else {}
+    existing = json.loads(destination.read_text(encoding="utf-8")) if destination.exists() else {}
     if not isinstance(existing, dict):
-        raise ValueError(f"{AUTH_PATH} 必须是 JSON 对象，未覆盖原文件。")
+        raise ValueError(f"{destination} 必须是 JSON 对象，未覆盖原文件。")
     data = {**existing, **data}  # 保留账号、密码、设备信任及其他配置。
-    write_private_json(AUTH_PATH, data)
+    write_private_json(destination, data)
 
 
 def load_auth(session, data):
@@ -848,10 +850,120 @@ class Checkout:
         return node
 
 
-def reauthenticate_checkout(flow):
+def _checkout_browser_recovery(flow, handler, expected):
+    """Import only this original checkout's verified browser document in place."""
+    if (getattr(handler, 'submitted', False) is True
+            or getattr(flow, '_browser_authentication_recovery_attempted', False) is True):
+        raise ValueError('当前结账不能再次恢复认证；未重放购买。')
+    expected = expected or ([handler.purchase_selection] if getattr(handler, 'purchase_selection', None) else None)
+    if not isinstance(expected, (list, tuple)) or not expected:
+        raise ValueError('当前结账缺少原购买商品授权，未接管浏览器认证。')
+    authorized = sorted((normalize_sku(sku), count) for sku, count in expected
+                        if type(count) is int and count > 0)
+    if len(authorized) != len(expected):
+        raise ValueError('当前结账商品数量授权无效，未接管浏览器认证。')
+    account = getattr(handler, 'account', None)
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError('当前结账缺少账号归属，未接管浏览器认证。')
+    flow._browser_authentication_recovery_attempted = True
+    cookies = [{'name': c.name, 'value': c.value, 'domain': c.domain, 'path': c.path,
+                'secure': c.secure, 'expires': c.expires,
+                'httpOnly': c.has_nonstandard_attr('HttpOnly')}
+               for c in flow.session.cookies if not c.is_expired()
+               and (c.domain.lstrip('.') == 'apple.com.cn' or c.domain.endswith('.apple.com.cn'))]
+    recovered = handler.recover_checkout_authentication({'entry_url': flow.url, 'cookies': cookies,
+        'user_agent': flow.session.headers.get('User-Agent', '')})
+    if not isinstance(recovered, dict) or str(recovered.get('account', '')).strip().casefold() != account.strip().casefold():
+        raise ValueError('官网恢复返回的账号与当前购买不同，未继续结账。')
+    url = recovered.get('url')
+    parsed = urlsplit(url) if isinstance(url, str) else None
+    if (parsed is None or parsed.scheme != 'https' or parsed.username or parsed.password
+            or parsed.port not in (None, 443)
+            or not re.fullmatch(r'secure\d*\.www\.apple\.com\.cn', parsed.hostname or '')
+            or parsed.path not in ('/shop/checkout', '/shop/checkout/start')):
+        raise ValueError('官网恢复未返回实际结账页面，未重新创建结账。')
+    body = recovered.get('init_data')
+    if not isinstance(body, dict):
+        raise ValueError('官网恢复未返回当前结账数据，未继续购买。')
+    page = field(body, 'checkout.d.page')
+    sections = {'Fulfillment':'fulfillment', 'PickupContact':'pickupContact', 'Shipping':'shipping',
+                'Billing':'billing', 'Review':'review'}
+    if page not in sections or not isinstance(field(body, 'checkout.' + sections[page]), dict):
+        raise ValueError('官网恢复未确认有效结账步骤，未继续购买。')
+    evidence = []
+    for path in ('checkout.fulfillment', 'checkout.shipping', 'checkout.review.fulfillmentReview',
+                 'checkout.companionBar.orderDetails'):
+        items = model_items(field(body, path, {}))
+        if items:
+            evidence.append(sorted((normalize_sku(sku), count) for sku, count in items))
+    if not evidence or any(items != authorized for items in evidence):
+        raise ValueError('官网恢复的商品或数量与原购买不一致，未继续结账。')
+    meta_url = field(body, 'meta.page.htmlUrl')
+    if meta_url:
+        resolved = urlsplit(urljoin(url, meta_url))
+        if resolved.netloc != parsed.netloc or resolved.path not in ('/shop/checkout', '/shop/checkout/start'):
+            raise ValueError('官网恢复的页面元数据与当前结账不一致。')
+    headers = field(body, 'meta.h', {})
+    if not isinstance(headers, dict) or not any(k.lower() == 'x-aos-stk' and isinstance(v, str) and v for k,v in headers.items()):
+        raise ValueError('官网恢复缺少当前结账令牌，未继续购买。')
+    returned = recovered.get('cookies')
+    agent = recovered.get('user_agent')
+    if not isinstance(returned, list) or not isinstance(agent, str) or not agent.strip() or len(agent) > 4096:
+        raise ValueError('官网恢复的会话数据不完整，未继续购买。')
+    replacement = requests.cookies.RequestsCookieJar()
+    for row in returned:
+        if not isinstance(row, dict):
+            raise ValueError('官网恢复的 Cookie 格式无效。')
+        domain = row.get('domain', '')
+        if not isinstance(domain, str) or not (domain.lstrip('.') == 'apple.com.cn' or domain.endswith('.apple.com.cn')):
+            continue
+        if (not isinstance(row.get('name'), str) or not row['name']
+                or not isinstance(row.get('value'), str) or not isinstance(row.get('path', '/'), str)
+                or not row.get('path', '/').startswith('/')):
+            raise ValueError('官网恢复的 Cookie 格式无效。')
+        expires = row.get('expires')
+        if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires)):
+            raise ValueError('官网恢复的 Cookie 有效期无效。')
+        if expires is None or expires == -1:
+            expires = None  # CDP uses -1 only for a session cookie.
+        elif expires < 0:
+            raise ValueError('官网恢复的 Cookie 有效期无效。')
+        else:
+            expires = int(expires)
+            if expires <= time():
+                continue
+        replacement.set_cookie(requests.cookies.create_cookie(row['name'], row['value'], domain=domain,
+            path=row.get('path', '/'), secure=row.get('secure', True) is True, expires=expires,
+            rest={'HttpOnly': None} if row.get('httpOnly') is True else {}))
+    if getattr(handler, 'submitted', False) is True:
+        raise ValueError('认证等待期间已有提交记录，未继续购买。')
+    # Validate everything before replacing current cookies or page tokens.
+    for cookie in list(flow.session.cookies):
+        if cookie.domain.lstrip('.') == 'apple.com.cn' or cookie.domain.endswith('.apple.com.cn'):
+            flow.session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+    for cookie in replacement:
+        flow.session.cookies.set_cookie(cookie)
+    flow.session.headers['User-Agent'] = agent
+    document = requests.Response()
+    document.status_code = 200
+    document.url = url
+    encoded_body = json.dumps(body, ensure_ascii=False).replace('<', '\\u003c')
+    document._content = ('<script id="init_data">' + encoded_body + '</script>').encode('utf-8')
+    document.encoding = 'utf-8'
+    flow.read_page(document, '官网浏览器恢复原结账')
+    save_auth(flow.session)
+    return True
+
+
+def reauthenticate_checkout(flow, *, expected=None):
     if not urlsplit(flow.url).path.startswith("/shop/signIn"):
         return False
     from apple_login import AppleStoreLogin, LoginError, load_credentials
+    if (getattr(flow, '_browser_authentication_recovery_attempted', False) is True
+            or getattr(flow, '_http_authx_rejected', False) is True):
+        raise ValueError('本次结账认证恢复已尝试，未重复发送认证。')
+    if getattr(interaction.handler, 'submitted', False) is True:
+        raise ValueError('当前结账已有提交记录，未重新认证或重放购买。')
 
     log.info("[结账认证] 当前结账要求重新认证，保留 Session 和原登录入口继续。")
     prepared = flow.session.prepare_request(requests.Request('GET', flow.url))
@@ -867,10 +979,22 @@ def reauthenticate_checkout(flow):
     scope = (interaction.handler.checkout_authentication()
              if hasattr(interaction.handler, 'checkout_authentication') else nullcontext())
     with scope:
+        failed_before = getattr(interaction.handler, 'authentication_failed', False)
         try:
             account, password = load_credentials(AUTH_PATH)
             response = client.login(account, password, signin_url=flow.url, signin_response=flow.page_response)
         except LoginError as error:
+            if error.status == 541 and error.phase == 'store_exchange':
+                flow._http_authx_rejected = True
+            handler = interaction.handler
+            if (error.status == 541 and error.phase == 'store_exchange'
+                    and getattr(handler, 'submitted', False) is not True
+                    and callable(getattr(handler, 'recover_checkout_authentication', None))):
+                _checkout_browser_recovery(flow, handler, expected)
+                if failed_before is False and getattr(handler, 'password_rejected', False) is not True:
+                    handler.authentication_failed = False
+                log.info('[结账认证] 官网浏览器已在原购买任务中恢复结账，未重复加购或重放认证。')
+                return True
             raise ValueError("结账重新认证失败：" + str(error)) from error
         except EOFError:
             raise ValueError("结账验证码输入已取消，请在终端重新运行 -p。") from None
@@ -1151,7 +1275,7 @@ def pay_bag(*, flow=None, prepare_only=False):
                 for name in ("state", "provinceCityDistrict", "countryCode"):
                     data[prefix + address + "." + name] = field(item, address[1:] + ".d." + name, "CN" if name == "countryCode" else "")
             flow.action("shoppingCart.actions", "checkout", data)
-            reauthenticate_checkout(flow)
+            reauthenticate_checkout(flow, expected=expected)
             return continue_checkout(flow, expected, prepare_only=prepare_only)
         finally:
             if standalone:

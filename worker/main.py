@@ -124,8 +124,10 @@ def main():
             message = f'操作未完成（{type(exc).__name__}），请查看任务阶段。'
         if service and service.submitted:
             message += ' 订单提交结果可能未确认，请查询订单后再决定下一步。'
+        from protocol import checkout_browser_error, checkout_browser_diagnostics
+        diagnostic = checkout_browser_diagnostics(checkout_browser_error(exc))
         channel.emit('error', message=message[:2000], order_submitted=bool(service and service.submitted),
-                     account_invalid=bool(service and service.should_remove_account(exc)))
+                     account_invalid=bool(service and service.should_remove_account(exc)), **diagnostic)
     finally:
         if service:
             try:

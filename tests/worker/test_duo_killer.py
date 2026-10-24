@@ -499,6 +499,7 @@ class BrowserInitializationTests(unittest.TestCase):
                     with self.assertRaises(LoginError) as caught:
                         client.finish_store_login()
                     self.assertEqual(caught.exception.status, status)
+                    self.assertEqual(caught.exception.phase, "store_exchange" if status == 541 else None)
                     request.assert_called_once()
                     initialize.assert_not_called()
                 self.assertEqual((client.browser_profile / ".authx-541").exists(), status == 541)
@@ -737,10 +738,13 @@ class FailedLoginLifecycleTests(unittest.TestCase):
                         with self.assertRaises(type(error)):
                             client.login(config["account"], config["password"], signin_url=entry)
                         attempt.assert_called_once()
-                    # 模拟调用方 finally 保存，认证 Cookie 不能复活。
+                    # Callers persist the current jar: rejected credentials stay removed;
+                    # a merchant 541 preserves response-updated state without old snapshots.
                     duo_killer.save_auth(client.session)
                     saved = json.loads(path.read_text())
-                    self.assertEqual({c["name"] for group in saved["cookies"].values() for c in group}, {"shld_bt_ck"})
+                    expected_names = ({"as_ltn_cn", "myacinfo", "idmsa-session", "shld_bt_ck"}
+                                      if getattr(error, "status", None) == 541 else {"shld_bt_ck"})
+                    self.assertEqual({c["name"] for group in saved["cookies"].values() for c in group}, expected_names)
                     self.assertEqual(saved["trust_cookies"], config["trust_cookies"])
                     self.assertEqual(saved["custom"], "keep")
                     self.assertEqual((saved["account"], saved["password"]),

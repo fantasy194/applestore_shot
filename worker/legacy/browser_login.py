@@ -8,6 +8,7 @@ import json
 import weakref
 import os
 from contextlib import nullcontext
+from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -438,6 +439,28 @@ def verified_identity(session, expected_account):
     return result
 
 
+def persist_verified_browser_session(session, expected_account, *, auth_path=None):
+    """Persist only a session whose account was already verified by the caller."""
+    destination = Path(auth_path) if auth_path is not None else duo_killer.AUTH_PATH
+    existing = json.loads(destination.read_text(encoding='utf-8')) if destination.exists() else {}
+    if (not isinstance(existing, dict) or existing.get('account') is not None
+            and str(existing['account']).strip().casefold() != expected_account.strip().casefold()):
+        raise ValueError('账号会话保存位置与当前账号不一致，未覆盖会话。')
+    if auth_path is None:
+        duo_killer.save_auth(session)
+    else:
+        duo_killer.save_auth(session, auth_path=destination)
+    from apple_login import stored_device_trust, TRUST_COOKIE_NAME
+    candidates = [{'name': c.name, 'value': c.value, 'domain': c.domain, 'path': c.path,
+                   'expires': c.expires} for c in session.cookies if TRUST_COOKIE_NAME.fullmatch(c.name)]
+    if candidates:
+        saved = json.loads(destination.read_text(encoding='utf-8'))
+        saved['trust_account'] = expected_account
+        saved['trust_cookies'] = stored_device_trust({'account': expected_account,
+            'trust_account': expected_account, 'trust_cookies': candidates}, expected_account)
+        duo_killer.write_private_json(destination, saved)
+
+
 def import_browser_session(cookies, user_agent, expected_account):
     with requests.Session() as session:
         session.headers.update({'User-Agent': user_agent, 'Accept-Language': 'zh-CN,zh;q=0.9'})
@@ -451,16 +474,7 @@ def import_browser_session(cookies, user_agent, expected_account):
                 secure=c.get('secure', True), expires=int(expiry) if expiry > 0 else None,
                 rest={'HttpOnly': None} if c.get('httpOnly') else {}))
         result = verified_identity(session, expected_account)
-        duo_killer.save_auth(session)
-        from apple_login import stored_device_trust, TRUST_COOKIE_NAME
-        candidates = [{'name': c.name, 'value': c.value, 'domain': c.domain, 'path': c.path,
-                       'expires': c.expires} for c in session.cookies if TRUST_COOKIE_NAME.fullmatch(c.name)]
-        if candidates:
-            saved = json.loads(duo_killer.AUTH_PATH.read_text(encoding='utf-8'))
-            saved['trust_account'] = expected_account
-            saved['trust_cookies'] = stored_device_trust({'account': expected_account,
-                'trust_account': expected_account, 'trust_cookies': candidates}, expected_account)
-            duo_killer.write_private_json(duo_killer.AUTH_PATH, saved)
+        persist_verified_browser_session(session, expected_account)
         return result
 
 
@@ -500,7 +514,7 @@ def seed_missing_session(context, service):
         context.add_cookies(selected)
 
 
-def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, storefront=False, automatic=False):
+def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, storefront=False, automatic=False, checkout_context=None):
     from browser_cdp import BrowserConnectError, connect_browser
     from playwright.sync_api import sync_playwright, Error as BrowserError, TimeoutError as BrowserTimeout
     from apple_login import HOME, browser_profile_path
@@ -564,59 +578,68 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                 assistant = BrowserSigninAssistant(service, headless=headless, automatic=automatic)
                 from browser_remote import remote_context
                 with (nullcontext(None) if headless else remote_context(service, port)) as remote:
-                    account_url = None
-                    if (maintenance or headless) and not recover and not storefront:
-                        seed_missing_session(browser.contexts[0], service)
-                        context = browser.contexts[0]
-                        page = context.pages[-1] if context.pages else context.new_page()
-                        # Refresh the browser's real storefront context even when
-                        # the HTTP export still contains an unexpired shield cookie.
-                        for url in (HOME, HOME + 'shop/bag', 'https://secure.www.apple.com.cn/shop/account/home'):
-                            service.channel.checkpoint()
-                            reply = page.goto(url, wait_until='domcontentloaded', timeout=20000)
-                            if reply is not None and reply.status in (403, 429, 541):
-                                return {'success': False, 'status': 'blocked', 'requires_login': True,
-                                        'error_code': 'APPLE_SESSION_BLOCKED', 'http_status': reply.status,
-                                        'browser_started': True, 'browser_connected': True,
-                                        'message': '官网会话检查被拒绝，请使用官网窗口恢复登录；未自动重新认证。'}
-                            if reply is None or reply.status >= 400:
-                                return {'success': False, 'status': 'failed', 'requires_login': False,
-                                        'error_code': 'BROWSER_NAVIGATION_HTTP_ERROR',
-                                        'http_status': reply.status if reply is not None else None,
-                                        'browser_started': True, 'browser_connected': True,
-                                        'message': '官网页面请求未正常完成，会话状态尚未确认；未判定登录过期。'}
-                            if pending_auth_page(page) or trust_browser_if_offered(page, accept=False):
-                                if automatic or trust_browser_if_offered(page, accept=False):
-                                    account_url = 'https://secure.www.apple.com.cn/shop/account/home'
-                                else:
-                                    service.stage('官网会话需要重新登录，正在从首页入口自动继续')
-                                    account_url = open_storefront_login(context, service, **({'automatic': True} if automatic else {}))
-                                break
-                        parsed = urlsplit(page.url)
-                        if account_url is None and parsed.path != '/shop/account/home':
-                            needs_login = signin_page(page.url)
-                            if headless and needs_login:
-                                raise headless_auth_required()
-                            return {'success': False, 'status': 'requires_login' if needs_login else 'failed',
-                                    'requires_login': needs_login,
-                                    'error_code': 'OFFICIAL_SIGNIN_REQUIRED' if needs_login else 'BROWSER_UNEXPECTED_PAGE',
-                                    'browser_started': True, 'browser_connected': True,
-                                    'message': ('官网明确跳转到登录页面，请打开官网窗口完成验证；未自动登录。'
-                                                if needs_login else '浏览器到达了未识别的官网页面，会话状态尚未确认；未判定登录过期。')}
+                    if checkout_context is not None:
+                        from browser_checkout import BrowserCheckoutRecovery
+                        checkout = BrowserCheckoutRecovery(browser.contexts[0], service, checkout_context)
+                        checkout.prepare()
+                        result = checkout.wait(browser, process, assistant, network, timeout, remote=remote)
                     else:
-                        account_url = open_storefront_login(browser.contexts[0], service, **({'automatic': True} if automatic else {}))
-                    wait_options = {'remote': remote, 'assistant': assistant}
-                    if automatic:
-                        wait_options['automatic'] = True
-                    if account_url is not None:
-                        wait_options['account_url'] = account_url
-                        if getattr(account_url, 'read_only', False):
-                            wait_options['account_read_only'] = True
-                    if headless:
-                        wait_options['headless'] = True
-                    cookies, agent = wait_for_account_page(browser, process, service, timeout, network, **wait_options)
-                service.stage('正在核对官网登录账号并验证工具会话')
-                result = import_browser_session(cookies, agent, service.account)
+                        account_url = None
+                        if (maintenance or headless) and not recover and not storefront:
+                            seed_missing_session(browser.contexts[0], service)
+                            context = browser.contexts[0]
+                            page = context.pages[-1] if context.pages else context.new_page()
+                            # Refresh the browser's real storefront context even when
+                            # the HTTP export still contains an unexpired shield cookie.
+                            for url in (HOME, HOME + 'shop/bag', 'https://secure.www.apple.com.cn/shop/account/home'):
+                                service.channel.checkpoint()
+                                reply = page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                                if reply is not None and reply.status in (403, 429, 541):
+                                    return {'success': False, 'status': 'blocked', 'requires_login': True,
+                                            'error_code': 'APPLE_SESSION_BLOCKED', 'http_status': reply.status,
+                                            'browser_started': True, 'browser_connected': True,
+                                            'message': '官网会话检查被拒绝，请使用官网窗口恢复登录；未自动重新认证。'}
+                                if reply is None or reply.status >= 400:
+                                    return {'success': False, 'status': 'failed', 'requires_login': False,
+                                            'error_code': 'BROWSER_NAVIGATION_HTTP_ERROR',
+                                            'http_status': reply.status if reply is not None else None,
+                                            'browser_started': True, 'browser_connected': True,
+                                            'message': '官网页面请求未正常完成，会话状态尚未确认；未判定登录过期。'}
+                                if pending_auth_page(page) or trust_browser_if_offered(page, accept=False):
+                                    if automatic or trust_browser_if_offered(page, accept=False):
+                                        account_url = 'https://secure.www.apple.com.cn/shop/account/home'
+                                    else:
+                                        service.stage('官网会话需要重新登录，正在从首页入口自动继续')
+                                        account_url = open_storefront_login(context, service, **({'automatic': True} if automatic else {}))
+                                    break
+                            parsed = urlsplit(page.url)
+                            if account_url is None and parsed.path != '/shop/account/home':
+                                needs_login = signin_page(page.url)
+                                if headless and needs_login:
+                                    raise headless_auth_required()
+                                return {'success': False, 'status': 'requires_login' if needs_login else 'failed',
+                                        'requires_login': needs_login,
+                                        'error_code': 'OFFICIAL_SIGNIN_REQUIRED' if needs_login else 'BROWSER_UNEXPECTED_PAGE',
+                                        'browser_started': True, 'browser_connected': True,
+                                        'message': ('官网明确跳转到登录页面，请打开官网窗口完成验证；未自动登录。'
+                                                    if needs_login else '浏览器到达了未识别的官网页面，会话状态尚未确认；未判定登录过期。')}
+                        else:
+                            account_url = open_storefront_login(browser.contexts[0], service, **({'automatic': True} if automatic else {}))
+                        wait_options = {'remote': remote, 'assistant': assistant}
+                        if automatic:
+                            wait_options['automatic'] = True
+                        if account_url is not None:
+                            wait_options['account_url'] = account_url
+                            if getattr(account_url, 'read_only', False):
+                                wait_options['account_read_only'] = True
+                        if headless:
+                            wait_options['headless'] = True
+                        cookies, agent = wait_for_account_page(browser, process, service, timeout, network, **wait_options)
+                if checkout_context is None:
+                    service.stage('正在核对官网登录账号并验证工具会话')
+                    result = import_browser_session(cookies, agent, service.account)
+                else:
+                    service.stage('当前结账认证已恢复，继续原结账会话')
                 (browser_profile_path(service.auth) / '.authx-541').unlink(missing_ok=True)
                 (service.root / 'session-maintenance.json').unlink(missing_ok=True)
                 if maintenance:

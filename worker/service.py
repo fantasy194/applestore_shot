@@ -54,6 +54,7 @@ class Service:
         self.pickup_contact_review_verified = False
         self._parallel_child = False
         self._checkout_auth_active = False
+        self._checkout_browser_recovery_used = False
         self._purchase_session_owner = None
         self._purchase_session_proof = None
         self.settings_dir = (self.root.parent.parent / 'settings'
@@ -146,8 +147,9 @@ class Service:
         """Authorize credentials only for the current official Checkout flow.
 
         Isolated children acquire their parent's account-wide lease and receive
-        credentials through private IPC. They never open a browser/profile or
-        create a replacement checkout to recover authentication.
+        credentials through private IPC. Browser recovery is delegated to that
+        parent's original profile for this exact checkout; children never open
+        profiles or create replacement checkouts to recover authentication.
         """
         if self._checkout_auth_active:
             raise ValueError('结账认证不能嵌套执行。')
@@ -160,6 +162,7 @@ class Service:
                                  and isinstance(credential.get('password'), str) else None)
                 self.remember = False
             self._checkout_auth_active = True
+            self._checkout_browser_recovery_used = False
             try:
                 yield
             except Exception as error:
@@ -185,6 +188,29 @@ class Service:
                 self._checkout_auth_active = False
                 if self._parallel_child:
                     self.password = None
+
+    def recover_checkout_authentication(self, payload):
+        """Recover only this live Checkout, using the original account browser."""
+        from browser_checkout import validate_checkout_recovery_payload, recover_checkout_in_browser
+        self.channel.checkpoint()
+        if not self._checkout_auth_active or self.submitted or self._checkout_browser_recovery_used:
+            raise ValueError('当前结账不允许重复或提交后恢复认证。')
+        self._checkout_browser_recovery_used = True
+        payload = validate_checkout_recovery_payload(payload)
+        if not self._parallel_child:
+            return recover_checkout_in_browser(self, payload)
+        from protocol import (CHECKOUT_BROWSER_REQUEST, CHECKOUT_BROWSER_RESPONSE,
+                              checkout_private_write, checkout_private_read, checkout_private_remove)
+        request, digest = checkout_private_write(self.task_dir, CHECKOUT_BROWSER_REQUEST, payload)
+        try:
+            reply = self.channel.checkout_browser_recovery(digest)
+            result = checkout_private_read(self.task_dir, CHECKOUT_BROWSER_RESPONSE, reply['sha256'])
+            if not isinstance(result.get('account'), str) or result['account'].strip().casefold() != self.account.strip().casefold():
+                raise ValueError('当前结账认证账号不匹配。')
+            return result
+        finally:
+            checkout_private_remove(request, digest)
+            self.channel.emit('checkout_browser_consumed', checkout_auth_lease=self.channel._checkout_auth_lease)
 
     def credentials(self, path):
         self.purchase_auth_interaction = True
