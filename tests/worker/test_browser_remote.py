@@ -25,6 +25,8 @@ class BrowserRemoteTests(unittest.TestCase):
         self.service = Mock(task_dir=Path(self.directory.name),
                             channel=Channel('account-fixture', 'task-fixture', io.StringIO()))
         self.page = Mock(url='https://secure9.www.apple.com.cn/shop/signIn/account')
+        self.page.frames = [self.page.main_frame]
+        self.page.main_frame.evaluate.return_value = True
         self.page.evaluate.return_value = {'width': 500, 'height': 640}
         self.page.is_closed.return_value = False
         self.handlers = {}

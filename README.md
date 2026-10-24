@@ -6,6 +6,8 @@ iPhone DUO launch assistant and Apple Store quick checkout tool for macOS, Windo
 
 本仓库基于 [Jasper-zzq/iPhoneDuo](https://github.com/Jasper-zzq/iPhoneDuo) 的本地修改版本，包含结算提速、失败状态核对恢复及订单取消。按本次所选商品和数量自动结算，无独立商品授权白名单、固定数量或金额上限；不附加 AppleCare+。地址按账号独立保存，价格、库存和实际限购数量以官网返回为准。旧 `automation.json` 不再作为下单条件。
 
+**0.1.14 登录恢复：**修复常驻浏览器第二次操作时后台任务页未激活、正常页面更新和输入前字段重建导致的输入中断；同步 HTTP 与常驻浏览器的商城会话，保留较新的浏览器状态和 Cookie 属性。下单继续优先复用登录态，明确需要认证时才恢复。诊断与验证范围见 [登录态同步与输入恢复](docs/LOGIN-STATE-INPUT-RECOVERY.md)。
+
 **0.1.13 快速自提架构：**Docker 按账号常驻 Chrome；空闲自提准备保留原 worker、Session 和 Checkout，手动、定时与监控通过同一入口接手。预选门店分别入队并归属同一次购买目标，成功后停止同组剩余任务。自提统一选择上海时间今天起 7 个自然日内的最早有效时段，包括明天及后续日期。准备命中不代表已下单，三秒是待现场验证的性能目标。参见 [整体架构与验收](docs/FAST-PICKUP-ARCHITECTURE.md) 和 [准备交接协议](docs/PREPARED-HANDOFF.md)。
 
 ## 主要功能

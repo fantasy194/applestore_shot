@@ -245,6 +245,9 @@ def save_auth(session, *, auth_path=None):
                      "with_expiry" if c.expires is not None else "expiry_unknown")
             data["cookies"][group].append({"name": c.name, "value": c.value, "domain": c.domain,
                                           "path": c.path, "secure": c.secure, "expires": c.expires,
+                                          **({"httpOnly": True} if c.has_nonstandard_attr("HttpOnly") else {}),
+                                          **({"sameSite": c.get_nonstandard_attr("SameSite")}
+                                             if c.get_nonstandard_attr("SameSite") in ("Strict", "Lax", "None") else {}),
                                           **expiry_details(c.expires, now),
                                           **({"expires_after": c.get_nonstandard_attr(
                                               "expires_after", "未知（缺少下发记录）")}
@@ -273,7 +276,9 @@ def load_auth(session, data):
             0, c["name"], c["value"], None, False, domain, domain.startswith("."),
             domain.startswith("."), c.get("path", "/"), True, c.get("secure", True),
             expires, expires is None, None, None,
-            {"expires_after": c["expires_after"]} if "expires_after" in c else {}, False))
+            {**({"expires_after": c["expires_after"]} if "expires_after" in c else {}),
+             **({"HttpOnly": None} if c.get("httpOnly") is True else {}),
+             **({"SameSite": c["sameSite"]} if c.get("sameSite") in ("Strict", "Lax", "None") else {})}, False))
     remove_imported_cookie_duplicates(session)
 
 

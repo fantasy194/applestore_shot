@@ -36,6 +36,8 @@ class Field:
         return True
 
     def evaluate(self, script, original=None):
+        if 'hasFocus()' in script and not self.frame.page.document_focus:
+            return False
         if 'Boolean(element.value)' in script:
             return bool(self.value)
         if original is not None:
@@ -81,6 +83,14 @@ class Frame:
         self.fields, self.body, self.alerts = [], '', []
         self.detached = False
         self.visible = True
+        self.document = object()
+
+    def evaluate_handle(self, _expression):
+        original = self.document
+        return SimpleNamespace(evaluate=lambda _expression: self.document is original, dispose=lambda: None)
+
+    def evaluate(self, _expression):
+        return self.page.document_focus
 
     def frame_element(self):
         return SimpleNamespace(is_visible=lambda:self.visible, dispose=lambda:None)
@@ -128,9 +138,13 @@ class Page:
         self.frames = [self.main_frame, self.auth]
         self.listeners, self.events = {}, []
         self.closed = False
+        self.document_focus = True
         self.after_type = None
         self.wait_for_timeout = lambda milliseconds: None
         self.keyboard = SimpleNamespace(type=self.type, press=self.press)
+
+    def bring_to_front(self):
+        self.document_focus = True
 
     def is_closed(self):
         return self.closed
@@ -142,6 +156,8 @@ class Page:
         self.listeners[event].remove(callback)
 
     def emit(self, event, *args):
+        if event == 'framenavigated' and args:
+            args[0].document = object()
         for callback in self.listeners.get(event, [])[:]:
             callback(*args)
 
@@ -158,6 +174,49 @@ class Page:
 
 
 class BrowserInputTests(unittest.TestCase):
+    def test_inactive_task_is_activated_only_before_input(self):
+        page=Page()
+        page.document_focus=False
+        field=Field(page.auth,'password')
+        replace_field(page,page.auth,field,'synthetic',lambda:None)
+        self.assertTrue(page.document_focus)
+        self.assertEqual(field.value,'synthetic')
+
+    def test_document_focus_loss_stops_even_when_active_element_is_unchanged(self):
+        page=Page()
+        field=Field(page.auth,'password')
+        page.after_type=lambda:setattr(page,'document_focus',False)
+        with self.assertRaises(BrowserInputInterrupted) as error:
+            replace_field(page,page.auth,field,'synthetic',lambda:None)
+        self.assertEqual(error.exception.reason,'focus_changed')
+        self.assertEqual(field.value,'s')
+        self.assertFalse(page.document_focus)
+
+    def test_general_keyboard_does_not_reactivate_after_task_tab_loses_focus(self):
+        page=Page()
+        field=Field(page.auth,'otp')
+        page.focus=field
+        page.after_type=lambda:setattr(page,'document_focus',False)
+        with self.assertRaises(BrowserInputInterrupted) as error:
+            type_keyboard_text(page,'012345')
+        self.assertEqual(field.value,'0')
+        self.assertEqual(error.exception.reason,'focus_changed')
+        self.assertFalse(page.document_focus)
+    def test_same_document_navigation_preserves_guard_and_original_field(self):
+        page=Page()
+        field=Field(page.auth,'password')
+        def same_document():
+            page.auth.url='https://idmsa.apple.com.cn/appleauth/auth/authorize#fixture'
+            for callback in list(page.listeners.get('framenavigated',[])):
+                callback(page.auth)
+        page.after_type=same_document
+        replace_field(page,page.auth,field,'synthetic',lambda:None)
+        self.assertEqual(field.value,'synthetic')
+
+    def test_interruption_diagnostics_are_allowlisted(self):
+        error=BrowserInputInterrupted('not logged',reason='private-untrusted-value',phase='private-untrusted-phase')
+        self.assertEqual((error.reason,error.phase),('cdp_error','input'))
+
     def test_controls_and_surrogates_rejected_before_browser_event(self):
         for text in ('a\nb', '\x00', '\x7f', '\x85', '\ud800', ''):
             with self.subTest(text=repr(text)), self.assertRaises(BrowserInputInterrupted):
@@ -233,6 +292,33 @@ class BrowserInputTests(unittest.TestCase):
 
 
 class BrowserSigninTests(unittest.TestCase):
+    def test_readonly_body_navigation_waits_without_input_or_credential_access(self):
+        from playwright.sync_api import Error as BrowserError
+        self.form(account=self.service.account,password=True)
+        original=self.page.auth.locator
+        def locator(selector):
+            result=original(selector)
+            if selector=='body':
+                result.inner_text=Mock(side_effect=BrowserError('Execution context was destroyed'))
+            return result
+        self.page.auth.locator=locator
+        self.assertEqual(self.assistant.step(self.page,self.network),'unrecognized')
+        self.assertFalse(self.assistant.interrupted)
+        self.assertEqual(self.page.events,[])
+        self.service.browser_password.assert_not_called()
+
+    def test_actual_focus_change_reports_safe_phase_and_reason(self):
+        self.form(account=self.service.account,password=True)
+        self.page.after_type=lambda:setattr(self.page,'focus',None)
+        with self.assertRaises(BrowserSessionError) as failure:
+            self.assistant.step(self.page,self.network)
+        self.assertEqual((failure.exception.reason,failure.exception.phase),('focus_changed','type'))
+        stage=self.service.stage.call_args
+        self.assertIn('输入焦点已切换',stage.args[0])
+        self.assertEqual(stage.kwargs['browser_input_phase'],'type')
+        self.assertEqual(stage.kwargs['browser_input_reason'],'focus_changed')
+        self.assertNotIn('private-fixture',str(stage))
+
     def setUp(self):
         self.page = Page()
         self.service = SimpleNamespace(account='owner@example.test', channel=SimpleNamespace(checkpoint=Mock()),

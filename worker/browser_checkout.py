@@ -257,7 +257,10 @@ class BrowserCheckoutRecovery:
                     cookies = [row for row in self.context.cookies() if row['domain'].lstrip('.') == 'apple.com.cn'
                                or row['domain'].lstrip('.').endswith('.apple.com.cn')]
                     agent = self.page.evaluate('navigator.userAgent')
+                    exported = cookies
                     cookies = _verify_account(cookies, agent, self.service.account, auth_path=self.service.auth)
+                    from browser_session_sync import sync_browser_session
+                    sync_browser_session(self.context, self.service, verified_export=exported)
                     return {'account': self.service.account, 'url': reply.url,
                             'init_data': copy.deepcopy(model), 'cookies': cookies, 'user_agent': agent}
             self.page.wait_for_timeout(200)

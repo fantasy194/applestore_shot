@@ -305,6 +305,9 @@ class AppleStoreLogin:
                 from browser_remote import remote_context
                 context = browser.contexts[0]
                 page = context.new_page()
+                if interaction.handler is not None:
+                    from browser_session_sync import sync_browser_session
+                    sync_browser_session(context, interaction.handler)
                 with (nullcontext(None) if headless else remote_context(interaction.handler, port, page=page)) as remote:
                     try:
                         context = browser.contexts[0]

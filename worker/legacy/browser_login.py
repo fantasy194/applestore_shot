@@ -557,39 +557,9 @@ def import_browser_session(cookies, user_agent, expected_account):
 
 
 def seed_missing_session(context, service):
-    """Carry valid HTTP login cookies into the same account's existing browser.
-    Browser fingerprint and trust cookies remain authoritative and untouched."""
-    try:
-        saved = json.loads(service.auth.read_text(encoding='utf-8'))
-    except (ValueError, OSError):
-        return
-    if str(saved.get('account', '')).casefold() != service.account.casefold():
-        return
-    present = {(c['name'], c['domain'].lstrip('.'), c.get('path', '/')) for c in context.cookies()}
-    selected = []
-    for rows in saved.get('cookies', {}).values():
-        if not isinstance(rows, list):
-            continue
-        for cookie in rows:
-            if not isinstance(cookie, dict):
-                continue
-            name, domain = cookie.get('name'), cookie.get('domain', '')
-            if (name not in ('as_ltn_cn', 'as_cn', 'as_disa', 'as_rec', 'myacinfo', 'acn01')
-                    or not isinstance(domain, str) or (domain.lstrip('.') != 'apple.com.cn'
-                        and not domain.lstrip('.').endswith('.apple.com.cn'))
-                    or not isinstance(cookie.get('value'), str)):
-                continue
-            key = (name, domain.lstrip('.'), cookie.get('path', '/'))
-            expiry = cookie.get('expires')
-            if key in present or expiry is not None and (type(expiry) not in (int, float) or expiry <= time.time()):
-                continue
-            entry = {'name': name, 'value': cookie['value'], 'domain': domain,
-                     'path': cookie.get('path', '/'), 'secure': cookie.get('secure', True)}
-            if expiry is not None:
-                entry['expires'] = expiry
-            selected.append(entry)
-    if selected:
-        context.add_cookies(selected)
+    """Compatibility entrypoint for the shared account-scoped session bridge."""
+    from browser_session_sync import sync_browser_session
+    return sync_browser_session(context, service)
 
 
 def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, storefront=False, automatic=False, checkout_context=None):
@@ -654,6 +624,8 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                 if not browser.contexts:
                     raise BrowserSessionError('BROWSER_CONTEXT_MISSING', '已连接浏览器但没有可用页面；会话状态尚未检查。',
                                               browser_started=True, browser_connected=True)
+                from browser_session_sync import sync_browser_session
+                sync_browser_session(browser.contexts[0], service)
                 task_page = browser.contexts[0].new_page()
                 network = observe_login_network(browser.contexts[0], service, page=task_page)
                 assistant = BrowserSigninAssistant(service, headless=headless, automatic=automatic)
@@ -667,7 +639,6 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                     else:
                         account_url = None
                         if (maintenance or headless) and not recover and not storefront:
-                            seed_missing_session(browser.contexts[0], service)
                             context = browser.contexts[0]
                             page = task_page
                             # Refresh the browser's real storefront context even when
@@ -719,6 +690,7 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, 
                 if checkout_context is None:
                     service.stage('正在核对官网登录账号并验证工具会话')
                     result = import_browser_session(cookies, agent, service.account)
+                    sync_browser_session(browser.contexts[0], service, verified_export=cookies)
                 else:
                     service.stage('当前结账认证已恢复，继续原结账会话')
                 (browser_profile_path(service.auth) / '.authx-541').unlink(missing_ok=True)

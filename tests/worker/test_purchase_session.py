@@ -112,6 +112,26 @@ class PurchaseSessionTests(unittest.TestCase):
         self.service._purchase_session_proof=original
         self.assertTrue(session_ready(self.service,now_ms=stamp))
 
+    def test_explicit_signin_persists_official_cookie_deletion_before_browser_recovery(self):
+        def signed_out(session, **options):
+            session.cookies.clear('.apple.com.cn', '/', 'as_ltn_cn')
+            session.cookies.set('as_rec', 'current-response', domain='.apple.com.cn', path='/')
+            return {'success':True,'logged_in':False,'reauthentication_required':True}
+        self.account_read.side_effect = signed_out
+        original = self.browser.side_effect
+        def restore(owner, **options):
+            self.assertTrue(owner._http_session_rejected)
+            saved = json.loads(owner.auth.read_text(encoding='utf-8'))
+            rows = [row for group in saved['cookies'].values() for row in group]
+            self.assertFalse(any(row['name'] == 'as_ltn_cn' for row in rows))
+            self.assertTrue(any(row['name'] == 'as_rec' and row['value'] == 'current-response' for row in rows))
+            self.assertTrue(any(row['name'] == 'shld_bt_ck' for row in rows))
+            return original(owner, **options)
+        self.browser.side_effect = restore
+        ensure_purchase_session(self.service)
+        self.browser.assert_called_once()
+        self.assertFalse(self.service._http_session_rejected)
+
     def test_previous_action_and_background_maintenance_never_skip_new_purchase_refresh(self):
         record_action_session(self.service)
         with patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed'}):

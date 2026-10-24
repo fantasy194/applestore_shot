@@ -62,7 +62,18 @@ def _read_or_restore(service):
             return {**result,'status':'healthy'}
         if (isinstance(result,dict) and result.get('success') is True
                 and result.get('logged_in') is False and result.get('reauthentication_required') is True):
-            return _restore_browser(service)
+            # The official redirect may have rotated or deleted merchant keys.
+            # Recovery must consume this response state, not revive the export
+            # that existed before the account check. Browser-only trust remains.
+            duo_killer.save_auth(session)
+            previous = getattr(service, '_http_session_rejected', False)
+            service._http_session_rejected = True
+            try:
+                # Even without Set-Cookie deletion, this HTTP snapshot was
+                # rejected. Let the original browser assess its own session.
+                return _restore_browser(service)
+            finally:
+                service._http_session_rejected = previous
     raise BrowserSessionError('PURCHASE_SESSION_UNVERIFIED',
         '官网当前会话暂时无法核验，已保留登录状态；未重新登录或开始购买。',
         status='failed',requires_login=False)
