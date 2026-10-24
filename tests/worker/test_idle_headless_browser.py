@@ -64,7 +64,7 @@ class IdleHeadlessBrowserPolicyTests(unittest.TestCase):
         self.assertTrue(browser_login.trust_browser_if_offered(page))
         button.click.assert_called_once()
         self.assertEqual(button.click.call_args.kwargs['timeout'], 1000)
-        self.assertTrue(100 <= button.click.call_args.kwargs['delay'] <= 200)
+        self.assertEqual(button.click.call_args.kwargs.get('delay', 0), 0)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,5 @@
 """Keyboard events with bounded lifetime; never expose supplied text in errors."""
 from contextlib import contextmanager
-import random
 import time
 
 
@@ -15,13 +14,9 @@ class BrowserInputInterrupted(ValueError):
         self.phase = phase if phase in self.PHASES else 'input'
 
 
-def interaction_delay():
-    return random.SystemRandom().randint(100, 200)
-
-
 def click_control(locator, *, timeout=1500):
-    """Normal mouse events with the same bounded timing as credential typing."""
-    locator.click(timeout=timeout, delay=interaction_delay())
+    """Normal mouse events without an artificial interaction delay."""
+    locator.click(timeout=timeout)
 
 
 def validate_keyboard_text(text):
@@ -102,7 +97,7 @@ def type_keyboard_text(page, text, checkpoint=lambda: None, *, deadline=None):
                 check()
                 if page.main_frame.evaluate('document.hasFocus()') is not True:
                     raise BrowserInputInterrupted('输入窗口焦点已变化，已停止输入。', reason='focus_changed', phase='type')
-                page.keyboard.type(char, delay=interaction_delay())
+                page.keyboard.type(char)
                 check()
                 if page.main_frame.evaluate('document.hasFocus()') is not True:
                     raise BrowserInputInterrupted('输入窗口焦点已变化，已停止输入。', reason='focus_changed', phase='type')
@@ -150,10 +145,10 @@ def replace_field(page, frame, locator, text, checkpoint, *, deadline=None, rebi
 
             require_focus('focus')
             phase = 'clear'
-            page.keyboard.press('ControlOrMeta+A', delay=interaction_delay())
+            page.keyboard.press('ControlOrMeta+A')
             check()
             require_focus('clear')
-            page.keyboard.press('Backspace', delay=interaction_delay())
+            page.keyboard.press('Backspace')
             prefix = ''
             phase = 'type'
             for char in text:
@@ -161,7 +156,7 @@ def replace_field(page, frame, locator, text, checkpoint, *, deadline=None, rebi
                 require_focus('type')
                 if locator.input_value(timeout=500) != prefix:
                     raise BrowserInputInterrupted('登录输入内容已变化，已停止剩余输入。', reason='value_changed', phase='type')
-                page.keyboard.type(char, delay=interaction_delay())
+                page.keyboard.type(char)
                 prefix += char
                 check()
                 require_focus('type')

@@ -99,7 +99,7 @@ def main():
                     assert page.locator('#field').input_value() == 'stream fixture'
                     assert retained_tab.locator('#field').input_value() == ''
                     report['passes'].append('bound_page_input_leaves_old_tab_untouched')
-                    # Typing is deliberately 100-200ms per character. The input
+                    # Input and focus validation can span multiple event pumps. The input
                     # owner must continue to serve independent live heartbeats
                     # throughout a command longer than the UI's five-second gate.
                     current = request()['frame']

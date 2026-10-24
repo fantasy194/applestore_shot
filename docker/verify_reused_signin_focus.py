@@ -268,7 +268,7 @@ def main():
     print(json.dumps({'scope': 'synthetic intercepted official routes; no Apple traffic or real accounts',
         'source_label': os.environ.get('DUO_SIGNIN_SOURCE_LABEL', 'workspace'), 'headful': True,
         'source_sha256': source_hashes,
-        'keyboard_delay_ms': [100, 200], 'secret_characters_recorded': False,
+        'artificial_delay_ms': 0, 'secret_characters_recorded': False,
         'stable_focus_cases_passed': stable, 'rerender_control_covered': bool(controls),
         'rerender_interruption_zero_submissions': interrupted,
         'old_tabs_received_no_characters': old_tabs_untouched, 'cases': cases}, ensure_ascii=False), flush=True)

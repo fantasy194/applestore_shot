@@ -512,9 +512,8 @@ class BrowserRemote:
                 if kind == 'click':
                     if not 0 <= payload['x'] < frame['width'] or not 0 <= payload['y'] < frame['height']:
                         continue
-                    from browser_input import interaction_delay
                     command['started'] = True
-                    page.mouse.click(payload['x'], payload['y'], delay=interaction_delay())
+                    page.mouse.click(payload['x'], payload['y'])
                 elif kind == 'text':
                     from browser_input import type_keyboard_text
                     generation = self.document_id
@@ -533,9 +532,8 @@ class BrowserRemote:
                     command['started'] = True
                     self.signin_request.set()
                 elif kind == 'key':
-                    from browser_input import interaction_delay
                     command['started'] = True
-                    page.keyboard.press('ControlOrMeta+A' if payload['key'] == 'Control+A' else payload['key'], delay=interaction_delay())
+                    page.keyboard.press('ControlOrMeta+A' if payload['key'] == 'Control+A' else payload['key'])
                 elif kind == 'scroll':
                     command['started'] = True
                     page.mouse.wheel(payload.get('delta_x', 0), payload.get('delta_y', 0))

@@ -144,6 +144,6 @@ docker compose start --wait
 
 离线浏览器验收可在 PowerShell 执行 `Get-Content -Raw docker/verify_browser.py | docker compose exec -T app python -`（Linux shell 可用 `docker compose exec -T app python - < docker/verify_browser.py`）；它仅打开临时 fixture 页面，检查真实 jlesage GUI Chromium、非 root worker、沙箱、私有 Unix CDP、预览和空格输入、同时运行的资料隔离、普通浏览器及 Cookie 进程重启保存，不访问 Apple。`verify_cdp_startup.py` 另覆盖慢 WebSocket 连接和恢复标签页；`verify_persistent_browser.py` 覆盖同账号跨任务复用同一进程 / 页面 JS / Cookie、独占租约、取消后保留、迟到 token 拒绝及显式关闭保留资料。Actions 会独立重建 browser 和 app 后再次运行验收，检查两种更新顺序。HTTP 入口可用 `python docker/verify_web.py` 检查。
 
-0.1.14 起，Actions 还执行 `verify_reused_signin_focus.py`：在同一常驻 profile 的两次独立租约中，分别以前台旧标签页、认证 iframe 和额外窗口验证本次输入页激活，并保留输入中字段被替换的拒绝路径。脚本仅在独立合成 profile 中拦截所有官网形状的请求，不访问 Apple；设置 `DUO_ASSERT_SIGNIN_FOCUS=1` 启用验收断言。
+0.1.15 起，Actions 还执行 `verify_reused_signin_focus.py`：在同一常驻 profile 的两次独立租约中，分别以前台旧标签页、认证 iframe 和额外窗口验证本次输入页激活，并保留输入中字段被替换的拒绝路径。脚本仅在独立合成 profile 中拦截所有官网形状的请求，不访问 Apple；设置 `DUO_ASSERT_SIGNIN_FOCUS=1` 启用验收断言。
 
 此前 amd64 本机部署的检查结果见 [本地 Docker 验收记录](VERIFICATION.md)。该记录不代表 ARM64 或后续镜像已经通过同样检查；新镜像的各架构构建与离线检查以对应 GitHub Actions 运行日志为准，均不证明真实 Apple 登录、库存或下单可用。

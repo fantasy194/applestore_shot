@@ -25,7 +25,7 @@ import browser_input
 import browser_login
 from service import Service
 from platform_support import find_browser
-from playwright.sync_api import Page, sync_playwright as actual_playwright
+from playwright.sync_api import Keyboard, Locator, Page, sync_playwright as actual_playwright
 
 HOME = 'https://www.apple.com.cn/'
 ENTRY = 'https://secure8.www.apple.com.cn/shop/signIn?ssi=synthetic-current-menu'
@@ -172,7 +172,6 @@ class Fixture:
     @contextmanager
     def instrument(self):
         popen = subprocess.Popen
-        real_randint = browser_input.random.SystemRandom.randint
         real_goto = Page.goto
 
         def navigate(page, url, *args, **kwargs):
@@ -184,11 +183,13 @@ class Fixture:
                 return real_goto(page, ENTRY, *args, **kwargs)
             return reply
 
-        def delay(rng, low, high):
-            require((low, high) == (100, 200), 'Configured interaction delay left its allowed range')
-            value = real_randint(rng, low, high)
-            self.delays.append(value)
-            return value
+        def immediate(original):
+            def event(owner, *args, **kwargs):
+                delay = kwargs.get('delay', 0)
+                require(delay in (None, 0), 'Artificial mouse/keyboard delay reintroduced')
+                self.delays.append(delay or 0)
+                return original(owner, *args, **kwargs)
+            return event
 
         def launch(args, *positional, **kwargs):
             if str(args[0]) != self.executable:
@@ -197,8 +198,8 @@ class Fixture:
             require('--user-data-dir=' + str(self.profile) in args, 'Profile is not isolated')
             require('--no-sandbox' not in args, 'Browser sandbox was disabled')
             require(not any(str(a).startswith(('http://', 'https://')) for a in args), 'Browser navigated before routing')
-            if self.mode != 'manual':
-                require('--headless=new' in args, 'Production maintenance did not select headless')
+            require(not any(str(arg).startswith('--headless') for arg in args),
+                    'Production browser renderer must use the shared normal Chrome mode')
             protected = [*args, '--no-proxy-server', '--disable-background-networking',
                 '--disable-component-update', '--disable-sync', '--disable-domain-reliability',
                 '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost']
@@ -227,7 +228,9 @@ class Fixture:
         with patch('subprocess.Popen', side_effect=launch), \
                 patch.object(Page, 'goto', navigate), \
                 patch('playwright.sync_api.sync_playwright', playwright), \
-                patch.object(browser_input.random.SystemRandom, 'randint', delay), \
+                patch.object(Keyboard, 'type', immediate(Keyboard.type)), \
+                patch.object(Keyboard, 'press', immediate(Keyboard.press)), \
+                patch.object(Locator, 'click', immediate(Locator.click)), \
                 patch('requests.Session.request', side_effect=AssertionError('Python HTTP forbidden')), \
                 patch('requests.utils.get_environ_proxies', return_value={}), \
                 patch('browser_remote.remote_context', return_value=nullcontext(None)), \
@@ -257,7 +260,7 @@ class Fixture:
                 for field in ('account', 'password'):
                     types = {e['type'] for e in self.events if e['field'] == field and e['trusted']}
                     require({'keydown', 'input', 'keyup', 'click'} <= types, 'Trusted mouse/keyboard events missing')
-                require(len(self.delays) >= len(OWNER) + len(SECRET) + 4, 'Mouse/keyboard interaction delays missing')
+                require(self.delays and all(value == 0 for value in self.delays), 'Unexpected interaction pacing')
             else:
                 require(error is not None and not self.imports and self.submits['authx'] == 0,
                         'Incomplete authentication imported a session')
@@ -272,17 +275,21 @@ class Fixture:
                     require(error.code == 'BROWSER_LOGIN_ACCOUNT_MISMATCH', 'Mismatched account was not rejected')
                     require(not self.delays and self.submits['password'] == 0, 'Password entered for another identity')
                 else:
-                    require(error.code == 'BROWSER_LOGIN_INPUT_INTERRUPTED', 'Navigation did not interrupt typing')
+                    # Without artificial pacing the account binding check can
+                    # observe the replacement document before its navigation
+                    # event is dispatched. Both guards must stop all input.
+                    require(error.code in ('BROWSER_LOGIN_INPUT_INTERRUPTED', 'BROWSER_LOGIN_ACCOUNT_MISMATCH'),
+                            f'{self.mode}: navigation did not interrupt typing ({error.code})')
                     require(self.submits['password'] == 0, 'Interrupted password submitted')
                     # Chrome may deliver the already-held first key's release
                     # after navigation; no new key press or text may follow.
                     require(not any(e['afterInterrupt'] and e['type'] in ('keydown', 'input') for e in self.events),
                             'Remaining credentials were sent to the replacement document')
             return {'scenario': self.mode, 'actual_chrome_cdp': True, 'production_login_branch': True,
-                'automatic_headless': self.mode != 'manual', 'fixture_forced_headless': self.mode == 'manual',
+                'production_normal_renderer_before_instrumentation': True, 'fixture_forced_headless': True,
                 'submissions': self.submits, 'import_count': len(self.imports),
                 'trusted_event_count': sum(e['trusted'] for e in self.events),
-                'keyboard_delay_count': len(self.delays),
+                'interaction_event_count': len(self.delays),
                 'delay_bounds_ms': [min(self.delays), max(self.delays)] if self.delays else None,
                 'error_code': getattr(error, 'code', None), 'profile_and_auth_preserved': True,
                 'browser_closed': True, 'unexpected_request_count': 0,

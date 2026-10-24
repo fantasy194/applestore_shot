@@ -7,7 +7,7 @@ import re
 import time
 from urllib.parse import urlsplit
 
-from browser_input import BrowserInputInterrupted, _navigation_guard, click_control, replace_field, validate_keyboard_text, interaction_delay
+from browser_input import BrowserInputInterrupted, _navigation_guard, click_control, replace_field, validate_keyboard_text
 
 
 ACCOUNT_NAMES = re.compile(r'^(?:Apple (?:ID|账户|账号|Account)|电子邮件(?:或电话号码)?|电子邮件地址|邮箱|账号|账户|Email(?: or phone number)?|Account name)$', re.I)
@@ -254,7 +254,7 @@ class BrowserSigninAssistant:
                     if (fields[0].evaluate(focused, handles[0]) is not True
                             or fields[0].input_value(timeout=500) != code[:5]):
                         raise BrowserInputInterrupted('官网验证码输入已变化，已停止输入。')
-                    page.keyboard.type(code[-1], delay=interaction_delay())
+                    page.keyboard.type(code[-1])
                 else:
                     # Apple advances focus within six one-character inputs.
                     # Revalidate each original element before its normal event.
@@ -273,7 +273,7 @@ class BrowserSigninAssistant:
                         check()
                         if field.evaluate(focused, original) is not True:
                             raise BrowserInputInterrupted('官网验证码输入焦点已变化，已停止输入。')
-                        page.keyboard.type(digit, delay=interaction_delay())
+                        page.keyboard.type(digit)
                 # Apple submits the final digit itself, sometimes after a
                 # delayed callback. Never add click/Enter: an enabled button or
                 # a quiet network interval cannot prove no submit is pending.

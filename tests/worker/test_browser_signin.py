@@ -161,7 +161,7 @@ class Page:
         for callback in self.listeners.get(event, [])[:]:
             callback(*args)
 
-    def type(self, char, *, delay):
+    def type(self, char, *, delay=0):
         self.events.append((char, delay))
         if self.focus:
             self.focus.value += char
@@ -222,14 +222,14 @@ class BrowserInputTests(unittest.TestCase):
             with self.subTest(text=repr(text)), self.assertRaises(BrowserInputInterrupted):
                 validate_keyboard_text(text)
 
-    def test_replacement_uses_click_and_individual_bounded_keyboard_events(self):
+    def test_replacement_uses_guarded_keyboard_events_without_added_delay(self):
         page = Page()
         field = Field(page.auth, 'password', 'old')
         replace_field(page, page.auth, field, 'secret-fixture', lambda: None)
         self.assertEqual(field.value, 'secret-fixture')
         self.assertEqual(field.clicks, 1)
         self.assertEqual(''.join(char for char, _ in page.events), field.value)
-        self.assertTrue(all(100 <= delay <= 200 for _, delay in page.events))
+        self.assertTrue(all(delay == 0 for _, delay in page.events))
         self.assertTrue(all(not callbacks for callbacks in page.listeners.values()))
 
     def test_same_url_reload_interrupts_after_first_character(self):

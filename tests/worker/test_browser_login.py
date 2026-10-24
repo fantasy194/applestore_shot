@@ -106,7 +106,7 @@ class BrowserLoginTests(unittest.TestCase):
         self.assertTrue(browser_login.trust_browser_if_offered(page))
         frame.get_by_role.return_value.click.assert_called_once()
         self.assertEqual(frame.get_by_role.return_value.click.call_args.kwargs["timeout"], 1000)
-        self.assertTrue(100 <= frame.get_by_role.return_value.click.call_args.kwargs["delay"] <= 200)
+        self.assertEqual(frame.get_by_role.return_value.click.call_args.kwargs.get("delay", 0), 0)
 
     def test_headless_signin_requires_manual_recovery_without_hidden_wait(self):
         page = Mock(url='https://secure9.www.apple.com.cn/shop/signIn/account', frames=[])
@@ -188,7 +188,7 @@ class BrowserLoginTests(unittest.TestCase):
         self.assertTrue(browser_login.trust_browser_if_offered(page))
         button.click.assert_called_once()
         self.assertEqual(button.click.call_args.kwargs["timeout"], 1000)
-        self.assertTrue(100 <= button.click.call_args.kwargs["delay"] <= 200)
+        self.assertEqual(button.click.call_args.kwargs.get("delay", 0), 0)
         frame.url = 'https://apple.com.cn.example.test/login'
         button.click.reset_mock()
         self.assertFalse(browser_login.trust_browser_if_offered(page))
