@@ -12,8 +12,17 @@ services:
   watchtower:
     image: ghcr.io/nicholas-fedor/watchtower:latest
     restart: unless-stopped
+    environment:
+      DOCKER_CONFIG: /docker-config
+      WATCHTOWER_LOG_LEVEL: ${WATCHTOWER_LOG_LEVEL:-info}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${DUO_REGISTRY_CONFIG_DIR:-${DOCKER_CONFIG:-${HOME}/.docker}}
+        target: /docker-config
+        read_only: true
+        bind:
+          create_host_path: false
     command: ['--interval=300', '--label-enable', '--scope=applestore-shot', '--stop-timeout=45s', '--cleanup']
     labels:
       com.centurylinklabs.watchtower.scope: applestore-shot

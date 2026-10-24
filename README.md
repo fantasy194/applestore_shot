@@ -80,6 +80,8 @@ pnpm dev:web
 
 **树莓派快捷部署与自动更新：**下载并执行 [`scripts/install-docker.sh`](scripts/install-docker.sh)。脚本显示六个部署阶段、下载进度及每五秒的等待提示；配置下载、镜像拉取和服务启动分别设置超时，失败会标明阶段和退出码。首次配置 Watchtower 每五分钟检查应用与浏览器新版。重新运行会备份并升级未修改的官方 Compose 配置，保留自定义配置、已有项目及 `/data` 数据卷；自定义部署按 Docker 文档合并浏览器服务后再更新。已安装 Docker Compose 的 64 位树莓派可执行 `bash scripts/install-docker.sh`；自定义目录使用 `DUO_INSTALL_DIR`。安装器的离线回归覆盖旧配置升级、自定义配置保留、下载中断及拉取 / 启动失败。
 
+**自动更新诊断（0.1.5）：**安装器识别已发布的官方 Compose 配置并安全迁移；Watchtower 可只读使用宿主的注册表配置目录，支持配置日志级别以查明检查跳过的原因。`skipped` 不代表已是最新版，需核对容器提交、健康状态及网页版本；旧单容器部署仍须先合并浏览器服务。目录选择、临时诊断及保留数据更新步骤见 [Docker 自动更新说明](docker/README.md)。
+
 **浏览器上下文连接：**添加账号、官网登录恢复和预览共用有界的分阶段 CDP 连接，等待端口就绪后再完整连接，避免树莓派慢启动被旧的 1 秒超时误判为配置占用。连接失败会区分原因并保留账号资料；双架构镜像新增真实浏览器的慢握手、预览输入和资料重启回归。说明见 [浏览器连接诊断与验证](docs/BROWSER-CDP-STARTUP.md)。
 
 **Docker 局域网访问：**可配置 `DUO_WEB_BIND=0.0.0.0`，使用原 Web 密码登录。由网络或反向代理控制入口时，设置 `DUO_WEB_TRUST_NETWORK=1` 可关闭 Host/Origin 校验，允许任意访问域名；也可保留默认检查并使用精确的 `DUO_WEB_ALLOWED_ORIGINS`。Docker 默认停用 Quick Tunnel；配置示例及主机目录持久化说明见 [树莓派局域网访问](docker/README.md#树莓派局域网访问)。

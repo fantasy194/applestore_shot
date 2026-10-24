@@ -23,11 +23,25 @@ class InstallerTests(unittest.TestCase):
         self.calls = self.root / 'docker-calls.jsonl'
         self.env = dict(os.environ, DUO_INSTALL_DIR=str(self.deploy),
                         PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
+                        HOME=str(self.root / 'fixture-home'),
                         MOCK_ROOT=str(ROOT), MOCK_CALLS=str(self.calls))
+        self.env.pop('DOCKER_CONFIG', None)
+        self.env.pop('DUO_REGISTRY_CONFIG_DIR', None)
         self.executable('docker', '''#!/usr/bin/env python3
 import json, os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
+effective = {}
+env_file = Path('.env')
+if env_file.is_file():
+    for line in env_file.read_text().splitlines():
+        if '=' in line and not line.startswith('#'):
+            key, value = line.split('=', 1)
+            effective[key] = value
+effective.update(os.environ)
+registry = (effective.get('DUO_REGISTRY_CONFIG_DIR') or effective.get('DOCKER_CONFIG')
+            or str(Path(effective['HOME']) / '.docker'))
+Path(os.environ['MOCK_CALLS'] + '.registry').write_text(registry)
 with open(os.environ['MOCK_CALLS'], 'a') as stream:
     stream.write(json.dumps(args) + '\\n')
 if 'pull' in args:
@@ -38,6 +52,12 @@ if 'pull' in args:
 if 'config' in args and os.environ.get('MOCK_CONFIG_FAILURE'):
     print('fixture invalid compose', file=sys.stderr)
     sys.exit(15)
+if 'config' in args and '--environment' in args:
+    for key in ['DUO_REGISTRY_CONFIG_DIR', 'DOCKER_CONFIG', 'HOME']:
+        print(key + '=' + effective.get(key, ''))
+    print('UNRELATED_SECRET=synthetic-environment-secret')
+if 'up' in args:
+    assert Path(registry).is_dir(), 'registry directory was not prepared'
 if 'up' in args and os.environ.get('MOCK_UP_FAILURE'):
     print('fixture application not healthy', file=sys.stderr)
     sys.exit(17)
@@ -113,6 +133,70 @@ print('fixture download 100%', file=sys.stderr)
         for relative, text in files.items():
             self.assertEqual((self.deploy / relative).read_text(), text)
         self.assertIn('保留已有自定义配置', result.stdout)
+
+    def test_registry_directory_is_optional_empty_and_created_for_anonymous_pulls(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        directory = self.root / 'fixture-home' / '.docker'
+        self.assertTrue(directory.is_dir())
+        self.assertFalse((directory / 'config.json').exists())
+        self.assertEqual(Path(str(self.calls) + '.registry').read_text(), str(directory))
+        overlay = (self.deploy / 'compose.autoupdate.yaml').read_text()
+        self.assertIn('DOCKER_CONFIG: /docker-config', overlay)
+        self.assertIn('read_only: true', overlay)
+        self.assertIn('create_host_path: false', overlay)
+        self.assertIn('WATCHTOWER_LOG_LEVEL: ${WATCHTOWER_LOG_LEVEL:-info}', overlay)
+
+    def test_registry_directory_override_preserves_credentials_and_env_without_logging_them(self):
+        directory = self.root / 'registry directory with spaces'
+        directory.mkdir()
+        credentials = '{"auths":{"ghcr.io":{"auth":"synthetic-secret-marker"}}}\n'
+        (directory / 'config.json').write_text(credentials)
+        env_file = self.deploy / '.env'
+        env_file.write_text('DUO_WEB_PORT=18777\n')
+        result = self.run_installer(DUO_REGISTRY_CONFIG_DIR=str(directory),
+                                    DOCKER_CONFIG=str(self.root / 'unused-config'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(Path(str(self.calls) + '.registry').read_text(), str(directory))
+        self.assertEqual((directory / 'config.json').read_text(), credentials)
+        self.assertEqual(env_file.read_text(), 'DUO_WEB_PORT=18777\n')
+        self.assertNotIn('synthetic-secret-marker', result.stdout + result.stderr)
+        self.assertFalse((self.root / 'unused-config').exists())
+
+    def test_standard_docker_config_directory_is_used_when_no_override_exists(self):
+        directory = self.root / 'docker caller config'
+        result = self.run_installer(DOCKER_CONFIG=str(directory))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(Path(str(self.calls) + '.registry').read_text(), str(directory))
+        self.assertTrue(directory.is_dir())
+
+    def test_env_file_registry_path_is_prepared_without_exposing_environment(self):
+        directory = self.root / 'env registry with spaces'
+        env_file = self.deploy / '.env'
+        contents = f'DUO_REGISTRY_CONFIG_DIR={directory}\nDUO_WEB_PORT=18777\n'
+        env_file.write_text(contents)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(directory.is_dir())
+        self.assertEqual(env_file.read_text(), contents)
+        self.assertNotIn('synthetic-environment-secret', result.stdout + result.stderr)
+
+    def test_env_file_relative_registry_path_uses_deployment_directory(self):
+        (self.deploy / '.env').write_text('DUO_REGISTRY_CONFIG_DIR=registry config\n')
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.deploy / 'registry config').is_dir())
+
+    def test_unmanaged_previous_published_official_files_are_safely_migrated(self):
+        for name in ['compose.yaml', 'compose.autoupdate.yaml']:
+            fixture = ROOT / 'tests/docker/fixtures' / name.replace('.yaml', '.013.yaml')
+            (self.deploy / name).write_bytes(fixture.read_bytes())
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ['compose.yaml', 'compose.autoupdate.yaml']:
+            self.assertEqual((self.deploy / name).read_bytes(), (ROOT / name).read_bytes())
+            self.assertEqual(len(list(self.deploy.glob(name + '.backup.*'))), 1)
+            self.assertTrue((self.deploy / (name + '.duo-sha256')).exists())
 
     def seed_legacy_official_configuration(self):
         for name in ['compose.yaml', 'compose.autoupdate.yaml']:

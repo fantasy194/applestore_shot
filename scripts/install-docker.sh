@@ -87,16 +87,24 @@ duo_download() {
 # version recorded locally. Local edits are never overwritten by the installer.
 duo_config_candidate() {
   local duo_relative=$1
-  local duo_legacy_hash=$2
+  shift
   local duo_current_hash=''
   local duo_saved_hash=''
+  local duo_official_hash
+  local duo_known_official=0
   if [[ -s "$duo_relative" ]]; then
     duo_current_hash=$(sha256sum "$duo_relative")
     duo_current_hash=${duo_current_hash%% *}
     if [[ -s "${duo_relative}.duo-sha256" ]]; then
       read -r duo_saved_hash < "${duo_relative}.duo-sha256"
     fi
-    if [[ "$duo_current_hash" != "$duo_legacy_hash" && "$duo_current_hash" != "$duo_saved_hash" ]]; then
+    for duo_official_hash in "$@"; do
+      if [[ "$duo_current_hash" == "$duo_official_hash" ]]; then
+        duo_known_official=1
+        break
+      fi
+    done
+    if [[ "$duo_known_official" == 0 && "$duo_current_hash" != "$duo_saved_hash" ]]; then
       duo_message "保留已有自定义配置：$duo_relative；如需浏览器容器，请按 Docker 文档手动合并。"
       duo_candidate=$duo_relative
       return
@@ -148,16 +156,39 @@ duo_message "部署目录：$PWD；沿用已有 Compose 项目和数据卷。"
 
 duo_stage='2/6 下载配置文件'
 duo_message "$duo_stage"
-duo_config_candidate compose.yaml 54ad9625e35ed9dcdc8170a6f81a8aef3a2e44d06b20d2f84e9576fd0b75cf2d
+duo_config_candidate compose.yaml \
+  54ad9625e35ed9dcdc8170a6f81a8aef3a2e44d06b20d2f84e9576fd0b75cf2d \
+  b60a581d3bed637cfd5206df68b08675c19053b9631f7a6fa5e8b58799fc40ed
 duo_compose_input=$duo_candidate
 duo_download docker/chrome-seccomp.json
 
 duo_stage='3/6 配置自动更新并检查 Compose'
 duo_message "$duo_stage"
-duo_config_candidate compose.autoupdate.yaml 58820b5d79f5f382564529460af92566bd3ec35d5c9469c75d573c77e3b0d986
+duo_config_candidate compose.autoupdate.yaml \
+  58820b5d79f5f382564529460af92566bd3ec35d5c9469c75d573c77e3b0d986 \
+  ec09a5e71fb433058bd4a18dfcfb23a9e7ca95b0ebd55d2fe35c6970bb44fa6c
 duo_overlay_input=$duo_candidate
 
 duo_compose=(docker compose --progress plain -f "$duo_compose_input" -f "$duo_overlay_input")
+# Resolve using Compose's own .env and shell precedence, including relative
+# paths from the deployment directory. Keep the environment in memory only:
+# it can contain secrets unrelated to the three path variables selected below.
+duo_registry_environment=$(timeout --kill-after=5s 20s "${duo_compose[@]}" config --environment)
+duo_registry_override=''
+duo_registry_docker_config=''
+duo_registry_home=$HOME
+while IFS= read -r duo_environment_line; do
+  case "$duo_environment_line" in
+    DUO_REGISTRY_CONFIG_DIR=*) duo_registry_override=${duo_environment_line#*=} ;;
+    DOCKER_CONFIG=*) duo_registry_docker_config=${duo_environment_line#*=} ;;
+    HOME=*) duo_registry_home=${duo_environment_line#*=} ;;
+  esac
+done <<< "$duo_registry_environment"
+unset duo_registry_environment duo_environment_line
+duo_registry_config_dir="${duo_registry_override:-${duo_registry_docker_config:-$duo_registry_home/.docker}}"
+mkdir -p -- "$duo_registry_config_dir"
+duo_message "准备注册表配置目录：$duo_registry_config_dir（只读；无需登录也可检查公开镜像）。"
+
 duo_run timeout --kill-after=5s 20s "${duo_compose[@]}" config --quiet
 duo_config_commit compose.yaml "$duo_compose_input"
 duo_config_commit compose.autoupdate.yaml "$duo_overlay_input"

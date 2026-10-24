@@ -42,6 +42,26 @@ docker compose up -d --no-build --wait
 
 旧部署需要先更新一次 Compose，才能获得 `browser` 服务。重新运行 [安装器](../scripts/install-docker.sh) 会识别并备份旧官方配置或上次受管配置，校验新 Compose 成功后升级；保留原项目名、`.env` 和 `/data`。无法识别的自定义配置会保留并提示手动合并。仅拉取新 app 镜像不会自动新增侧车。启用 [自动更新覆盖文件](../compose.autoupdate.yaml) 后，Watchtower 同时跟踪 app 与 browser；继续沿用原 Compose 项目和数据卷。
 
+### 自动更新配置与诊断
+
+Watchtower 默认每 300 秒检查一次。Actions 发布完成后，等待下一次检查，并核对运行容器的版本或镜像 revision；`healthy` 只说明更新器进程存活。日志中的 `updated=0` 不代表失败，`skipped>0` 也不能直接认定为无更新或认证失败，需要查看具体错误。现场曾出现一轮跳过后，下一轮正常自动升级的情况。
+
+更新器通过只读目录挂载读取 Docker 注册表配置。默认目录为执行 Compose 用户的 `${DOCKER_CONFIG:-$HOME/.docker}`，可使用 `DUO_REGISTRY_CONFIG_DIR` 明确指定；安装器按 Compose 解析后的 `.env` 和环境变量优先级创建缺少的目录，相对路径以部署目录为准，不复制凭据或修改已有 `.env`。公开镜像支持空目录和匿名拉取，私有镜像需要在对应目录执行正常的 `docker login`。目录挂载让 `docker login` 原子替换 `config.json` 后的新配置继续可见。凭据助手还需该助手在更新器内可用，不能仅挂载依赖宿主专用助手的配置。
+
+手动使用覆盖文件前，先创建所选配置目录，例如 `mkdir -p "${DOCKER_CONFIG:-$HOME/.docker}"`。安装、登录和后续 Compose 操作应使用同一用户；`sudo` 可能改变 `HOME`。需要固定路径时，可在原 `.env` 中自行设置 `DUO_REGISTRY_CONFIG_DIR=/home/部署用户/.docker`，并确保该目录存在；不要在 `.env` 中存注册表 token。显式导出的 `DUO_REGISTRY_CONFIG_DIR` 优先于 `.env`。
+
+先查看现有日志；需要定位跳过原因时，临时以 debug 日志重建更新器，应用和浏览器不重建：
+
+```sh
+docker compose -f compose.yaml -f compose.autoupdate.yaml logs --since 20m watchtower
+WATCHTOWER_LOG_LEVEL=debug docker compose -f compose.yaml -f compose.autoupdate.yaml up -d --no-deps --no-build --pull never watchtower
+docker compose -f compose.yaml -f compose.autoupdate.yaml logs --since 10m watchtower
+# 诊断完成后恢复默认 info 日志。
+docker compose -f compose.yaml -f compose.autoupdate.yaml up -d --no-deps --no-build --pull never watchtower
+```
+
+如在 `.env` 固定了日志级别，恢复时也需改回 `info`。debug 可用于定位 `Added container as skipped` 的错误原因；不要启用 `trace`，上游明确说明它可能输出凭据。不要在长期运行的更新器内用 `docker exec ... --run-once` 诊断，该模式可能修改更新器自身的重启策略。排查时区分注册表访问、标签是否更新、容器是否已更换和页面缓存，并保留在途任务与 `/data`。
+
 ## 数据与密码
 
 账号、每账号的 Chrome 配置、Cookie、购买队列、日志和加密设置保存在 `iphoneduo_app-data` 数据卷的 `/data` 下。重新构建、重启以及普通 `docker compose down` 均保留数据。`docker compose down -v` 会删除数据，正常更新不要使用 `-v`。
