@@ -1,5 +1,6 @@
 import type { Bridge } from "./api";
 import type { Account, Snapshot, Task } from "./types";
+import { connectBrowserStream } from "./browser-stream";
 import { webHeaders } from "./pwa";
 
 interface WorkspaceChanges {
@@ -71,6 +72,7 @@ export function localWebBridge(): Bridge {
     logs: (params = {}) => call("activity_logs", { params }),
     browser: (accountId, taskId, operation, params = {}) =>
       call("browser_command", { accountId, taskId, operation, params }),
+    browserStream: connectBrowserStream,
     maintenance: (operation, params = {}) =>
       call("maintenance_command", { operation, params }),
     subscribe: async (callback, onSnapshot) => {

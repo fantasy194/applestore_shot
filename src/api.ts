@@ -2,6 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Account, Action, Data, Snapshot, Task } from "./types";
 import { localWebBridge } from "./web-api";
+import { connectNativeBrowserStream } from "./browser-stream";
 export const isLocalWeb = import.meta.env.MODE === "local-web";
 export interface Bridge {
   snapshot(): Promise<Snapshot>;
@@ -33,6 +34,12 @@ export interface Bridge {
     operation: string,
     params?: Data,
   ): Promise<Data>;
+  browserStream?(
+    accountId: string,
+    taskId: string,
+    onStatus: (status: Data) => void,
+    onError: () => void,
+  ): () => void;
   maintenance?(operation: string, params?: Data): Promise<Data>;
   subscribe(
     callback: (task: Task) => void,
@@ -62,6 +69,18 @@ const native: Bridge = {
   logs: (params = {}) => invoke("activity_logs", { params }),
   browser: (accountId, taskId, operation, params = {}) =>
     invoke("browser_command", { accountId, taskId, operation, params }),
+  browserStream: (accountId, taskId, onStatus, onError) =>
+    connectNativeBrowserStream(
+      (after) =>
+        invoke("browser_command", {
+          accountId,
+          taskId,
+          operation: "events",
+          params: { after },
+        }),
+      onStatus,
+      onError,
+    ),
   maintenance: (operation, params = {}) =>
     invoke("maintenance_command", { operation, params }),
   subscribe: async (callback) =>

@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock
 
 import browser_login
+from browser_signin import BrowserSigninAssistant
 
 
 ENTRY = 'https://secure8.www.apple.com.cn/shop/signIn?ssi=fixture'
@@ -85,6 +86,7 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
         callbacks['response'](Mock(request=rejected, status=401))
         callbacks['response'](Mock(request=Mock(url=ACCOUNT), status=200))
         self.assertTrue(network['authentication_failed'])
+
         page, browser, process, _ = self.waiting()
         assistant = Mock()
         with self.assertRaises(browser_login.BrowserSessionError) as raised:
@@ -93,6 +95,30 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
         self.assertNotIn('private', str(raised.exception))
         assistant.step.assert_not_called()
         page.wait_for_timeout.assert_not_called()
+
+    def test_remote_request_resumes_the_same_assistant_and_preserves_submission_history(self):
+        page, browser, process, network = self.waiting()
+        assistant = BrowserSigninAssistant(Mock())
+        assistant.interrupted = True
+        assistant.submitted.add('account')
+        remote = Mock()
+        remote.take_signin_request.return_value = True
+
+        def advance(*_):
+            assistant.on_interaction()
+            page.url = ACCOUNT
+            assistant.submitted.add('password')
+            return 'acted'
+
+        assistant.request_existing_credentials = Mock(wraps=assistant.request_existing_credentials)
+        assistant.step = Mock(side_effect=advance)
+        result = browser_login.wait_for_account_page(browser, process, Mock(), 12, network,
+            assistant=assistant, remote=remote, settle_seconds=0)
+        self.assertEqual(result, ([COOKIE], 'fixture-agent'))
+        assistant.request_existing_credentials.assert_called_once()
+        assistant.step.assert_called_once_with(page, network)
+        self.assertEqual(assistant.submitted, {'account', 'password'})
+        self.assertIn(unittest.mock.call(False, 'running'), remote.set_signin_status.call_args_list)
 
     def test_two_factor_409_remains_a_challenge_instead_of_password_rejection(self):
         context = Mock()

@@ -76,6 +76,15 @@
     padding: 12px;
   }
   .remote-browser-keys button {
+    min-height: 44px;
     flex: 1 1 auto;
   }
+}
+
+.remote-browser-signin {
+  margin-block: 12px;
+}
+.remote-browser-signin button {
+  min-height: 44px;
+  white-space: normal;
 }

@@ -26,7 +26,19 @@ class BrowserRemoteTests(unittest.TestCase):
                             channel=Channel('account-fixture', 'task-fixture', io.StringIO()))
         self.page = Mock(url='https://secure9.www.apple.com.cn/shop/signIn/account')
         self.page.evaluate.return_value = {'width': 500, 'height': 640}
-        self.page.screenshot.return_value = b'fixture-jpeg'
+        self.page.is_closed.return_value = False
+        self.handlers = {}
+        self.session = Mock()
+        self.session.on.side_effect = lambda event, handler: self.handlers.__setitem__(event, handler)
+        self.page.context.new_cdp_session.return_value = self.session
+        def send(method, params=None):
+            if method == 'Page.startScreencast':
+                self.emit()
+        self.session.send.side_effect = send
+
+    def emit(self):
+        self.handlers['Page.screencastFrame']({'sessionId': 1, 'data': '/9j/2Q==',
+                                             'metadata': {'deviceWidth': 500, 'deviceHeight': 640}})
 
     def request(self, broker, path, data=None, authenticated=True):
         headers = {'Content-Type': 'application/json'}
@@ -99,19 +111,81 @@ class BrowserRemoteTests(unittest.TestCase):
                 self.service.stage.assert_not_called()
                 self.assertEqual(self.service.channel.checkpoint.call_count, 2)
 
-    def test_screenshot_finishing_after_close_does_not_repopulate_sensitive_frame(self):
+    def test_empty_browser_round_trip_observes_disconnect_without_a_page_event_pump(self):
+        browser = Mock(contexts=[])
+        browser.is_connected.return_value = True
+        browser.new_browser_cdp_session.return_value.send.side_effect = RuntimeError('fixture disconnect')
+        with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \
+                patch('browser_remote.connect_browser', return_value=browser):
+            with BrowserRemote(self.service) as broker:
+                broker.attach_cdp(12345)
+                broker.controller.join(timeout=2)
+                self.assertFalse(broker.active)
+                self.assertFalse(broker.controller.is_alive())
+                browser.new_browser_cdp_session.return_value.send.assert_called_once_with('Browser.getVersion')
+
+    def test_frame_finishing_after_close_does_not_repopulate_sensitive_frame(self):
         with BrowserRemote(self.service) as broker:
-            def close_during_screenshot(**kwargs):
-                with broker.lock:
-                    broker.active = False
-                    broker.closed = True
-                    broker.frame = None
-                    broker.frames.clear()
-                return b'private-screenshot-fixture'
-            self.page.screenshot.side_effect = close_during_screenshot
             broker.tick(self.page)
+            broker.active = False
+            broker.closed = True
+            broker.frame = None
+            broker.frames.clear()
+            self.emit()
             self.assertIsNone(broker.frame)
             self.assertFalse(broker.frames)
+
+    def test_stationary_live_document_remains_current_and_heartbeats_omit_image(self):
+        with BrowserRemote(self.service) as broker:
+            broker.tick(self.page)
+            broker.last_capture -= 60
+            current = broker.status()
+            self.assertTrue(current['frame_current'])
+            self.assertGreater(current['frame_age_ms'], 59000)
+            heartbeat = broker.status(current['revision'])
+            self.assertFalse(heartbeat['frame_updated'])
+            self.assertIsNone(heartbeat['frame'])
+            code, _ = self.input_and_tick(broker, {'type': 'click', 'x': 40, 'y': 50, 'sequence': broker.sequence})
+            self.assertEqual(code, 200)
+            broker.last_alive -= 5
+            self.assertFalse(broker.status()['frame_current'])
+
+    def test_continuous_frames_are_acked_in_bounded_batches_without_starving_input(self):
+        self.session.send.side_effect = lambda method, params=None: self.emit() if method in ('Page.startScreencast', 'Page.screencastFrameAck') else None
+        with BrowserRemote(self.service) as broker:
+            broker.tick(self.page)
+            count = len(self.session.send.call_args_list)
+            code, _ = self.input_and_tick(broker, {'type': 'click', 'x': 40, 'y': 50, 'sequence': broker.sequence})
+            self.assertEqual(code, 200)
+            self.assertLess(len(self.session.send.call_args_list) - count, 4)
+            self.assertEqual(len(broker.pending_acks), 1)
+
+    def test_signin_request_contains_no_credentials_and_running_assistant_blocks_manual_input(self):
+        with BrowserRemote(self.service) as broker:
+            broker.tick(self.page)
+            broker.set_signin_status(True, 'ready')
+            code, _ = self.input_and_tick(broker, {'type': 'signin', 'sequence': broker.sequence})
+            self.assertEqual(code, 200)
+            self.assertTrue(broker.take_signin_request())
+            self.assertFalse(broker.take_signin_request())
+            broker.set_signin_status(False, 'running')
+            code, _ = self.input_and_tick(broker, {'type': 'text', 'text': 'fixture', 'sequence': broker.sequence})
+            self.assertEqual(code, 409)
+            self.page.keyboard.type.assert_not_called()
+
+    def test_same_url_navigation_and_late_frame_cannot_revive_previous_document(self):
+        with BrowserRemote(self.service) as broker:
+            broker.tick(self.page)
+            original = broker.frame['sequence']
+            late = self.handlers['Page.screencastFrame']
+            self.handlers['Page.frameNavigated']({'frame': {'id': 'main'}})
+            self.assertIsNone(broker.frame)
+            late({'sessionId': 1, 'data': '/9j/2Q==',
+                  'metadata': {'deviceWidth': 500, 'deviceHeight': 640}})
+            self.assertIsNone(broker.frame)
+            code, _ = self.input_and_tick(broker, {'type': 'click', 'x': 40, 'y': 50, 'sequence': original})
+            self.assertEqual(code, 409)
+            self.page.mouse.click.assert_not_called()
 
     def input_and_tick(self, broker, payload, before_tick=None):
         result = []
@@ -162,10 +236,10 @@ class BrowserRemoteTests(unittest.TestCase):
             sequence = broker.sequence
             code, _ = self.input_and_tick(broker, {'type': 'key', 'key': 'Space', 'sequence': sequence})
             self.assertEqual(code, 200)
-            self.page.keyboard.press.assert_called_once_with('Space')
+            self.assertEqual(self.page.keyboard.press.call_args.args, ('Space',))
             code, _ = self.input_and_tick(broker, {'type': 'text', 'text': '   ', 'sequence': sequence})
             self.assertEqual(code, 200)
-            self.page.keyboard.insert_text.assert_called_once_with('   ')
+            self.assertEqual(''.join(call.args[0] for call in self.page.keyboard.type.call_args_list), '   ')
 
     def test_inputs_execute_on_the_owner_tick_and_are_not_persisted(self):
         with BrowserRemote(self.service) as broker:
@@ -173,18 +247,18 @@ class BrowserRemoteTests(unittest.TestCase):
             sequence = broker.sequence
             code, result = self.input_and_tick(broker, {'type': 'text', 'text': 'private-fixture', 'sequence': sequence})
             self.assertEqual((code, result), (200, {'accepted': True}))
-            self.page.keyboard.insert_text.assert_called_once_with('private-fixture')
+            self.assertEqual(''.join(call.args[0] for call in self.page.keyboard.type.call_args_list), 'private-fixture')
             self.assertNotIn('private-fixture', broker.path.read_text())
             self.assertNotIn('private-fixture', self.service.channel.output.getvalue())
             code, _ = self.input_and_tick(broker, {'type': 'click', 'x': 40, 'y': 50, 'sequence': sequence})
             self.assertEqual(code, 200)
-            self.page.mouse.click.assert_called_once_with(40, 50)
+            self.assertEqual(self.page.mouse.click.call_args.args, (40, 50))
 
     def test_navigation_and_expired_commands_cannot_replay_input(self):
         with BrowserRemote(self.service) as broker:
             broker.tick(self.page)
             code, _ = self.input_and_tick(broker, {'type': 'click', 'x': 40, 'y': 50, 'sequence': broker.sequence},
-                lambda: setattr(self.page, 'url', 'https://secure9.www.apple.com.cn/shop/account/home'))
+                lambda: self.handlers['Page.frameNavigated']({'frame': {'id': 'main'}}))
             self.assertEqual(code, 409)
             self.page.mouse.click.assert_not_called()
             command = {'payload': {'type': 'text', 'text': 'stale'}, 'deadline': 0,

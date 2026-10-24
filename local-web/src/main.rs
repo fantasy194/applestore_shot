@@ -11,7 +11,7 @@ mod access;
 mod push;
 
 use axum::{
-    extract::{DefaultBodyLimit, Path as UrlPath, Request, State},
+    extract::{ws::{WebSocket, WebSocketUpgrade, Message}, DefaultBodyLimit, Path as UrlPath, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
@@ -64,11 +64,7 @@ async fn login(State(s): State<LocalState>, headers: HeaderMap, Json(body): Json
     let password = password.to_owned();
     let verified = tokio::task::spawn_blocking(move || auth::Auth::verify(&password, &hash)).await.unwrap_or(false);
     if !verified { return (StatusCode::UNAUTHORIZED, Json(json!({"error":"访问密码不正确"}))).into_response(); }
-    let host = headers.get(header::HOST).and_then(|x| x.to_str().ok());
-    let secure = if s.trust_network { access::forwarded_secure(&headers) } else {
-        host != Some(s.authority.as_str())
-            && s.allowed_origins.iter().find(|origin| host == Some(origin.authority.as_str())).is_none_or(|origin| origin.secure)
-    };
+    let secure = secure_cookie(&s, &headers);
     let cookie = format!("duo_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}", s.auth.session(), if secure { "; Secure" } else { "" });
     ([(header::SET_COOKIE, cookie)], Json(json!({"authenticated":true}))).into_response()
 }
@@ -83,6 +79,64 @@ async fn password(State(s): State<LocalState>, Json(body): Json<Value>) -> Respo
         Ok(()) => ([(header::SET_COOKIE, "duo_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")], Json(json!({"success":true}))).into_response(),
         Err(message) => bad_request(message),
     }
+}
+
+fn secure_cookie(s: &LocalState, headers: &HeaderMap) -> bool {
+    let host = headers.get(header::HOST).and_then(|x| x.to_str().ok());
+    if s.trust_network { access::forwarded_secure(headers) } else {
+        host != Some(s.authority.as_str())
+            && s.allowed_origins.iter().find(|origin| host == Some(origin.authority.as_str())).is_none_or(|origin| origin.secure)
+    }
+}
+
+// Exchange a local bearer for the same HttpOnly cookie used by password login.
+// No application bearer or broker token is ever placed in a WebSocket URL.
+async fn browser_stream_session(State(s): State<LocalState>, headers: HeaderMap) -> Response {
+    if s.auth.authenticated_session(&headers) { return Json(json!({"authenticated":true})).into_response(); }
+    let secure = secure_cookie(&s, &headers);
+    let cookie = format!("duo_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{}", s.auth.session(), if secure { "; Secure" } else { "" });
+    ([(header::SET_COOKIE, cookie)], Json(json!({"authenticated":true}))).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserStreamScope { account_id: String, task_id: String }
+
+async fn browser_stream(State(s): State<LocalState>, Query(scope): Query<BrowserStreamScope>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    if headers.get(header::ORIGIN).is_none() || !s.auth.authenticated_session(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // Validate ownership before accepting the upgrade, and again on each event.
+    if browser_remote::command(&s.engine, &scope.account_id, &scope.task_id, "status", &json!({})).await.is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    ws.max_message_size(1024).max_frame_size(1024).write_buffer_size(0)
+        .max_write_buffer_size(4 * 1024 * 1024)
+        .on_upgrade(move |socket| browser_stream_loop(socket, s, scope, headers))
+}
+
+async fn browser_stream_loop(mut socket: WebSocket, s: LocalState, scope: BrowserStreamScope, headers: HeaderMap) {
+    let mut after = 0u64;
+    loop {
+        if *s.stopping.borrow() || !s.auth.authenticated_session(&headers) { break; }
+        let params = json!({"after":after});
+        let event = tokio::select! {
+            result = browser_remote::command(&s.engine, &scope.account_id, &scope.task_id, "events", &params) => result,
+            incoming = socket.recv() => {
+                match incoming { Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue, _ => break }
+            }
+        };
+        let status = event.unwrap_or_else(|_| json!({"active":false,"connected":false,
+            "frame_current":false,"frame_updated":true,"document_id":"","revision":0,
+            "frame_age_ms":0,"frame":null,"url_host":""}));
+        if !s.auth.authenticated_session(&headers) { break; }
+        after = status["revision"].as_u64().unwrap_or(after);
+        let active = status["active"] == true;
+        // Slow peers get the latest bounded frame, never an unbounded backlog.
+        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), socket.send(Message::Text(status.to_string().into()))).await, Ok(Ok(()))) { break; }
+        if !active { break; }
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), socket.send(Message::Close(None))).await;
 }
 
 fn valid_public_origin(value: &str) -> bool {
@@ -234,13 +288,29 @@ async fn events(State(s): State<LocalState>) -> Response {
         .into_response()
 }
 
+fn content_security_policy(authority: &str, secure: bool) -> HeaderValue {
+    // Derive the WS source from a parsed HTTP authority, never raw Origin or
+    // forwarded text. Explicit schemes are required by mobile Safari CSP.
+    let valid = !authority.is_empty() && authority.len() <= 300
+        && authority.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'[' | b']'))
+        && authority.parse::<axum::http::uri::Authority>().is_ok();
+    let socket = if valid { format!(" {}://{}", if secure { "wss" } else { "ws" }, authority) } else { String::new() };
+    HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'{socket}; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"))
+        .expect("CSP contains a validated authority")
+}
+
 async fn guard(State(s): State<LocalState>, request: Request, next: Next) -> Response {
+    let host = request.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    let secure = if s.trust_network { access::forwarded_secure(request.headers()) }
+        else if host == s.authority { false }
+        else { s.allowed_origins.iter().find(|origin| host == origin.authority).is_none_or(|origin| origin.secure) };
+    let policy = content_security_policy(host, secure);
     let mut response = guarded_request(State(s), request, next).await;
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, policy);
     response
 }
 
@@ -291,7 +361,7 @@ async fn guarded_request(State(s): State<LocalState>, request: Request, next: Ne
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"));
+
     response
 }
 
@@ -516,6 +586,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/shutdown", post(request_shutdown))
         .route("/api/push/{operation}", post(push_command))
         .route("/api/events", get(events))
+        .route("/api/browser-stream-session", post(browser_stream_session))
+        .route("/api/browser-stream", get(browser_stream))
         .route("/api/{command}", post(command));
     if !development {
         app = app.fallback_service(ServeDir::new(web_root));
@@ -571,3 +643,6 @@ async fn main() {
         std::process::exit(1);
     }
 }
+#[cfg(test)]
+#[path = "browser_stream_tests.rs"]
+mod browser_stream_tests;

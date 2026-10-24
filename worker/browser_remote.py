@@ -1,7 +1,7 @@
 """Ephemeral, account-task scoped browser preview and input broker.
 
 Only the owning Playwright thread executes browser calls. HTTP workers exchange
-in-memory commands; screenshots and typed credentials are never written to disk.
+in-memory commands; streamed frames and typed credentials are never written to disk.
 """
 import base64
 from collections import deque
@@ -15,7 +15,7 @@ import queue
 import secrets
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from platform_support import private_fd
 from contextlib import contextmanager
 from browser_cdp import BrowserConnectError, connect_browser
@@ -39,9 +39,22 @@ class BrowserRemote:
         self.account_id, self.task_id = scope.channel.account_id, scope.channel.task_id
         self.token = secrets.token_hex(32)
         self.commands = queue.Queue(maxsize=24)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.changed = threading.Condition(self.lock)
+        self.revision = 1
+        self.document_id = secrets.token_hex(16)
+        self.connected = False
+        self.last_alive = 0.0
+        self.page = None
+        self.session = None
+        self.pending_acks = deque(maxlen=8)
+        self.navigation_pending = False
+        self.interaction_lock = threading.Lock()
+        self.signin_request = threading.Event()
+        self.signin_available = False
+        self.signin_status = ""
         self.frame = None
-        self.frames = deque(maxlen=16)
+        self.frames = deque(maxlen=240)
         self.host = None
         self.active = True
         self.closed = False
@@ -80,16 +93,23 @@ class BrowserRemote:
             def do_GET(self):
                 if not self.authorized():
                     return
-                if self.path != '/status':
+                parsed = urlsplit(self.path)
+                if parsed.path not in ('/status', '/events'):
                     self.reply(404, {'error': '浏览器操作不存在。'})
                     return
-                with broker.lock:
-                    frame = broker.frame
-                    if frame and int(time.time() * 1000) - frame['captured_at_ms'] > 10000:
-                        frame = None
-                    data = {'active': broker.active, 'frame': frame, 'url_host': broker.host}
-                    if broker.reason is not None:
-                        data.update(error_code=broker.error_code, reason=broker.reason)
+                after = None
+                if parsed.path == '/events':
+                    try:
+                        after = int(parse_qs(parsed.query).get('after', ['0'])[0])
+                        if after < 0:
+                            raise ValueError()
+                    except ValueError:
+                        self.reply(400, {'error': '浏览器事件参数无效。'})
+                        return
+                with broker.changed:
+                    if after is not None and after == broker.revision and not broker.closed:
+                        broker.changed.wait(timeout=1.0)
+                    data = broker.status(after)
                 self.reply(200, data)
 
             def do_POST(self):
@@ -113,7 +133,7 @@ class BrowserRemote:
                 except (ValueError, TypeError, queue.Full):
                     self.reply(400, {'error': '浏览器输入无效或等待队列已满。'})
                     return
-                command['finished'].wait(3)
+                command['finished'].wait(95)
                 self.reply(200 if command['accepted'] else 409,
                            {'accepted': True} if command['accepted'] else
                            {'error': '页面已变化或输入已过期，请刷新预览后重试。'})
@@ -132,6 +152,9 @@ class BrowserRemote:
                    for key in ('x', 'y')):
                 raise ValueError()
             if type(payload.get('frame_sequence', payload.get('sequence'))) is not int:
+                raise ValueError()
+        elif kind == 'signin':
+            if type(payload.get('sequence', payload.get('frame_sequence'))) is not int:
                 raise ValueError()
         elif kind == 'text':
             if not isinstance(payload.get('text'), str) or not 0 < len(payload['text']) <= 2048:
@@ -165,6 +188,8 @@ class BrowserRemote:
     def __exit__(self, *_args):
         self.active = False
         self.closed = True
+        with self.changed:
+            self._notify()
         self.token = secrets.token_hex(32)
         self.path.unlink(missing_ok=True)
         with self.lock:
@@ -202,6 +227,8 @@ class BrowserRemote:
                     self.error_code, self.reason = code, reason
                     self.frame, self.host = None, None
                     self.frames.clear()
+                    self.connected = False
+                    self._notify()
                 stage = getattr(self.service, 'stage', None)
                 if callable(stage):
                     stage(reason)
@@ -209,6 +236,8 @@ class BrowserRemote:
             try:
                 with sync_playwright() as playwright:
                     browser = connect_browser(playwright.chromium, None, port, checkpoint=checkpoint)
+                    health = browser.new_browser_cdp_session()
+                    failures = 0
                     while self.active:
                         checkpoint()
                         if not browser.is_connected():
@@ -218,9 +247,32 @@ class BrowserRemote:
                         if pages:
                             from browser_login import pending_auth_page
                             chosen = next((page for page in reversed(pages) if pending_auth_page(page)), pages[-1])
-                            self.tick(chosen)
-                            chosen.wait_for_timeout(150)
+                            try:
+                                self.tick(chosen)
+                                chosen.wait_for_timeout(100)
+                                failures = 0
+                            except Cancelled:
+                                raise
+                            except Exception:
+                                failures += 1
+                                with self.changed:
+                                    self.page = None
+                                    self._clear_page()
+                                if failures >= 3:
+                                    raise
+                                # Reattach the selected page after popup/navigation races.
+                                # Prior document frames and queued inputs stay invalid.
+                                time.sleep(.1)
                         else:
+                            with self.changed:
+                                if self.page is not None:
+                                    self.page = None
+                                    self._clear_page()
+                            # With no pages there is no Page.wait_for_timeout
+                            # to pump Playwright's event loop. An actual CDP
+                            # round trip observes disconnects instead of trusting
+                            # the cached Browser.is_connected flag indefinitely.
+                            health.send('Browser.getVersion')
                             time.sleep(.15)
             except BrowserConnectError as error:
                 failed(error.code, error.message)
@@ -229,6 +281,8 @@ class BrowserRemote:
                     self.active = False
                     self.frame, self.host = None, None
                     self.frames.clear()
+                    self.connected = False
+                    self._notify()
             except Exception:
                 failed('BROWSER_PREVIEW_INTERRUPTED', '浏览器预览连接已中断，请等待官网窗口恢复；未发送等待中的输入。')
         self.controller = threading.Thread(target=control, daemon=True)
@@ -238,69 +292,194 @@ class BrowserRemote:
         if self.controller is None:
             self.tick(page)
 
+    def _notify(self):
+        self.revision += 1
+        self.changed.notify_all()
+
+    def set_signin_status(self, available, status=''):
+        with self.changed:
+            if self.signin_available != bool(available) or self.signin_status != status:
+                self.signin_available, self.signin_status = bool(available), status
+                self._notify()
+
+    def take_signin_request(self):
+        if not self.signin_request.is_set():
+            return False
+        self.signin_request.clear()
+        return True
+
+    def status(self, after=None):
+        live = self.active and self.connected and time.monotonic() - self.last_alive <= 3
+        current = bool(live and self.frame and self.frame.get('document_id') == self.document_id)
+        updated = after is None or after != self.revision
+        result = {'active': self.active, 'connected': live, 'frame_current': current,
+                  'document_id': self.document_id, 'revision': self.revision,
+                  'frame_updated': updated, 'frame': self.frame if updated and current else None,
+                  'frame_age_ms': max(0, int((time.monotonic() - self.last_capture) * 1000)),
+                  'url_host': self.host, 'signin_available': self.signin_available,
+                  'signin_status': self.signin_status}
+        if self.reason is not None:
+            result.update(error_code=self.error_code, reason=self.reason)
+        return result
+
+    def _clear_page(self):
+        self.document_id = secrets.token_hex(16)
+        self.frame, self.host = None, None
+        self.frames.clear()
+        self.connected = False
+        self._notify()
+
+    def _start_stream(self, page):
+        old = self.session
+        self.session = None
+        if old is not None:
+            try:
+                old.detach()
+            except Exception:
+                pass
+        with self.changed:
+            self._clear_page()
+            self.page = page
+            self.navigation_pending = False
+        session = page.context.new_cdp_session(page)
+        self.session = session
+        generation = self.document_id
+        pending_acks = deque(maxlen=8)
+        self.pending_acks = pending_acks
+
+        def navigated(event):
+            if not event.get('frame', {}).get('parentId') and self.session is session:
+                with self.changed:
+                    self.navigation_pending = True
+                    self._clear_page()
+
+        def received(event):
+            try:
+                # Never make synchronous Playwright calls from event callbacks:
+                # nested greenlet waits can starve input under animated pages.
+                pending_acks.append(event['sessionId'])
+                if (self.session is not session or generation != self.document_id
+                        or self.navigation_pending or not self.active or self.closed
+                        or not self.allowed_page(page)):
+                    return
+                metadata, encoded = event['metadata'], event['data']
+                width, height = metadata['deviceWidth'], metadata['deviceHeight']
+                if (not isinstance(encoded, str) or len(encoded) > 2_666_668
+                        or any(type(v) not in (float, int) or not math.isfinite(v)
+                               or not 1 <= v <= 4096 for v in (width, height))):
+                    return
+                raw = base64.b64decode(encoded, validate=True)
+                if len(raw) > 2_000_000 or not raw.startswith(b'\xff\xd8\xff'):
+                    return
+                with self.changed:
+                    if generation != self.document_id or not self.active or self.closed:
+                        return
+                    self.sequence += 1
+                    self.last_capture = time.monotonic()
+                    self.frame = {'width': int(width), 'height': int(height),
+                                  'sequence': self.sequence, 'document_id': generation,
+                                  'captured_at_ms': int(time.time() * 1000),
+                                  'data_url': 'data:image/jpeg;base64,' + encoded}
+                    self.frames.append({k: v for k, v in self.frame.items() if k != 'data_url'})
+                    self.host = urlsplit(page.url).hostname
+                    self._notify()
+            except Exception:
+                pass
+
+        session.on('Page.frameNavigated', navigated)
+        session.on('Page.screencastFrame', received)
+        session.send('Page.enable')
+        # CDP input dispatch in a background restored tab may wait indefinitely
+        # for compositor work. Activate the exact page shown by this broker.
+        session.send('Page.bringToFront')
+        session.send('Page.startScreencast', {'format': 'jpeg', 'quality': 60,
+                                            'maxWidth': 4096, 'maxHeight': 4096,
+                                            'everyNthFrame': 1})
+
+    def _flush_acks(self):
+        # Snapshot the bounded ACK batch. Frames triggered by these ACKs wait
+        # for the next pump; continuous animation cannot monopolize input.
+        pending = list(self.pending_acks)
+        self.pending_acks.clear()
+        for session_id in pending:
+            self.session.send('Page.screencastFrameAck', {'sessionId': session_id})
+
     def tick(self, page):
-        """Call frequently on the same thread that owns the Playwright page."""
+        """Only the owning Playwright thread may call CDP or browser input."""
         self.service.channel.checkpoint()
         permitted = self.allowed_page(page)
         if not permitted:
-            with self.lock:
-                self.frame, self.host = None, None
+            with self.changed:
+                if self.frame or self.connected:
+                    self._clear_page()
+        elif self.page is not page or self.session is None or self.navigation_pending:
+            self._start_stream(page)
+        if permitted and self.session is not None:
+            self._flush_acks()
+            if time.monotonic() - self.last_alive >= 1:
+                self.session.send('Page.getLayoutMetrics')
+                with self.changed:
+                    self.last_alive = time.monotonic()
+                    if not self.connected:
+                        self.connected = True
+                        self._notify()
         while True:
             try:
                 command = self.commands.get_nowait()
             except queue.Empty:
                 break
             payload = command['payload']
+            acquired = False
             try:
                 if not self.active or not permitted or time.monotonic() >= command['deadline']:
                     continue
+                acquired = self.interaction_lock.acquire(blocking=False)
+                if not acquired:
+                    continue
                 kind = payload['type']
+                if self.signin_status == 'running':
+                    continue
                 with self.lock:
                     sequence = payload.get('frame_sequence', payload.get('sequence'))
                     frame = next((f for f in self.frames if f['sequence'] == sequence), None)
-                if (not frame or int(time.time() * 1000) - frame['captured_at_ms'] > 5000
-                        or page.url != frame['_page_url']):
+                    valid = (self.status()['frame_current'] and frame
+                             and frame.get('document_id') == self.document_id
+                             and payload.get('document_id', self.document_id) == self.document_id)
+                if not valid:
                     continue
                 if kind == 'click':
-                    if (not 0 <= payload['x'] < frame['width']
-                            or not 0 <= payload['y'] < frame['height']):
+                    if not 0 <= payload['x'] < frame['width'] or not 0 <= payload['y'] < frame['height']:
                         continue
-                    page.mouse.click(payload['x'], payload['y'])
+                    from browser_input import interaction_delay
+                    page.mouse.click(payload['x'], payload['y'], delay=interaction_delay())
                 elif kind == 'text':
-                    page.keyboard.insert_text(payload['text'])
+                    from browser_input import type_keyboard_text
+                    generation = self.document_id
+                    def checkpoint():
+                        self.service.channel.checkpoint()
+                        self._flush_acks()
+                        if not self.active or self.closed or self.document_id != generation:
+                            raise ValueError()
+                        with self.lock:
+                            self.last_alive = time.monotonic()
+                    type_keyboard_text(page, payload['text'], checkpoint, deadline=time.monotonic() + 90)
+                elif kind == 'signin':
+                    if not self.signin_available:
+                        continue
+                    self.signin_request.set()
                 elif kind == 'key':
-                    page.keyboard.press('ControlOrMeta+A' if payload['key'] == 'Control+A' else payload['key'])
+                    from browser_input import interaction_delay
+                    page.keyboard.press('ControlOrMeta+A' if payload['key'] == 'Control+A' else payload['key'], delay=interaction_delay())
                 elif kind == 'scroll':
                     page.mouse.wheel(payload.get('delta_x', 0), payload.get('delta_y', 0))
                 command['accepted'] = True
             except Exception:
-                pass  # Browser errors can contain typed data; never expose them.
+                pass
             finally:
+                if acquired:
+                    self.interaction_lock.release()
                 payload.clear()
                 command['finished'].set()
-        if not permitted or time.monotonic() - self.last_capture < .65:
-            return
-        self.last_capture = time.monotonic()
-        try:
-            size = page.evaluate('({width: innerWidth, height: innerHeight})')
-            if (not isinstance(size, dict) or not all(type(size.get(k)) is int and 0 < size[k] <= 4096
-                                                    for k in ('width', 'height'))):
-                return
-            image = page.screenshot(type='jpeg', quality=60, full_page=False, timeout=1200)
-            if len(image) > 2_000_000:
-                return
-            self.sequence += 1
-            frame = {**size, 'sequence': self.sequence, 'captured_at_ms': int(time.time() * 1000),
-                     'data_url': 'data:image/jpeg;base64,' + base64.b64encode(image).decode('ascii')}
-            with self.lock:
-                if not self.active or self.closed:
-                    return
-                self.frame = frame
-                self.frames.append({**{k: v for k, v in frame.items() if k != 'data_url'},
-                                    '_page_url': page.url})
-                self.host = urlsplit(page.url).hostname
-        except Exception:
-            pass
 
 
 @contextmanager

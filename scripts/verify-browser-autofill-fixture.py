@@ -69,7 +69,7 @@ class Fixture:
         mode = self.mode
         initial = 'password' if mode == 'mismatch' else 'account'
         owner = 'other@example.test' if mode == 'mismatch' else OWNER
-        return '''<!doctype html><html><body><form></form><script>
+        html = '''<!doctype html><html><body><form></form><script>
         const mode=MODE, owner=OWNER, expected=SECRET;
         const form=document.querySelector('form'); let step=INITIAL;
         const afterInterrupt=sessionStorage.getItem('interrupted')==='yes';
@@ -109,6 +109,13 @@ class Fixture:
         }); render();
         </script></body></html>'''.replace('MODE', json.dumps(mode)).replace('OWNER', json.dumps(owner)).replace(
             'SECRET', json.dumps(SECRET)).replace('INITIAL', json.dumps(initial))
+        if mode == 'native_fields':
+            html = html.replace('<label>Password<input id="password_text_field" autocomplete="current-password" type="password"></label>',
+                                '<input id="password_text_field" type="password" placeholder="密码">')
+            html = html.replace('password_text_field', 'storefront_password')
+            html = html.replace('id="sign-in" type="submit">Continue', 'id="native-arrow" type="submit">→')
+            html = html.replace("e.target.id==='sign-in'", "e.target.id==='native-arrow'")
+        return html
 
     def route(self, route):
         request = route.request
@@ -178,7 +185,7 @@ class Fixture:
             return reply
 
         def delay(rng, low, high):
-            require((low, high) == (20, 99), 'Configured keyboard delay left its allowed range')
+            require((low, high) == (100, 200), 'Configured interaction delay left its allowed range')
             value = real_randint(rng, low, high)
             self.delays.append(value)
             return value
@@ -243,14 +250,14 @@ class Fixture:
             require(hashlib.sha256(self.service.auth.read_bytes()).hexdigest() == self.digest, 'Auth file changed')
             require(self.sentinel.read_text() == 'preserve', 'Browser profile replaced')
             require(self.menu_requests == 1, f'{self.mode}: current menu count {self.menu_requests}; error {getattr(error, "code", None)}')
-            if self.mode in ('manual', 'maintenance'):
+            if self.mode in ('manual', 'maintenance', 'native_fields'):
                 require(error is None and result.get('logged_in') is True, 'Production automatic login failed')
                 require(self.submits == {'account': 1, 'password': 1, 'authx': 1}, 'Authentication submitted more than once')
                 require(len(self.imports) == 1, 'Successful session was not imported once')
                 for field in ('account', 'password'):
                     types = {e['type'] for e in self.events if e['field'] == field and e['trusted']}
                     require({'keydown', 'input', 'keyup', 'click'} <= types, 'Trusted mouse/keyboard events missing')
-                require(len(self.delays) == len(OWNER) + len(SECRET), 'Keyboard was not typed one character at a time')
+                require(len(self.delays) >= len(OWNER) + len(SECRET) + 4, 'Mouse/keyboard interaction delays missing')
             else:
                 require(error is not None and not self.imports and self.submits['authx'] == 0,
                         'Incomplete authentication imported a session')
@@ -290,7 +297,7 @@ class Fixture:
 def main():
     with tempfile.TemporaryDirectory(prefix='browser-autofill-fixture-') as directory:
         cases = [Fixture(Path(directory), mode).run() for mode in (
-            'manual', 'maintenance', 'otp', 'wrong_password', 'mismatch', 'interrupt_reload', 'interrupt_navigation')]
+            'manual', 'maintenance', 'native_fields', 'otp', 'wrong_password', 'mismatch', 'interrupt_reload', 'interrupt_navigation')]
     report = {'success': True, 'scope': 'local synthetic DOM and import only; no live Apple login proof',
         'python_http_forbidden': True, 'browser_routes_intercepted': True, 'browser_dns_disabled': True,
         'expired_session_redirect_emulated_with_intercepted_navigations': True,

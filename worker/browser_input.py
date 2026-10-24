@@ -8,6 +8,15 @@ class BrowserInputInterrupted(ValueError):
     pass
 
 
+def interaction_delay():
+    return random.SystemRandom().randint(100, 200)
+
+
+def click_control(locator, *, timeout=1500):
+    """Normal mouse events with the same bounded timing as credential typing."""
+    locator.click(timeout=timeout, delay=interaction_delay())
+
+
 def validate_keyboard_text(text):
     if not isinstance(text, str) or not text or len(text) > 4096:
         raise BrowserInputInterrupted('浏览器输入格式无效。')
@@ -57,7 +66,7 @@ def type_keyboard_text(page, text, checkpoint=lambda: None, *, deadline=None):
         with _navigation_guard(page, checkpoint, deadline) as check:
             for char in text:
                 check()
-                page.keyboard.type(char, delay=random.SystemRandom().randint(20, 99))
+                page.keyboard.type(char, delay=interaction_delay())
                 check()
     except BrowserInputInterrupted:
         raise
@@ -75,7 +84,7 @@ def replace_field(page, frame, locator, text, checkpoint, *, deadline=None):
             original = locator.element_handle(timeout=500)
             if original is None:
                 raise BrowserInputInterrupted('登录输入字段已变化，已停止输入。')
-            locator.click(timeout=1500)
+            click_control(locator)
             check()
 
             def focused():
@@ -83,17 +92,17 @@ def replace_field(page, frame, locator, text, checkpoint, *, deadline=None):
 
             if not focused():
                 raise BrowserInputInterrupted('登录输入焦点已变化，已停止输入。')
-            page.keyboard.press('ControlOrMeta+A')
+            page.keyboard.press('ControlOrMeta+A', delay=interaction_delay())
             check()
             if not focused():
                 raise BrowserInputInterrupted('登录输入焦点已变化，已停止输入。')
-            page.keyboard.press('Backspace')
+            page.keyboard.press('Backspace', delay=interaction_delay())
             prefix = ''
             for char in text:
                 check()
                 if not focused() or locator.input_value(timeout=500) != prefix:
                     raise BrowserInputInterrupted('登录输入已变化，已停止剩余输入。')
-                page.keyboard.type(char, delay=random.SystemRandom().randint(20, 99))
+                page.keyboard.type(char, delay=interaction_delay())
                 prefix += char
                 check()
                 if not focused() or locator.input_value(timeout=500) != prefix:

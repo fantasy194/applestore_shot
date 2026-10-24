@@ -1,10 +1,11 @@
 """Synthetic form regressions; selectors are not a live Apple DOM assertion."""
 import unittest
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from browser_input import BrowserInputInterrupted, replace_field, type_keyboard_text, validate_keyboard_text
-from browser_signin import BrowserSigninAssistant
+from browser_signin import BrowserSigninAssistant, step_browser_signin
 from browser_login import BrowserSessionError
 
 
@@ -39,6 +40,9 @@ class Field:
 
     def element_handle(self, **_):
         return self
+
+    def locator(self, _selector):
+        return Locator([field for field in self.frame.fields if field.kind == 'button'])
 
     def dispose(self):
         pass
@@ -137,7 +141,7 @@ class Page:
         if self.after_type:
             self.after_type()
 
-    def press(self, key):
+    def press(self, key, **_):
         if key == 'Backspace':
             self.focus.value = ''
 
@@ -155,7 +159,7 @@ class BrowserInputTests(unittest.TestCase):
         self.assertEqual(field.value, 'secret-fixture')
         self.assertEqual(field.clicks, 1)
         self.assertEqual(''.join(char for char, _ in page.events), field.value)
-        self.assertTrue(all(20 <= delay < 100 for _, delay in page.events))
+        self.assertTrue(all(100 <= delay <= 200 for _, delay in page.events))
         self.assertTrue(all(not callbacks for callbacks in page.listeners.values()))
 
     def test_same_url_reload_interrupts_after_first_character(self):
@@ -410,6 +414,91 @@ class BrowserSigninTests(unittest.TestCase):
         with self.assertRaises(BrowserSessionError):
             self.assistant.step(self.page, self.network)
         self.assertEqual(button.clicks, 1)
+
+    def test_explicit_existing_credentials_resumes_only_unsubmitted_password_step(self):
+        _, button = self.form(account=self.service.account, password=True)
+        self.assistant.submitted.add('account')
+        self.assistant.interrupted = True
+        self.assistant.deadline = 0
+        self.assertTrue(self.assistant.request_existing_credentials())
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.service.browser_password.assert_called_once_with(allow_prompt=False)
+        self.assertEqual(button.clicks, 1)
+        self.assertFalse(self.assistant.request_existing_credentials())
+        self.assertEqual(self.assistant.step(self.page, self.network), 'waiting')
+        self.assertEqual(button.clicks, 1)
+
+    def test_explicit_existing_credentials_never_retries_failed_authentication(self):
+        self.form(account=self.service.account, password=True)
+        with self.assertRaises(BrowserSessionError):
+            self.assistant.step(self.page, {'authentication_failed': True})
+        self.assertFalse(self.assistant.request_existing_credentials())
+        self.service.browser_password.assert_not_called()
+
+    def test_explicit_resume_replaces_our_partial_password_instead_of_submitting_it(self):
+        _, button = self.form(account=self.service.account, password=True)
+        password = self.page.auth.fields[-1]
+        self.page.after_type = lambda: setattr(self.page, 'focus', None)
+        with self.assertRaises(BrowserSessionError):
+            self.assistant.step(self.page, self.network)
+        self.assertTrue(self.assistant.password_input_incomplete)
+        self.assertEqual(password.value, 'p')
+        self.assertEqual(button.clicks, 0)
+        self.page.after_type = None
+        self.assertTrue(self.assistant.request_existing_credentials())
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.assertEqual(password.value, 'private-fixture')
+        self.assertEqual(button.clicks, 1)
+        self.assertFalse(self.assistant.request_existing_credentials())
+
+    def test_explicit_resume_replaces_our_partial_account_and_preserves_selected_identity(self):
+        account, button = self.form()
+        self.page.after_type = lambda: setattr(self.page, 'focus', None)
+        with self.assertRaises(BrowserSessionError):
+            self.assistant.step(self.page, self.network)
+        self.assertTrue(self.assistant.account_input_incomplete)
+        self.assertEqual(button.clicks, 0)
+        self.page.after_type = None
+        self.assertTrue(self.assistant.request_existing_credentials())
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.assertEqual(account.value, self.service.account)
+        self.assertEqual(button.clicks, 1)
+
+    def test_remote_manual_input_and_assistant_do_not_interleave(self):
+        lock = threading.Lock()
+        remote = SimpleNamespace(interaction_lock=lock)
+        assistant = Mock()
+        lock.acquire()
+        self.assertEqual(step_browser_signin(assistant, self.page, self.network, remote), 'waiting')
+        assistant.step.assert_not_called()
+        lock.release()
+        assistant.step.side_effect = RuntimeError('fixture')
+        with self.assertRaises(RuntimeError):
+            step_browser_signin(assistant, self.page, self.network, remote)
+        self.assertFalse(lock.locked())
+
+    def test_waiting_disabled_prefilled_form_does_not_toggle_interaction_status(self):
+        for password_step in (False, True):
+            with self.subTest(password_step=password_step):
+                self.setUp()
+                _, button = self.form(account=self.service.account, password=password_step)
+                if password_step:
+                    self.page.auth.fields[-1].value = 'browser-prefilled-fixture'
+                button.is_enabled = lambda: False
+                self.assistant.on_interaction = Mock()
+                self.assertEqual(self.assistant.step(self.page, self.network), 'waiting')
+                self.assistant.on_interaction.assert_not_called()
+
+    def test_existing_credentials_missing_does_not_open_new_password_prompt(self):
+        self.form(account=self.service.account, password=True)
+        self.service.browser_password.return_value = None
+        self.assistant.headless = False
+        self.assertTrue(self.assistant.request_existing_credentials())
+        with self.assertRaises(BrowserSessionError) as raised:
+            self.assistant.step(self.page, self.network)
+        self.assertEqual(raised.exception.code, 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
+        self.service.browser_password.assert_called_once_with(allow_prompt=False)
+        self.assertNotIn('password', self.assistant.submitted)
 
 
 if __name__ == '__main__':

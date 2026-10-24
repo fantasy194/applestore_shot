@@ -199,7 +199,7 @@ async function fixture(page: Page, delay = 40, pending = false) {
 
 test("首次添加账号没有prompt时也能看到并操作官网登录窗口", async ({ page }) => {
   await fixture(page, 40, true);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.locator(".setup-progress")).toHaveCount(0);
   await page
     .getByRole("button", { name: "使用官网浏览器登录", exact: true })
@@ -232,7 +232,7 @@ test("首次添加账号没有prompt时也能看到并操作官网登录窗口",
 
 test("远程画面轮换且缩放点击映射到官网原始坐标", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const image = page.getByAltText("当前账号 Apple 官网窗口的实时画面");
   await expect(image).toBeVisible();
   const initial = await image.getAttribute("src");
@@ -256,7 +256,7 @@ test("远程画面轮换且缩放点击映射到官网原始坐标", async ({ pa
 
 test("输入只发送给当前窗口后立即清空且键盘滚动可用", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const field = page.getByLabel("输入到官网", { exact: true });
   await expect(field).toBeEnabled();
   await expect(field).toHaveAttribute("type", "password");
@@ -300,7 +300,7 @@ test("输入只发送给当前窗口后立即清空且键盘滚动可用", async
 
 test("官网空格键及纯空格输入保持原值", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const space = page.getByRole("button", { name: "空格", exact: true });
   await expect(space).toBeEnabled();
   await space.click();
@@ -321,7 +321,7 @@ test("官网空格键及纯空格输入保持原值", async ({ page }) => {
 
 test("过期画面与终态任务都不能继续输入", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const screen = page.getByRole("button", {
     name: "操作 Apple 官网画面",
     exact: true,
@@ -363,7 +363,7 @@ test("过期画面与终态任务都不能继续输入", async ({ page }) => {
 test("手机远程画面不溢出且支持滑动滚动与折叠", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const screen = page.getByRole("button", {
     name: "操作 Apple 官网画面",
     exact: true,
@@ -391,7 +391,7 @@ test("手机远程画面不溢出且支持滑动滚动与折叠", async ({ page 
 
 test("慢请求不会重叠且输入错误可见并不显示私密错误正文", async ({ page }) => {
   await fixture(page, 1000);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const field = page.getByLabel("输入到官网", { exact: true });
   await expect(field).toBeEnabled();
   await page.evaluate(() => {
@@ -413,7 +413,7 @@ test("慢请求不会重叠且输入错误可见并不显示私密错误正文",
 
 test("远程连接失败会显示可读原因并能恢复", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const screen = page.getByRole("button", {
     name: "操作 Apple 官网画面",
     exact: true,
@@ -437,7 +437,7 @@ test("远程连接失败会显示可读原因并能恢复", async ({ page }) => 
 
 test("交替空帧后台刷新保留画面节点、输入内容和焦点", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const field = page.getByLabel("输入到官网", { exact: true });
   const image = page.getByAltText("当前账号 Apple 官网窗口的实时画面");
   await expect(field).toBeEnabled();
@@ -485,7 +485,7 @@ test("交替空帧后台刷新保留画面节点、输入内容和焦点", async
 
 test("新帧解码前保留旧画面且迟到解码不倒退", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const image = page.getByAltText("当前账号 Apple 官网窗口的实时画面");
   const field = page.getByLabel("输入到官网", { exact: true });
   await expect(field).toBeEnabled();
@@ -518,7 +518,7 @@ test("新帧解码前保留旧画面且迟到解码不倒退", async ({ page }) 
 
 test("重复序号不重复解码并保留运行等待切换的草稿", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const field = page.getByLabel("输入到官网", { exact: true });
   await expect(field).toBeEnabled();
   await field.fill("same-live-task-draft");
@@ -543,7 +543,7 @@ test("重复序号不重复解码并保留运行等待切换的草稿", async ({
 
 test("按下到释放期间冻结画面并发送按下时的序号", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const screen = page.getByRole("button", {
     name: "操作 Apple 官网画面",
     exact: true,
@@ -577,7 +577,7 @@ test("按下到释放期间冻结画面并发送按下时的序号", async ({ pa
 
 test("切换任务清理草稿并丢弃旧任务迟到响应", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const field = page.getByLabel("输入到官网", { exact: true });
   const image = page.getByAltText("当前账号 Apple 官网窗口的实时画面");
   await expect(field).toBeEnabled();
@@ -604,7 +604,7 @@ test("切换任务清理草稿并丢弃旧任务迟到响应", async ({ page }) 
 
 test("切换任务后旧图像迟到解码不能覆盖新窗口", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const image = page.getByAltText("当前账号 Apple 官网窗口的实时画面");
   await expect(image).toBeVisible();
   await page.evaluate(() => {
@@ -641,7 +641,7 @@ test("切换任务后旧图像迟到解码不能覆盖新窗口", async ({ page 
 
 test("无效新图像与临时网络错误不清除已显示画面或输入", async ({ page }) => {
   await fixture(page);
-  await page.goto("/");
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   const field = page.getByLabel("输入到官网", { exact: true });
   const image = page.getByAltText("当前账号 Apple 官网窗口的实时画面");
   await expect(field).toBeEnabled();
@@ -666,4 +666,183 @@ test("无效新图像与临时网络错误不清除已显示画面或输入", as
   await expect(image).toHaveAttribute("src", old!);
   await expect(field).toHaveValue("transient-error-draft");
   await expect(field).toBeFocused();
+});
+
+async function streamFixture(page: Page) {
+  await fixture(page);
+  await page.addInitScript(() => {
+    const root = window as any;
+    root.remoteStreamState = {
+      paused: false,
+      disconnected: false,
+      document: "document-one",
+      offset: 86400000,
+      heartbeat: false,
+    };
+    root.remoteStreamCleanups = 0;
+    const bridge = root.__DUO_KILLER_TEST__;
+    bridge.browserStream = (
+      accountId: string,
+      taskId: string,
+      accept: any,
+      failed: any,
+    ) => {
+      let disposed = false;
+      let busy = false;
+      async function tick() {
+        if (disposed || busy || root.remoteStreamState.paused) return;
+        if (root.remoteStreamState.disconnected) {
+          failed();
+          return;
+        }
+        busy = true;
+        try {
+          const status = await bridge.browser(accountId, taskId, "status", {});
+          if (disposed) return;
+          const state = root.remoteStreamState;
+          const frame = status.frame && {
+            ...status.frame,
+            document_id: state.document,
+            captured_at_ms: Date.now() + state.offset,
+          };
+          accept({
+            ...status,
+            frame: state.heartbeat ? null : frame,
+            revision: root.remoteState.statusCalls,
+            connected: true,
+            frame_current: !root.remoteState.stale,
+            document_id: state.document,
+            frame_updated: !state.heartbeat,
+            signin_available: true,
+            signin_status: "ready",
+          });
+        } finally {
+          busy = false;
+        }
+      }
+      root.remotePush = accept;
+      const timer = setInterval(() => void tick(), 250);
+      void tick();
+      return () => {
+        disposed = true;
+        clearInterval(timer);
+        root.remoteStreamCleanups++;
+      };
+    };
+  });
+}
+
+test("实时心跳允许静止画面持续操作且不受服务器时钟影响", async ({ page }) => {
+  await streamFixture(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const screen = page.getByRole("button", {
+    name: "操作 Apple 官网画面",
+    exact: true,
+  });
+  await expect(screen).toBeEnabled();
+  await page.evaluate(() => {
+    (window as any).remoteStreamState.heartbeat = true;
+  });
+  await page.waitForTimeout(5500);
+  await expect(screen).toBeEnabled();
+  await page
+    .getByRole("button", { name: "使用现有凭证登录", exact: true })
+    .click();
+  expect(
+    await page.evaluate(() => (window as any).remoteInputs[0]),
+  ).toMatchObject({ type: "signin", document_id: "document-one" });
+  expect(
+    await page.evaluate(() =>
+      Object.keys((window as any).remoteInputs[0]).sort(),
+    ),
+  ).toEqual(["document_id", "sequence", "type"]);
+});
+
+test("实时连接中断禁用官网操作并保留草稿恢复", async ({ page }) => {
+  await streamFixture(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const screen = page.getByRole("button", {
+    name: "操作 Apple 官网画面",
+    exact: true,
+  });
+  const field = page.getByLabel("输入到官网", { exact: true });
+  await expect(screen).toBeEnabled();
+  await field.fill("private-draft");
+  await page.evaluate(() => {
+    (window as any).remoteStreamState.disconnected = true;
+  });
+  await expect(screen).toBeDisabled();
+  await expect(field).toHaveValue("private-draft");
+  await page.evaluate(() => {
+    (window as any).remoteStreamState.disconnected = false;
+  });
+  await expect(screen).toBeEnabled();
+  await expect(field).toHaveValue("private-draft");
+});
+
+test("页面切换清理旧图与迟到解码且结束任务释放推送", async ({ page }) => {
+  await streamFixture(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const screen = page.getByRole("button", {
+    name: "操作 Apple 官网画面",
+    exact: true,
+  });
+  await expect(screen).toBeEnabled();
+  await page.evaluate(() => {
+    (window as any).remoteState.holdDecode = true;
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).remoteDecodeWaiters.length))
+    .toBeGreaterThan(0);
+  await page.evaluate(() => {
+    const root = window as any;
+    root.remoteStreamState.paused = true;
+    root.remotePush({
+      active: true,
+      connected: true,
+      frame_current: false,
+      frame_updated: true,
+      frame: null,
+      document_id: "document-two",
+      revision: 999,
+    });
+  });
+  await expect(screen).toHaveCount(0);
+  await page.evaluate(() => {
+    (window as any).releaseRemoteDecode(0);
+  });
+  await page.waitForTimeout(100);
+  await expect(screen).toHaveCount(0);
+  await page.evaluate(() => {
+    (window as any).finishRemoteTask();
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).remoteStreamCleanups))
+    .toBe(1);
+});
+
+test("实时窗口手机与桌面布局截图", async ({ page }) => {
+  await page.setViewportSize({ width: 1180, height: 1400 });
+  await streamFixture(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await expect(
+    page.getByRole("button", { name: "使用现有凭证登录", exact: true }),
+  ).toBeEnabled();
+  await page
+    .locator(".remote-browser")
+    .screenshot({ path: "artifacts/remote-browser-live-desktop.png" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(
+    page.getByRole("button", { name: "使用现有凭证登录", exact: true }),
+  ).toBeEnabled();
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth),
+  ).toBeLessThanOrEqual(390);
+  await page
+    .locator(".remote-browser")
+    .screenshot({ path: "artifacts/remote-browser-live-mobile.png" });
+  const height = await page
+    .getByRole("button", { name: "空格", exact: true })
+    .evaluate((el) => el.getBoundingClientRect().height);
+  expect(height).toBeGreaterThanOrEqual(44);
 });

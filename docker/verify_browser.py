@@ -146,9 +146,21 @@ def main():
                                 break
                             time.sleep(.1)
                         assert first, 'No actual GUI Chrome preview'
-                        time.sleep(1.5)
-                        second = request('/status')['frame']
-                        assert second['sequence'] > first['sequence'], 'Remote preview did not advance'
+                        # A compositor frame is event-driven: a static page need not
+                        # emit new pixels. Its live connection must keep input usable.
+                        time.sleep(6)
+                        stationary = request('/status')
+                        assert stationary['connected'] and stationary['frame_current'], 'Static live page incorrectly expired'
+                        assert stationary['frame'], 'Static live page lost its image'
+                        report['static_frame_remains_interactive_after_six_seconds'] = True
+                        page.evaluate("document.body.style.backgroundColor = '#cde8ff'")
+                        deadline = time.monotonic() + 10
+                        while time.monotonic() < deadline:
+                            second = request('/status')['frame']
+                            if second and second['sequence'] > stationary['frame']['sequence']:
+                                break
+                            time.sleep(.1)
+                        assert second and second['sequence'] > stationary['frame']['sequence'], 'Compositor change did not push a frame'
                         assert request('/input', {'type': 'click', 'x': 50, 'y': 25,
                                                  'sequence': second['sequence']})['accepted']
                         assert request('/input', {'type': 'text', 'text': 'docker-gui-fixture',
@@ -158,7 +170,7 @@ def main():
                             'sequence': request('/status')['frame']['sequence']})['accepted']
                         assert page.locator('#field').input_value() == 'docker-gui-fixture '
                         report.update({'cdp_connected': True, 'existing_broker_preview': True,
-                                       'preview_sequence_advances': True, 'existing_mouse_and_text_input': True})
+                                       'compositor_frame_push': True, 'existing_mouse_and_text_input': True})
                         report['space_key_input'] = True
                     assert not (task_dir / 'browser-remote.json').exists()
                     report['broker_registration_cleaned'] = True

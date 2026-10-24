@@ -286,6 +286,9 @@ class AppleStoreLogin:
                         context = browser.contexts[0]
                         from browser_login import pending_auth_page, trust_browser_if_offered, observe_login_network, headless_auth_required, BrowserSessionError
                         network = observe_login_network(context, interaction.handler)
+                        from browser_signin import BrowserSigninAssistant, step_browser_signin
+                        assistant = (BrowserSigninAssistant(interaction.handler) if
+                                     not headless and interaction.handler is not None else None)
                         # Do not navigate a restored verification/trust page away.
                         preserve_auth = any(pending_auth_page(opened) for opened in context.pages)
                         if headless and preserve_auth:
@@ -313,8 +316,24 @@ class AppleStoreLogin:
                             if remote is not None:
                                 remote.pump(page)
                             opened = [p for owned in browser.contexts for p in owned.pages]
+                            if assistant is not None:
+                                assistant.process_remote_request(remote)
+                                outcome = None
+                                if assistant.interrupted is not True and not network['error']:
+                                    for opened_page in reversed(opened):
+                                        if not pending_auth_page(opened_page):
+                                            continue
+                                        try:
+                                            outcome = step_browser_signin(assistant, opened_page, network, remote)
+                                        except BrowserSessionError as error:
+                                            if error.code not in ('BROWSER_LOGIN_INPUT_INTERRUPTED', 'HEADLESS_LOGIN_REQUIRES_ATTENTION'):
+                                                raise
+                                            assistant.interrupted = True
+                                            interaction.report_stage('官网自动填写已停止，可使用现有凭证继续或在官网手动操作')
+                                        break
+                                assistant.publish_remote_status(remote, outcome)
                             trust_pending = any(trust_browser_if_offered(p, accept=False) if headless
-                                                else trust_browser_if_offered(p) for p in opened)
+                                                else trust_browser_if_offered(p, remote=remote) for p in opened)
                             auth_pending = any(pending_auth_page(p) for p in opened)
                             if headless and network.get('blocked_status') in (403, 429, 541):
                                 raise BrowserSessionError('APPLE_SESSION_BLOCKED',

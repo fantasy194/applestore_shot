@@ -120,7 +120,7 @@ def pending_auth_page(page):
             and '/auth' in parsed.path)
 
 
-def trust_browser_if_offered(page, *, accept=True):
+def trust_browser_if_offered(page, *, accept=True, remote=None):
     """Accept only the explicit official trust-browser choice authorized by user."""
     from browser_remote import official_page
     try:
@@ -139,14 +139,21 @@ def trust_browser_if_offered(page, *, accept=True):
             continue
         if not accept:
             return True
+        lock = getattr(remote, 'interaction_lock', None) if remote is not None else None
+        if lock is not None and lock.acquire(blocking=False) is False:
+            return True
         try:
             button = frame.get_by_role('button', name=TRUST_BUTTON)
             if (_TRUST_SENT.get(frame) != frame.url and button.count() == 1 and button.is_visible()):
                 _TRUST_SENT[frame] = frame.url  # Reserve before an uncertain click response.
-                button.click(timeout=1000)
+                from browser_input import click_control
+                click_control(button, timeout=1000)
                 log.info('[官网浏览器] 已选择信任此浏览器，等待官网确认')
         except Exception:
             pass
+        finally:
+            if lock is not None:
+                lock.release()
         return True  # A visible trust question must finish before closing.
     return False
 
@@ -263,8 +270,10 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
             raise ValueError('官网登录页面已关闭，未完成会话导入。')
         if remote is not None:
             remote.pump(pages[-1])
+            if assistant is not None:
+                assistant.process_remote_request(remote)
         outcome = None
-        if assistant is not None and not network['error']:
+        if assistant is not None and assistant.interrupted is not True and not network['error']:
             for page in reversed(pages):
                 if pending_auth_page(page):
                     if not authentication_seen:
@@ -273,16 +282,21 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                         deadline = max(deadline, time.monotonic() + 60)
                         authentication_seen = True
                     try:
-                        outcome = assistant.step(page, network)
+                        from browser_signin import step_browser_signin
+                        outcome = step_browser_signin(assistant, page, network, remote)
                     except BrowserSessionError as error:
-                        if headless or error.code != 'BROWSER_LOGIN_INPUT_INTERRUPTED':
+                        if headless or error.code not in ('BROWSER_LOGIN_INPUT_INTERRUPTED', 'HEADLESS_LOGIN_REQUIRES_ATTENTION'):
                             raise
-                        # Keep the visible official window available for takeover,
-                        # but never resume the interrupted credential automation.
-                        assistant = None
-                        service.stage('官网页面或输入已变化，自动填写已停止，请在当前官网窗口继续')
+                        # Keep the same assistant and its reserved submissions.
+                        # Only an explicit user action may resume unsubmitted input.
+                        assistant.interrupted = True
+                        service.stage('没有可用的现有密码，请在官网输入密码或完成账号密码确认' if
+                                      error.code == 'HEADLESS_LOGIN_REQUIRES_ATTENTION' else
+                                      '官网页面或输入已变化，自动填写已停止，可使用现有凭证继续或在官网手动操作')
                         outcome = 'verification'
                         reported_verification = True
+                    if remote is not None:
+                        assistant.publish_remote_status(remote, outcome)
                     if outcome == 'verification':
                         if headless:
                             raise headless_auth_required()
@@ -296,7 +310,7 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                         unrecognized_since = None
                     break
         trust_pending = any(trust_browser_if_offered(page, accept=False) if headless and assistant is None
-                            else trust_browser_if_offered(page) for page in pages)
+                            else trust_browser_if_offered(page, remote=remote) for page in pages)
         auth_pending = any(pending_auth_page(page) for page in pages)
         if headless and assistant is None and (trust_pending or auth_pending):
             raise headless_auth_required()
@@ -572,5 +586,9 @@ def login_in_browser(service, timeout=300, *, maintenance=False):
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.terminate()
-                process.wait(timeout=5)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
         service.stage('官网登录窗口已关闭', browser_pid=None)

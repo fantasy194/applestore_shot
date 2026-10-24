@@ -16,6 +16,7 @@ type Frame = {
   height: number;
   sequence: number;
   captured_at_ms: number;
+  document_id?: string;
 };
 
 const live = (task: Task) => ["running", "waiting"].includes(task.status);
@@ -47,6 +48,7 @@ export function RemoteBrowser({
 }) {
   // Optional to keep older desktop bridges and preview fixtures compatible.
   const browser = (bridge as Bridge & { browser?: BrowserCall }).browser;
+  const browserStream = bridge.browserStream;
   const contextKey = `${task.account_id}:${task.id}:${live(task) ? "live" : task.status}`;
   const [status, setStatus] = useState<Data>({ active: false });
   const [displayed, setDisplayed] = useState<{
@@ -60,7 +62,9 @@ export function RemoteBrowser({
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [imageFailed, setImageFailed] = useState(false);
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(performance.now());
+  const lastReceipt = useRef(-Infinity);
+  const latestStatus = useRef<Data>({ active: false });
   const seenRef = useRef(false);
   const mounted = useRef(true);
   const inputBusy = useRef(false);
@@ -96,8 +100,12 @@ export function RemoteBrowser({
   useEffect(() => {
     let disposed = false;
     let polling = false;
+    let stopStream: (() => void) | undefined;
+    let documentId: unknown;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setStatus({ active: false });
+    latestStatus.current = { active: false };
+    lastReceipt.current = -Infinity;
     setDisplayed(undefined);
     displayedRef.current = undefined;
     pendingDisplay.current = undefined;
@@ -149,7 +157,7 @@ export function RemoteBrowser({
             setDisplayed(next);
           }
           setImageFailed(false);
-          setNow(Date.now());
+          setNow(performance.now());
         })
         .catch(() => {
           if (
@@ -161,34 +169,57 @@ export function RemoteBrowser({
         });
     }
 
+    function accept(next: Data) {
+      if (disposed || currentContext.current !== contextKey) return;
+      const modern = typeof next.connected === "boolean";
+      if (modern && typeof next.document_id !== "string") return;
+      const changedDocument = modern && next.document_id !== documentId;
+      if (changedDocument) documentId = next.document_id;
+      lastReceipt.current = performance.now();
+      latestStatus.current = next;
+      setNow(performance.now());
+      setStatus({ ...next, context_key: contextKey });
+      setConnectionError("");
+      if (next.active && !seenRef.current) {
+        seenRef.current = true;
+        setSeen(true);
+        setExpanded(true);
+      }
+      if (
+        !next.active ||
+        changedDocument ||
+        (next.frame_updated === true && !next.frame)
+      ) {
+        frameGeneration.current++;
+        decoding.current = undefined;
+        displayedRef.current = undefined;
+        pendingDisplay.current = undefined;
+        setDisplayed(undefined);
+        pointer.current = null;
+        if (!next.active) setText("");
+      }
+      if (
+        next.active &&
+        validFrame(next.frame) &&
+        (!modern || next.frame.document_id === documentId)
+      )
+        prepareFrame(next.frame);
+    }
+    function failed() {
+      if (!disposed && currentContext.current === contextKey) {
+        lastReceipt.current = -Infinity;
+        setNow(performance.now());
+        setConnectionError("远程窗口连接失败，请稍后重试。");
+      }
+    }
     async function poll() {
-      if (disposed || polling) return;
+      if (disposed || polling || browserStream) return;
       polling = true;
       clearTimeout(timer);
       try {
-        const next = await browser!(task.account_id, task.id, "status");
-        if (disposed || currentContext.current !== contextKey) return;
-        setNow(Date.now());
-        setStatus({ ...next, context_key: contextKey });
-        setConnectionError("");
-        if (next.active && !seenRef.current) {
-          seenRef.current = true;
-          setSeen(true);
-          setExpanded(true);
-        }
-        if (!next.active) {
-          frameGeneration.current++;
-          decoding.current = undefined;
-          displayedRef.current = undefined;
-          pendingDisplay.current = undefined;
-          setDisplayed(undefined);
-          pointer.current = null;
-          setText("");
-        } else if (validFrame(next.frame)) prepareFrame(next.frame);
+        accept(await browser!(task.account_id, task.id, "status"));
       } catch {
-        if (!disposed) {
-          setConnectionError("远程窗口连接失败，请稍后重试。");
-        }
+        failed();
       } finally {
         polling = false;
         if (!disposed) {
@@ -206,27 +237,39 @@ export function RemoteBrowser({
     };
     document.addEventListener("visibilitychange", visible);
     window.addEventListener("focus", visible);
-    void poll();
+    if (browserStream)
+      stopStream = browserStream(task.account_id, task.id, accept, failed);
+    else void poll();
     return () => {
       disposed = true;
+      stopStream?.();
       frameGeneration.current++;
       clearTimeout(timer);
       pollNow.current = () => {};
       document.removeEventListener("visibilitychange", visible);
       window.removeEventListener("focus", visible);
     };
-  }, [browser, contextKey]);
+  }, [browser, browserStream, contextKey]);
 
   useEffect(() => {
     if (!status.active || !live(task)) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
+    const timer = setInterval(() => setNow(performance.now()), 1000);
     return () => clearInterval(timer);
   }, [status.active, task.status]);
 
   const active = status.context_key === contextKey && status.active === true;
   const frame = displayed?.context === contextKey ? displayed.frame : undefined;
-  const age = frame ? now - frame.captured_at_ms : Infinity;
-  const fresh = !!frame && age >= -1000 && age <= 5000;
+  const connected = now - lastReceipt.current <= 5000 && !connectionError;
+  const modern = typeof status.connected === "boolean";
+  const fresh =
+    !!frame &&
+    connected &&
+    (modern
+      ? status.connected === true &&
+        status.frame_current === true &&
+        frame.document_id === status.document_id
+      : Date.now() - frame.captured_at_ms >= -1000 &&
+        Date.now() - frame.captured_at_ms <= 5000);
   const enabled = !!browser && live(task) && active && fresh;
 
   function publishPendingFrame() {
@@ -235,7 +278,7 @@ export function RemoteBrowser({
     if (next?.context !== contextKey) return;
     displayedRef.current = next;
     setDisplayed(next);
-    setNow(Date.now());
+    setNow(performance.now());
   }
 
   async function send(params: Data) {
@@ -243,8 +286,11 @@ export function RemoteBrowser({
       !browser ||
       !enabled ||
       !frame ||
-      Date.now() - frame.captured_at_ms > 5000 ||
-      Date.now() - frame.captured_at_ms < -1000 ||
+      performance.now() - lastReceipt.current > 5000 ||
+      (modern &&
+        (latestStatus.current.connected !== true ||
+          latestStatus.current.frame_current !== true ||
+          frame.document_id !== latestStatus.current.document_id)) ||
       inputBusy.current
     ) {
       return;
@@ -258,6 +304,7 @@ export function RemoteBrowser({
       await browser(task.account_id, selectedTask, "input", {
         ...params,
         sequence: frame.sequence,
+        ...(frame.document_id ? { document_id: frame.document_id } : {}),
       });
       if (mounted.current && currentContext.current === selectedContext)
         pollNow.current();
@@ -412,6 +459,36 @@ export function RemoteBrowser({
           <p className="muted remote-browser-hint">
             点击画面选择官网输入框，再在下方输入并发送；滑动画面可滚动。密码和验证码直接送到此官网窗口。
           </p>
+          {(status.signin_available === true ||
+            typeof status.signin_status === "string") && (
+            <div className="remote-browser-signin">
+              <button
+                className="primary"
+                type="button"
+                disabled={
+                  !enabled ||
+                  sending ||
+                  status.signin_available !== true ||
+                  status.signin_status === "running" ||
+                  status.signin_status === "submitted"
+                }
+                onClick={() => void send({ type: "signin" })}
+              >
+                {status.signin_status === "running"
+                  ? "正在使用现有凭证登录…"
+                  : "使用现有凭证登录"}
+              </button>
+              {(status.signin_status === "manual" ||
+                status.signin_status === "missing_credentials") && (
+                <p className="muted">
+                  没有可用的登录凭证，请在官网窗口输入密码。
+                </p>
+              )}
+              {status.signin_status === "verification" && (
+                <p className="muted">请在官网窗口完成验证。</p>
+              )}
+            </div>
+          )}
           <form
             className="remote-browser-input"
             onSubmit={(event) => {

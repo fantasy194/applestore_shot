@@ -7,7 +7,7 @@ import re
 import time
 from urllib.parse import urlsplit
 
-from browser_input import BrowserInputInterrupted, _navigation_guard, replace_field, validate_keyboard_text
+from browser_input import BrowserInputInterrupted, _navigation_guard, click_control, replace_field, validate_keyboard_text
 
 
 ACCOUNT_NAMES = re.compile(r'^(?:Apple (?:ID|账户|账号|Account)|电子邮件(?:或电话号码)?|电子邮件地址|邮箱|账号|账户|Email(?: or phone number)?|Account name)$', re.I)
@@ -52,11 +52,35 @@ def _unique(locator):
 
 
 def _fields(frame):
-    accounts = frame.locator('input[autocomplete="username"]:not([type="password"]), input#account_name_text_field:not([type="password"])')
+    accounts = frame.locator('input[autocomplete="username"]:not([type="password"]), input[type="email"], input#account_name_text_field:not([type="password"]), input[id="signIn.accountName"], input[name="signIn.accountName"]')
     accounts = accounts.or_(frame.get_by_role('textbox', name=ACCOUNT_NAMES))
-    passwords = frame.locator('input[type="password"][autocomplete="current-password"], input[type="password"]#password_text_field')
+    # Storefront-native signIn.password has differed from the auth iframe IDs
+    # and may have no accessible label. Only the unique visible password on an
+    # already verified official login document can be selected below.
+    passwords = frame.locator('input[type="password"]')
     passwords = passwords.or_(frame.get_by_label(PASSWORD_NAMES).and_(frame.locator('input[type="password"]')))
     return accounts, passwords
+
+
+def _button(frame, field):
+    known = frame.get_by_role('button', name=CONTINUE_NAMES).or_(frame.locator(
+        'button#sign-in, input[type="submit"]#sign-in, button[id="signIn.signInButton"], input[id="signIn.signInButton"]'))
+    # An icon-only submit must belong to this exact login field's form.
+    # Do not borrow an unrelated search/newsletter submit from the same page.
+    submits = field.locator('xpath=ancestor::form[1]//button[@type="submit"] | ancestor::form[1]//input[@type="submit"]')
+    return _unique(known.or_(submits))
+
+
+def step_browser_signin(assistant, page, network, remote=None):
+    """Serialize normal UI events across the assistant and remote CDP owner."""
+    lock = getattr(remote, 'interaction_lock', None) if remote is not None else None
+    if lock is not None and lock.acquire(blocking=False) is False:
+        return 'waiting'
+    try:
+        return assistant.step(page, network)
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 class BrowserSigninAssistant:
@@ -66,6 +90,40 @@ class BrowserSigninAssistant:
         self.submitted = set()
         self.interrupted = False
         self.deadline = None
+        self.terminal = False
+        self.existing_only = False
+        self.on_interaction = lambda: None
+        self.remote_initialized = False
+        self.password_input_incomplete = False
+        self.account_input_incomplete = False
+
+    def process_remote_request(self, remote):
+        """Wire every visible login entry to the same main-thread assistant."""
+        if remote is None:
+            return
+        self.on_interaction = lambda: remote.set_signin_status(False, 'running')
+        if not self.remote_initialized:
+            remote.set_signin_status(not self.terminal and 'password' not in self.submitted,
+                                   'manual' if self.interrupted else 'ready')
+            self.remote_initialized = True
+        if remote.take_signin_request() is True and self.request_existing_credentials():
+            self.service.stage('正在使用当前账号的现有凭证继续官网登录')
+
+    def publish_remote_status(self, remote, outcome=None):
+        if remote is not None:
+            available = not self.terminal and 'password' not in self.submitted
+            remote.set_signin_status(available, 'manual' if self.interrupted else
+                                   'verification' if outcome == 'verification' else
+                                   'ready' if available else 'submitted')
+
+    def request_existing_credentials(self):
+        """Explicit takeover resumes only unsubmitted work, never an auth retry."""
+        if self.terminal or 'password' in self.submitted:
+            return False
+        self.interrupted = False
+        self.deadline = None
+        self.existing_only = True
+        return True
 
     def _verification(self, frame):
         if _visible(frame.locator('input[autocomplete="one-time-code"]')):
@@ -83,6 +141,8 @@ class BrowserSigninAssistant:
         for index in range(accounts.count()):
             value = accounts.nth(index).input_value(timeout=500).strip()
             if value and value.casefold() != expected:
+                if self.account_input_incomplete and expected.startswith(value.casefold()):
+                    continue
                 raise _error('BROWSER_LOGIN_ACCOUNT_MISMATCH', '官网登录账号与当前账号不一致，已停止自动输入。')
             matched = matched or bool(value)
         if matched:
@@ -107,28 +167,33 @@ class BrowserSigninAssistant:
                         raise _error('BROWSER_LOGIN_ACCOUNT_MISMATCH', '官网账号信息已变化，已停止认证。')
                     check()
                 bound_check()
-                prefilled = password.evaluate('(element) => Boolean(element.value)') is True
+                prefilled = (password.evaluate('(element) => Boolean(element.value)') is True
+                             and not self.password_input_incomplete)
                 bound_check()
                 if prefilled:
                     # Browser autofill is already in this verified account's form.
                     # Do not extract the existing password or prompt for another.
                     self.service.stage('正在继续官网已填写的登录表单')
                 else:
-                    secret = self.service.browser_password(allow_prompt=not self.headless)
+                    self.on_interaction()
+                    secret = self.service.browser_password(allow_prompt=not self.headless and not self.existing_only)
                     bound_check()
                     if not isinstance(secret, str) or not secret:
-                        raise _error('HEADLESS_LOGIN_REQUIRES_ATTENTION', '官网需要登录密码，请在账号工作台完成认证。')
+                        raise _error('HEADLESS_LOGIN_REQUIRES_ATTENTION', '没有可用的现有密码，请在官网输入密码或完成账号密码确认。')
                     validate_keyboard_text(secret)
                     self.service.stage('正在填写官网密码并继续认证')
+                    self.password_input_incomplete = True
                     replace_field(page, frame, password, secret, bound_check, deadline=self.deadline)
+                    self.password_input_incomplete = False
                 bound_check()
                 if password.evaluate('(element) => Boolean(element.value)') is not True:
                     raise BrowserInputInterrupted('官网密码字段已变化，已停止继续。')
                 if not button.is_enabled():
                     return 'waiting'
                 bound_check()
+                self.on_interaction()
                 self.submitted.add('password')
-                button.click(timeout=1500)
+                click_control(button)
                 return 'acted'
             finally:
                 if original is not None:
@@ -138,6 +203,7 @@ class BrowserSigninAssistant:
         if self.interrupted:
             raise _error('BROWSER_LOGIN_INPUT_INTERRUPTED', '登录页面已变化，请在官网页面继续。')
         if network.get('authentication_failed') is True or any(network.get(key) == 401 for key in ('status', 'http_status', 'authentication_status', 'blocked_status')):
+            self.terminal = True
             raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网拒绝了本次认证，请在官网确认账号和密码；未自动重试。')
         if network.get('pending') or network.get('error'):
             return 'waiting'
@@ -158,14 +224,16 @@ class BrowserSigninAssistant:
                 accounts, passwords = _fields(frame)
                 identity = self._identity(frame, accounts)
                 account, password = _unique(accounts), _unique(passwords)
-                buttons = frame.get_by_role('button', name=CONTINUE_NAMES).or_(frame.locator('button#sign-in, input[type="submit"]#sign-in'))
-                button = _unique(buttons)
+                button = _button(frame, password if password is not None else account) if password is not None or account is not None else None
                 if password is not None:
                     if 'password' in self.submitted:
                         return 'waiting'
-                    if account is not None and not account.input_value(timeout=500).strip():
+                    if account is not None and (self.account_input_incomplete or not account.input_value(timeout=500).strip()):
+                        self.on_interaction()
                         self.deadline = self.deadline or time.monotonic() + 60
+                        self.account_input_incomplete = True
                         replace_field(page, frame, account, self.service.account, self.service.channel.checkpoint, deadline=self.deadline)
+                        self.account_input_incomplete = False
                         identity = self._identity(frame, accounts)
                     if not identity or button is None:
                         return 'unrecognized'
@@ -176,15 +244,19 @@ class BrowserSigninAssistant:
                     if button is None:
                         return 'unrecognized'
                     self.service.stage('正在填写官网账号并继续')
-                    if not account.input_value(timeout=500).strip():
+                    if self.account_input_incomplete or not account.input_value(timeout=500).strip():
+                        self.on_interaction()
                         self.deadline = self.deadline or time.monotonic() + 60
+                        self.account_input_incomplete = True
                         replace_field(page, frame, account, self.service.account, self.service.channel.checkpoint, deadline=self.deadline)
+                        self.account_input_incomplete = False
                     self._identity(frame, accounts)
                     self.service.channel.checkpoint()
                     if not button.is_enabled():
                         return 'waiting'
+                    self.on_interaction()
                     self.submitted.add('account')
-                    button.click(timeout=1500)
+                    click_control(button)
                     return 'acted'
             return 'unrecognized'
         except BrowserInputInterrupted:
@@ -194,6 +266,7 @@ class BrowserSigninAssistant:
             from browser_login import BrowserSessionError
             if isinstance(error, BrowserSessionError):
                 self.interrupted = True
+                self.terminal = error.code not in ('BROWSER_LOGIN_INPUT_INTERRUPTED', 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
                 raise
             self.interrupted = True
             raise _error('BROWSER_LOGIN_INPUT_INTERRUPTED', '官网登录页面发生变化，已停止自动操作，请在官网继续。') from None

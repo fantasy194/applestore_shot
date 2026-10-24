@@ -1,4 +1,4 @@
-//! A task-bound bridge to the worker's private loopback screenshot/input broker.
+//! A task-bound bridge to the worker's private loopback frame-event/input broker.
 //! Neither the registration token nor raw broker errors leave this module.
 use crate::engine::Engine;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -103,10 +103,11 @@ fn input(params: &Value) -> Result<Value, String> {
         .as_str()
         .ok_or_else(|| INVALID_INPUT.to_owned())?;
     let allowed: &[&str] = match kind {
-        "click" => &["type", "x", "y", "sequence", "frame_sequence"],
-        "text" => &["type", "text", "sequence", "frame_sequence"],
-        "key" => &["type", "key", "sequence", "frame_sequence"],
-        "scroll" => &["type", "delta_x", "delta_y", "sequence", "frame_sequence"],
+        "click" => &["type", "x", "y", "sequence", "frame_sequence", "document_id"],
+        "text" => &["type", "text", "sequence", "frame_sequence", "document_id"],
+        "key" => &["type", "key", "sequence", "frame_sequence", "document_id"],
+        "scroll" => &["type", "delta_x", "delta_y", "sequence", "frame_sequence", "document_id"],
+        "signin" => &["type", "sequence", "frame_sequence", "document_id"],
         _ => return Err(INVALID_INPUT.into()),
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -124,6 +125,7 @@ fn input(params: &Value) -> Result<Value, String> {
         return Err(INVALID_INPUT.into());
     }
     let normalized: Result<Value, String> = match kind {
+        "signin" => Ok(json!({"type":"signin"})),
         "click" => Ok(
             json!({"type":"click", "x":number(params, "x", 0., 4096.)?, "y":number(params, "y", 0., 4096.)?}),
         ),
@@ -177,6 +179,10 @@ fn input(params: &Value) -> Result<Value, String> {
     };
     let mut normalized = normalized?;
     normalized["sequence"] = json!(sequence);
+    if let Some(document) = params.get("document_id") {
+        let document = document.as_str().filter(|value| value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit())).ok_or_else(|| INVALID_INPUT.to_owned())?;
+        normalized["document_id"] = json!(document);
+    }
     Ok(normalized)
 }
 
@@ -185,7 +191,7 @@ fn safe_status(value: Value) -> Result<Value, String> {
         .as_bool()
         .ok_or_else(|| INVALID_RESPONSE.to_owned())?;
     if !active {
-        return Ok(json!({"active":false,"frame":null,"url_host":""}));
+        return Ok(json!({"active":false,"frame":null,"url_host":"","connected":false,"frame_current":false,"frame_updated":true,"document_id":"","revision":0,"frame_age_ms":0}));
     }
     let mut result = Map::new();
     result.insert("active".into(), json!(true));
@@ -198,10 +204,30 @@ fn safe_status(value: Value) -> Result<Value, String> {
         return Err(INVALID_RESPONSE.into());
     }
     result.insert("url_host".into(), json!(host));
+    for name in ["connected", "frame_current", "frame_updated", "signin_available"] {
+        if let Some(value) = value[name].as_bool() { result.insert(name.into(), json!(value)); }
+    }
+    for name in ["revision", "frame_age_ms"] {
+        if let Some(value) = value[name].as_u64() { result.insert(name.into(), json!(value)); }
+    }
+    let document = value["document_id"].as_str().unwrap_or("");
+    if document.len() > 64 || !document.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(INVALID_RESPONSE.into());
+    }
+    result.insert("document_id".into(), json!(document));
+    if let Some(status) = value["signin_status"].as_str() {
+        // Only finite protocol states may leave the worker, never arbitrary errors.
+        if matches!(status, "" | "ready" | "running" | "working" | "unavailable" | "manual" | "submitted" | "verification" | "blocked" | "interrupted") {
+            result.insert("signin_status".into(), json!(status));
+        }
+    }
     let frame = &value["frame"];
     if frame.is_null() {
         result.insert("frame".into(), Value::Null);
     } else {
+        if !document.is_empty() && frame["document_id"].as_str() != Some(document) {
+            return Err(INVALID_RESPONSE.into());
+        }
         let data = frame["data_url"]
             .as_str()
             .ok_or_else(|| INVALID_RESPONSE.to_owned())?;
@@ -238,7 +264,7 @@ fn safe_status(value: Value) -> Result<Value, String> {
         let captured_at_ms = frame["captured_at_ms"]
             .as_u64()
             .ok_or_else(|| INVALID_RESPONSE.to_owned())?;
-        result.insert("frame".into(), json!({"data_url":data,"width":width,"height":height,"sequence":sequence,"captured_at_ms":captured_at_ms}));
+        result.insert("frame".into(), json!({"data_url":data,"width":width,"height":height,"sequence":sequence,"captured_at_ms":captured_at_ms,"document_id":document}));
     }
     Ok(Value::Object(result))
 }
@@ -254,7 +280,7 @@ pub async fn command(
     if !task_active(engine, account_id, task_id) {
         return Err(UNAVAILABLE.into());
     }
-    if !matches!(operation, "status" | "input") {
+    if !matches!(operation, "status" | "input" | "events") {
         return Err(INVALID_INPUT.into());
     }
     let body = if operation == "input" {
@@ -263,8 +289,8 @@ pub async fn command(
         None
     };
     let Some(record) = registration(&engine.root, account_id, task_id)? else {
-        return if operation == "status" {
-            Ok(json!({"active":false,"frame":null,"url_host":""}))
+        return if operation != "input" {
+            Ok(json!({"active":false,"frame":null,"url_host":"","connected":false,"frame_current":false,"frame_updated":true,"document_id":"","revision":0,"frame_age_ms":0}))
         } else {
             Err(UNAVAILABLE.into())
         };
@@ -274,19 +300,16 @@ pub async fn command(
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(if operation == "input" { 100 } else { 4 }))
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|_| UNAVAILABLE.to_owned())?;
-    let url = format!(
-        "http://127.0.0.1:{}/{}",
-        record.port,
-        if operation == "status" {
-            "status"
-        } else {
-            "input"
-        }
-    );
+    let endpoint = match operation {
+        "events" => format!("events?after={}", params["after"].as_u64().unwrap_or(0)),
+        "status" => "status".to_owned(),
+        _ => "input".to_owned(),
+    };
+    let url = format!("http://127.0.0.1:{}/{}", record.port, endpoint);
     let request = if let Some(body) = body {
         client
             .post(url)
@@ -325,7 +348,7 @@ pub async fn command(
         return Err(UNAVAILABLE.into());
     }
     let value: Value = serde_json::from_slice(&raw).map_err(|_| INVALID_RESPONSE.to_owned())?;
-    if operation == "status" {
+    if operation != "input" {
         safe_status(value)
     } else if value["accepted"] == true {
         crate::activity::append(&engine.root, "browser_remote_input", &json!({
@@ -339,7 +362,7 @@ pub async fn command(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::{private_json, TaskHost};
     use std::{path::PathBuf, sync::Arc};
@@ -392,10 +415,26 @@ mod tests {
         assert!(safe_status(invalid).is_err());
         let inactive =
             safe_status(json!({"active":false,"error":"SECRET","token":"SECRET"})).unwrap();
-        assert_eq!(inactive, json!({"active":false,"frame":null,"url_host":""}));
+        assert_eq!(inactive["active"], false);
+        assert_eq!(inactive["connected"], false);
     }
 
-    async fn task(root: &Path) -> (Arc<Engine>, String, String) {
+    #[test]
+    fn live_metadata_and_signin_are_bounded_without_exposing_arbitrary_messages() {
+        let document = "a".repeat(32);
+        assert_eq!(input(&json!({"type":"signin","sequence":7,"document_id":document})).unwrap(),
+            json!({"type":"signin","sequence":7,"document_id":document}));
+        assert!(input(&json!({"type":"signin","sequence":7,"password":"SECRET"})).is_err());
+        assert!(input(&json!({"type":"signin","sequence":7,"document_id":"INVALID"})).is_err());
+        let output = safe_status(json!({"active":true,"frame":null,"connected":true,"frame_current":true,
+            "frame_updated":false,"revision":9,"frame_age_ms":60000,"document_id":document,
+            "signin_status":"SECRET", "signin_available":true})).unwrap();
+        assert_eq!(output["frame_age_ms"],60000);
+        assert_eq!(output["frame_updated"],false);
+        assert!(!output.to_string().contains("SECRET"));
+    }
+
+    pub(crate) async fn task(root: &Path) -> (Arc<Engine>, String, String) {
         let engine = Engine::new(root.into()).unwrap();
         let account = engine
             .add_account("browser-fixture@example.test".into())
