@@ -15,13 +15,23 @@ fn default_enabled() -> bool { true }
 fn default_interval() -> u32 { 10 }
 fn warm_mode() -> String { "idle_warm_login".into() }
 fn default_flow() -> String { "login".into() }
-fn valid_flow(flow: &str) -> bool { matches!(flow, "login" | "pickup_prepare") }
+fn valid_flow(flow: &str) -> bool { matches!(flow, "login" | "pickup_prepare" | "browser_login") }
 fn flow_label(flow: &str) -> &'static str {
-    if flow == "pickup_prepare" { "提前准备自提（不下单）" } else { "预热登录（不加购）" }
+    match flow { "pickup_prepare" => "提前准备自提（不下单）", "browser_login" => "官网登录恢复（保留账号）", _ => "预热登录（不加购）" }
 }
 fn configure_flow(settings: &mut Settings, value: &Value, current: u64) -> Result<(), String> {
     let flow = value.as_str().filter(|flow| valid_flow(flow)).ok_or("预热流程无效")?;
-    if settings.flow != flow { settings.enabled_at_ms = current; settings.flow = flow.into(); }
+    if settings.flow != flow {
+        settings.enabled_at_ms = current;
+        settings.flow = flow.into();
+        if flow == "browser_login" {
+            // A deliberate change to recovery authorizes one background attempt.
+            // Keep cooldown/markers; saving the same flow cannot re-arm a refusal.
+            for run in &mut settings.last_runs {
+                if run.status != "running" { run.requires_login = false; }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -389,6 +399,41 @@ mod tests {
         assert!(error.is_none());
         assert_eq!(loaded.flow, "pickup_prepare");
         assert_eq!(loaded.last_runs[0].flow, "login");
+    }
+
+    #[test]
+    fn choosing_browser_recovery_arms_once_without_clearing_cooldown_or_active_runs() {
+        let mut settings = Settings::default();
+        settings.last_runs.push(Run { flow: "login".into(), account_id: "fixture".into(), preparation_stage: None,
+            order_ready: false, status: "blocked".into(), last_checked_at_ms: 10, last_warm_at_ms: 20,
+            next_check_at_ms: 3_600_000, message: "fixture".into(), requires_login: true,
+            cooldown_until_ms: 3_600_000, task_id: None });
+        let mut active = settings.last_runs[0].clone();
+        active.account_id = "busy".into(); active.status = "running".into();
+        settings.last_runs.push(active);
+        configure_flow(&mut settings, &json!("browser_login"), 1000).unwrap();
+        assert!(!settings.last_runs[0].requires_login);
+        assert_eq!(settings.last_runs[0].cooldown_until_ms, 3_600_000);
+        assert_eq!(settings.last_runs[0].status, "blocked");
+        assert!(settings.last_runs[1].requires_login);
+        settings.last_runs[0].requires_login = true; // This attempt needs a human.
+        configure_flow(&mut settings, &json!("browser_login"), 2000).unwrap();
+        assert!(settings.last_runs[0].requires_login);
+        assert_eq!(settings.enabled_at_ms, 1000);
+    }
+
+    #[test]
+    fn browser_login_flow_persists_without_changing_legacy_default() {
+        assert_eq!(Settings::default().flow, "login");
+        let mut settings = Settings::default();
+        configure_flow(&mut settings, &json!("browser_login"), 1234).unwrap();
+        assert_eq!(flow_label(&settings.flow), "官网登录恢复（保留账号）");
+        let directory = tempfile::tempdir().unwrap();
+        save(directory.path(), &settings).unwrap();
+        let (loaded, error) = load(directory.path());
+        assert!(error.is_none());
+        assert_eq!(loaded.flow, "browser_login");
+        assert_eq!(loaded.enabled_at_ms, 1234);
     }
 
     #[test]

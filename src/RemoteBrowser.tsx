@@ -301,17 +301,24 @@ export function RemoteBrowser({
     const selectedTask = task.id;
     const selectedContext = contextKey;
     try {
-      await browser(task.account_id, selectedTask, "input", {
+      const result = await browser(task.account_id, selectedTask, "input", {
         ...params,
         sequence: frame.sequence,
         ...(frame.document_id ? { document_id: frame.document_id } : {}),
       });
-      if (mounted.current && currentContext.current === selectedContext)
+      if (mounted.current && currentContext.current === selectedContext) {
+        if (result.accepted === false)
+          setInputError(
+            result.outcome === "rejected"
+              ? "页面已变化，操作未执行；请等待新画面后重试。"
+              : "操作结果未确认，请先查看官网画面，避免重复发送；输入内容未保留。",
+          );
         pollNow.current();
+      }
     } catch {
       if (mounted.current && currentContext.current === selectedContext)
         setInputError(
-          "操作未送达官网窗口，请等待画面更新后重试；输入内容未保留。",
+          "操作结果未确认，请先查看官网画面，避免重复发送；输入内容未保留。",
         );
     } finally {
       if (mounted.current && currentContext.current === selectedContext) {

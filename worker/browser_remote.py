@@ -128,7 +128,7 @@ class BrowserRemote:
                     payload = json.loads(self.rfile.read(size))
                     broker.validate(payload)
                     command = {'payload': payload, 'deadline': time.monotonic() + 3,
-                               'finished': threading.Event(), 'accepted': False}
+                               'finished': threading.Event(), 'accepted': False, 'started': False}
                     broker.commands.put_nowait(command)
                 except (ValueError, TypeError, queue.Full):
                     self.reply(400, {'error': '浏览器输入无效或等待队列已满。'})
@@ -136,7 +136,8 @@ class BrowserRemote:
                 command['finished'].wait(95)
                 self.reply(200 if command['accepted'] else 409,
                            {'accepted': True} if command['accepted'] else
-                           {'error': '页面已变化或输入已过期，请刷新预览后重试。'})
+                           {'error': '页面已变化或输入已过期，请刷新预览后重试。',
+                            'outcome': 'unknown' if command.get('started') else 'rejected'})
 
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.server.daemon_threads = True
@@ -237,7 +238,7 @@ class BrowserRemote:
                 with sync_playwright() as playwright:
                     browser = connect_browser(playwright.chromium, None, port, checkpoint=checkpoint)
                     health = browser.new_browser_cdp_session()
-                    failures = 0
+                    failure_since = None
                     while self.active:
                         checkpoint()
                         if not browser.is_connected():
@@ -250,15 +251,16 @@ class BrowserRemote:
                             try:
                                 self.tick(chosen)
                                 chosen.wait_for_timeout(100)
-                                failures = 0
+                                failure_since = None
                             except Cancelled:
                                 raise
                             except Exception:
-                                failures += 1
+                                if failure_since is None:
+                                    failure_since = time.monotonic()
                                 with self.changed:
                                     self.page = None
                                     self._clear_page()
-                                if failures >= 3:
+                                if time.monotonic() - failure_since >= 10:
                                     raise
                                 # Reattach the selected page after popup/navigation races.
                                 # Prior document frames and queued inputs stay invalid.
@@ -451,10 +453,12 @@ class BrowserRemote:
                     if not 0 <= payload['x'] < frame['width'] or not 0 <= payload['y'] < frame['height']:
                         continue
                     from browser_input import interaction_delay
+                    command['started'] = True
                     page.mouse.click(payload['x'], payload['y'], delay=interaction_delay())
                 elif kind == 'text':
                     from browser_input import type_keyboard_text
                     generation = self.document_id
+                    command['started'] = True
                     def checkpoint():
                         self.service.channel.checkpoint()
                         self._flush_acks()
@@ -466,11 +470,14 @@ class BrowserRemote:
                 elif kind == 'signin':
                     if not self.signin_available:
                         continue
+                    command['started'] = True
                     self.signin_request.set()
                 elif kind == 'key':
                     from browser_input import interaction_delay
+                    command['started'] = True
                     page.keyboard.press('ControlOrMeta+A' if payload['key'] == 'Control+A' else payload['key'], delay=interaction_delay())
                 elif kind == 'scroll':
+                    command['started'] = True
                     page.mouse.wheel(payload.get('delta_x', 0), payload.get('delta_y', 0))
                 command['accepted'] = True
             except Exception:

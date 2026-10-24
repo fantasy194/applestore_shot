@@ -318,3 +318,57 @@ test("空闲预热可选择自提准备，运行中仍显示原流程且不自�
   ).toEqual({ flow: "pickup_prepare", interval_minutes: 10 });
   expect(calls.some((call) => call.path === "/api/start_task")).toBe(false);
 });
+
+test("空闲预热可选择官网登录恢复，保存后重载保留且不直接启动登录", async ({
+  page,
+}) => {
+  const calls = await fixture(page, true, {
+    enabled: true,
+    flow: "login",
+    interval_minutes: 10,
+    last_runs: [{ account_id: "a", remaining_seconds: 600 }],
+  });
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const panel = page.getByRole("region", { name: "空闲预热", exact: true });
+  const select = panel.getByRole("combobox", { name: "预热流程", exact: true });
+  await chooseOption(select, "官网登录恢复（保留账号）");
+  await expect(select).toHaveText("官网登录恢复（保留账号）");
+  await expect(panel).toContainText("保留账号和浏览器登录资料");
+  await expect(panel).toContainText("不加购、不下单");
+  expect(
+    calls
+      .filter(
+        (call) =>
+          call.path === "/api/maintenance_command" &&
+          call.body.operation === "configure",
+      )
+      .map((call) => call.body.params),
+  ).toEqual([{ flow: "browser_login", interval_minutes: 10 }]);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(select).toHaveText("官网登录恢复（保留账号）");
+  expect(calls.some((call) => call.path === "/api/start_task")).toBe(false);
+});
+
+test("官网登录恢复执行中切换流程，仍显示实际恢复任务", async ({ page }) => {
+  const calls = await fixture(page, true, {
+    enabled: true,
+    flow: "browser_login",
+    interval_minutes: 10,
+    last_runs: [
+      { account_id: "a", status: "running", flow: "browser_login", busy: true },
+    ],
+  });
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const panel = page.getByRole("region", { name: "空闲预热", exact: true });
+  await expect(panel.getByRole("status")).toHaveText(
+    "正在恢复官网登录，不加购",
+  );
+  await chooseOption(
+    panel.getByRole("combobox", { name: "预热流程", exact: true }),
+    "预热登录（不加购）",
+  );
+  await expect(panel.getByRole("status")).toHaveText(
+    "正在恢复官网登录，不加购",
+  );
+  expect(calls.some((call) => call.path === "/api/start_task")).toBe(false);
+});

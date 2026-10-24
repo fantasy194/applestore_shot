@@ -201,6 +201,32 @@ class BrowserRemoteTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         return result[0]
 
+    def test_partial_input_failure_is_uncertain_but_stale_input_is_rejected(self):
+        with BrowserRemote(self.service) as broker:
+            broker.tick(self.page)
+            self.page.mouse.click.side_effect = RuntimeError('synthetic interrupted dispatch')
+            code, result = self.input_and_tick(broker, {'type': 'click', 'x': 40, 'y': 50, 'sequence': broker.sequence})
+            self.assertEqual(code, 409)
+            self.assertEqual(result['outcome'], 'unknown')
+            code, result = self.input_and_tick(broker, {'type': 'click', 'x': 40, 'y': 50, 'sequence': 0})
+            self.assertEqual(code, 409)
+            self.assertEqual(result['outcome'], 'rejected')
+            self.assertEqual(self.page.mouse.click.call_count, 1)
+
+    def test_transient_navigation_races_do_not_permanently_end_preview_after_three_ticks(self):
+        browser = Mock(contexts=[SimpleNamespace(pages=[self.page])])
+        browser.is_connected.return_value = True
+        with patch('playwright.sync_api.sync_playwright', return_value=nullcontext(Mock())), \
+                patch('browser_remote.connect_browser', return_value=browser), \
+                patch('browser_login.pending_auth_page', return_value=False):
+            with BrowserRemote(self.service) as broker:
+                broker.tick = Mock(side_effect=[RuntimeError('navigation')] * 3 + [Cancelled()])
+                broker.attach_cdp(12345)
+                broker.controller.join(timeout=3)
+                self.assertFalse(broker.controller.is_alive())
+                self.assertEqual(broker.tick.call_count, 4)
+                self.service.stage.assert_not_called()
+
     def test_frames_are_transient_and_bearer_protected(self):
         with BrowserRemote(self.service) as broker:
             broker.tick(self.page)

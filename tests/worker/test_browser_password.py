@@ -71,6 +71,90 @@ class BrowserPasswordTests(unittest.TestCase):
         self.vault.get.assert_not_called()
         self.channel.prompt.assert_not_called()
 
+    def test_real_network_observer_invalidates_only_password_completion_not_otp_or_541(self):
+        import browser_login
+        for path, status, invalidated in [('/appleauth/auth/signin/complete', 401, True),
+                                          ('/appleauth/auth/verify/trusteddevice/securitycode', 400, False),
+                                          ('/shop/signIn/idms/authx', 541, False)]:
+            with self.subTest(path=path, status=status):
+                self.service.password_rejected = False
+                self.service.password = 'private-fixture'
+                self.channel.emit.reset_mock()
+                context = Mock()
+                network = browser_login.observe_login_network(context, self.service)
+                callbacks = {call.args[0]: call.args[1] for call in context.on.call_args_list}
+                request = Mock(url='https://idmsa.apple.com.cn' + path)
+                callbacks['request'](request)
+                callbacks['response'](Mock(request=request, status=status))
+                process = Mock()
+                process.poll.return_value = None
+                with self.assertRaises((browser_login.BrowserSessionError, ValueError)):
+                    browser_login.wait_for_account_page(Mock(), process, self.service, 1, network, headless=True)
+                self.assertEqual(self.service.password_rejected, invalidated)
+                if invalidated:
+                    self.channel.emit.assert_called_once_with('credential_rejected')
+                else:
+                    self.channel.emit.assert_not_called()
+
+    def test_rejected_credential_does_not_reload_stale_vault_password(self):
+        self.service.password = 'private-rejected-fixture'
+        self.vault.get.return_value = 'private-rejected-fixture'
+        self.service.reject_password()
+        self.assertIsNone(self.service.browser_password(allow_prompt=False))
+        self.vault.get.assert_not_called()
+        self.channel.emit.assert_called_once_with('credential_rejected')
+        self.channel.prompt.return_value = {'password': 'private-replacement', 'remember': False}
+        self.assertEqual(self.service.browser_password(allow_prompt=True), 'private-replacement')
+        self.assertFalse(self.service.password_rejected)
+
+    def test_actual_checkout_wrapper_propagates_structured_password_rejection(self):
+        import requests
+        from apple_login import LoginError
+        from types import SimpleNamespace
+        self.service.ensure_auth_file()
+        self.service.password = 'private-checkout-fixture'
+        with requests.Session() as session:
+            flow = SimpleNamespace(session=session,url='https://secure8.www.apple.com.cn/shop/signIn',page_response=Mock())
+            client = Mock()
+            client.login.side_effect = LoginError('private fixture',status=401,codes=['-20101'])
+            with patch('apple_login.AppleStoreLogin',return_value=client), patch('requests.Session.send',side_effect=AssertionError('network forbidden')):
+                try:
+                    duo_killer.reauthenticate_checkout(flow)
+                except ValueError as error:
+                    self.assertIsInstance(error.__cause__,LoginError)
+                    self.service.cleanup_credentials(error)
+                else:
+                    self.fail('expected checkout authentication rejection')
+        self.assertTrue(self.service.password_rejected)
+        self.channel.emit.assert_called_once_with('credential_rejected')
+
+    def test_wrapped_srp_rejection_uses_structured_cause_and_preserves_541(self):
+        from apple_login import LoginError
+        for status, codes, rejected in [(401, ['-20101'], True),(541, [], False),(401, ['other'], False)]:
+            with self.subTest(status=status, codes=codes):
+                self.channel.emit.reset_mock()
+                self.service.password_rejected = False
+                try:
+                    try:
+                        raise LoginError('private fixture', status=status, codes=codes)
+                    except LoginError as error:
+                        raise ValueError('public wrapper') from error
+                except ValueError as error:
+                    self.service.cleanup_credentials(error)
+                self.assertEqual(self.service.password_rejected,rejected)
+
+    def test_541_preserves_cached_password_but_explicit_rejection_invalidates(self):
+        from browser_login import BrowserSessionError
+        for code, status, rejected in [('APPLE_SESSION_BLOCKED', 'blocked', False),
+                                       ('BROWSER_LOGIN_AUTHENTICATION_FAILED', 'requires_login', True)]:
+            with self.subTest(code=code):
+                self.channel.emit.reset_mock()
+                self.service.password_rejected = False
+                self.service.cleanup_credentials(BrowserSessionError(code, 'fixture', status=status))
+                self.assertEqual(self.service.password_rejected, rejected)
+                if not rejected:
+                    self.channel.emit.assert_not_called()
+
     def test_parallel_child_cannot_authenticate_or_read_the_parent_password(self):
         from browser_login import BrowserSessionError
         self.service._parallel_child = True

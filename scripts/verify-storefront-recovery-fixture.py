@@ -55,7 +55,7 @@ class Fixture:
         self.cooldown = self.root / 'session-maintenance.json'
         self.cooldown.write_text('fixture-cooldown', encoding='utf-8')
         self.service = SimpleNamespace(root=self.root, auth=self.auth, account=OWNER,
-            headless_browser=mode == 'maintenance', channel=SimpleNamespace(checkpoint=lambda: None),
+            headless_browser=mode in ('maintenance', 'background_recovery', 'background_blocked'), channel=SimpleNamespace(checkpoint=lambda: None),
             stage=lambda *args, **kwargs: None)
         self.executable = str(find_browser())
         self.processes = []
@@ -82,7 +82,7 @@ class Fixture:
             return
         if request.is_navigation_request():
             self.navigations.append((request.method, host, path))
-        if self.mode == 'blocked':
+        if self.mode in ('blocked', 'background_blocked'):
             route.fulfill(status=541, content_type='text/html', body='<html>Local fixture denial</html>')
             return
         if request.method == 'GET' and path in ('/', '/shop/bag'):
@@ -143,7 +143,7 @@ class Fixture:
             require(not any(str(arg).startswith(('http://', 'https://')) for arg in args),
                     'Production Chrome started navigation before interception')
             require('--no-sandbox' not in args, 'Fixture must keep the browser sandbox')
-            if self.mode == 'maintenance':
+            if self.mode in ('maintenance', 'background_recovery', 'background_blocked'):
                 require('--headless=new' in args, 'Automatic maintenance must select headless before fixture instrumentation')
             self.launches.append(list(args))
             protected = [*args, '--no-proxy-server', '--disable-background-networking',
@@ -191,7 +191,8 @@ class Fixture:
             with self.instrument():
                 try:
                     result = browser_login.login_in_browser(self.service, timeout=15,
-                        maintenance=self.mode == 'maintenance')
+                        maintenance=self.mode in ('maintenance', 'background_recovery', 'background_blocked'),
+                        recover=self.mode in ('background_recovery', 'background_blocked'))
                 except browser_login.BrowserSessionError as caught:
                     error = caught
             require(self.connections == 1, 'No real CDP connection was made')
@@ -200,7 +201,7 @@ class Fixture:
             require(hashlib.sha256(self.auth.read_bytes()).hexdigest() == self.auth_digest,
                     'Fixture import unexpectedly overwrote the auth file')
             require(self.sentinel.read_text(encoding='utf-8') == 'preserve', 'Profile was replaced')
-            if self.mode == 'blocked':
+            if self.mode in ('blocked', 'background_blocked'):
                 require(error is not None and error.http_status == 541, 'HTTP 541 was not retained')
                 require(self.marker.exists() and self.cooldown.exists(), 'Failed recovery removed markers')
                 require(not self.imports and len(self.navigations) == 1, 'Blocked recovery retried or imported')
@@ -208,7 +209,7 @@ class Fixture:
                 require(error is None and result.get('logged_in') is True, 'Fixture login did not complete')
                 require(len(self.imports) == 1 and len(self.account_requests) == 1, 'Account was not verified exactly once')
                 require(not self.marker.exists() and not self.cooldown.exists(), 'Verified success retained recovery markers')
-                if self.mode == 'manual':
+                if self.mode in ('manual', 'background_recovery'):
                     require(len(self.menu_requests) == len(self.signin_requests) == len(self.authx_requests) == 1,
                             'Manual recovery did not follow one current menu/authx transaction')
                     require(self.account_requests[0][0] == 'secure8.www.apple.com.cn', 'Account verification changed the dynamic host')
@@ -223,7 +224,8 @@ class Fixture:
                     require([path for _, _, path in self.navigations] == ['/', '/shop/bag', '/shop/account/home'],
                             'Maintenance skipped the browser context refresh')
             return {'scenario': self.mode, 'actual_chrome_cdp': True,
-                'production_manual_branch': self.mode != 'maintenance', 'fixture_forced_headless': True,
+                'production_manual_branch': self.mode in ('manual', 'blocked'), 'fixture_forced_headless': self.mode in ('manual', 'blocked'),
+                'production_background_recovery': self.mode in ('background_recovery', 'background_blocked'),
                 'navigation_paths': [path for _, _, path in self.navigations],
                 'menu_fetch_count': len(self.menu_requests), 'signin_count': len(self.signin_requests),
                 'authx_count': len(self.authx_requests), 'account_verification_count': len(self.account_requests),
@@ -240,7 +242,7 @@ class Fixture:
 
 def main():
     with tempfile.TemporaryDirectory(prefix='storefront-recovery-fixture-') as directory:
-        cases = [Fixture(Path(directory), mode).run() for mode in ('manual', 'maintenance', 'blocked')]
+        cases = [Fixture(Path(directory), mode).run() for mode in ('manual', 'maintenance', 'blocked', 'background_recovery', 'background_blocked')]
     report = {'success': True, 'scope': 'isolated local browser fixture; synthetic session import; no real Apple service',
               'python_http_forbidden': True, 'browser_routes_intercepted': True,
               'browser_dns_disabled': True, 'platform': platform.system(), 'architecture': platform.machine(),

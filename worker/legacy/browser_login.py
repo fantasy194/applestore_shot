@@ -49,7 +49,7 @@ def signin_page(url):
 
 def observe_login_network(context, service):
     state = {'pending': {}, 'error': None, 'last_activity': time.monotonic(), 'blocked_status': None,
-             'authentication_failed': False}
+             'authentication_failed': False, 'credential_rejected': False}
 
     def phase(request):
         parsed = urlsplit(request.url)
@@ -76,6 +76,10 @@ def observe_login_network(context, service):
                 state['blocked_status'] = response.status
             elif response.status in (400, 401):
                 state['authentication_failed'] = True
+                # OTP/trust/callback rejection does not prove that the password
+                # was refused. Only the actual password completion invalidates it.
+                if urlsplit(response.request.url).path == '/appleauth/auth/signin/complete':
+                    state['credential_rejected'] = True
                 state['error'] = f'官网浏览器的{name}未通过；本次未自动重新提交。'
             elif response.status < 400 and state.get('blocked_status') not in (403, 429, 541):
                 state['error'], state['blocked_status'] = None, None
@@ -245,7 +249,9 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
         if process.poll() is not None:
             raise ValueError('官网登录窗口已关闭，未完成会话导入。')
         if network.get('authentication_failed'):
-            raise BrowserSessionError('BROWSER_LOGIN_REJECTED',
+            if network.get('credential_rejected'):
+                service.reject_password()
+            raise BrowserSessionError('BROWSER_LOGIN_AUTHENTICATION_FAILED' if network.get('credential_rejected') else 'BROWSER_LOGIN_REJECTED',
                 '官网未接受本次认证，请核对登录信息后手动重试；账号和保存密码已保留。',
                 status='requires_login', requires_login=True,
                 browser_started=True, browser_connected=True)
@@ -445,7 +451,7 @@ def seed_missing_session(context, service):
         context.add_cookies(selected)
 
 
-def login_in_browser(service, timeout=300, *, maintenance=False):
+def login_in_browser(service, timeout=300, *, maintenance=False, recover=False):
     from browser_cdp import BrowserConnectError, connect_browser
     from playwright.sync_api import sync_playwright, Error as BrowserError, TimeoutError as BrowserTimeout
     from apple_login import HOME, browser_profile_path
@@ -453,7 +459,7 @@ def login_in_browser(service, timeout=300, *, maintenance=False):
     headless = getattr(service, 'headless_browser', False) is True
 
     profile = browser_profile_path(service.auth)
-    if (maintenance or headless) and (profile / '.authx-541').exists():
+    if (maintenance or headless) and not recover and (profile / '.authx-541').exists():
         raise BrowserSessionError('APPLE_SESSION_BLOCKED',
             '商城会话需要官网登录恢复；账号和浏览器资料已保留，未自动重新认证。',
             status='blocked', requires_login=True, http_status=541)
@@ -509,7 +515,7 @@ def login_in_browser(service, timeout=300, *, maintenance=False):
                 from browser_remote import remote_context
                 with (nullcontext(None) if headless else remote_context(service, port)) as remote:
                     account_url = None
-                    if maintenance or headless:
+                    if (maintenance or headless) and not recover:
                         seed_missing_session(browser.contexts[0], service)
                         context = browser.contexts[0]
                         page = context.pages[-1] if context.pages else context.new_page()

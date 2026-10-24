@@ -139,6 +139,8 @@ async function fixture(page: Page, delay = 40, pending = false) {
               );
             if (state.failInput)
               throw new Error("private-input-error-must-not-appear");
+            if (state.inputOutcome)
+              return { accepted: false, outcome: state.inputOutcome };
             return { ok: true };
           }
           const sequence = ++state.statusCalls;
@@ -399,10 +401,10 @@ test("慢请求不会重叠且输入错误可见并不显示私密错误正文",
   });
   await field.fill("fixture-secret");
   await page.getByRole("button", { name: "发送输入", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("操作未送达官网窗口");
+  await expect(page.getByRole("alert")).toContainText("操作结果未确认");
   await expect(field).toHaveValue("");
   await page.waitForTimeout(2200);
-  await expect(page.getByRole("alert")).toContainText("操作未送达官网窗口");
+  await expect(page.getByRole("alert")).toContainText("操作结果未确认");
   await expect(page.locator("body")).not.toContainText(
     "private-input-error-must-not-appear",
   );
@@ -845,4 +847,28 @@ test("实时窗口手机与桌面布局截图", async ({ page }) => {
     .getByRole("button", { name: "空格", exact: true })
     .evaluate((el) => el.getBoundingClientRect().height);
   expect(height).toBeGreaterThanOrEqual(44);
+});
+
+test("官网操作在执行前拒绝与执行结果未知使用不同提示且不自动重发", async ({
+  page,
+}) => {
+  await fixture(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const key = page.getByRole("button", { name: "回车", exact: true });
+  await expect(key).toBeEnabled();
+  await page.evaluate(
+    () => ((window as any).remoteState.inputOutcome = "rejected"),
+  );
+  await key.click();
+  await expect(page.getByRole("alert")).toContainText("操作未执行");
+  await page.evaluate(
+    () => ((window as any).remoteState.inputOutcome = "unknown"),
+  );
+  await key.click();
+  await expect(page.getByRole("alert")).toContainText("操作结果未确认");
+  await expect(page.getByRole("alert")).toContainText("避免重复发送");
+  await page.waitForTimeout(1000);
+  expect(await page.evaluate(() => (window as any).remoteInputs.length)).toBe(
+    2,
+  );
 });

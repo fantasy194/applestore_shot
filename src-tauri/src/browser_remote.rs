@@ -323,7 +323,8 @@ pub async fn command(
         .send()
         .await
         .map_err(|_| UNAVAILABLE.to_owned())?;
-    if !response.status().is_success() {
+    let rejected_input = operation == "input" && response.status() == reqwest::StatusCode::CONFLICT;
+    if !response.status().is_success() && !rejected_input {
         return Err(INVALID_RESPONSE.into());
     }
     if response
@@ -348,6 +349,12 @@ pub async fn command(
         return Err(UNAVAILABLE.into());
     }
     let value: Value = serde_json::from_slice(&raw).map_err(|_| INVALID_RESPONSE.to_owned())?;
+    if rejected_input {
+        // Only a command rejected before executing is safe to repeat. A CDP
+        // error after typing/clicking began is explicitly uncertain.
+        return Ok(json!({"accepted":false,"outcome":
+            if value["outcome"] == "rejected" { "rejected" } else { "unknown" }}));
+    }
     if operation != "input" {
         safe_status(value)
     } else if value["accepted"] == true {
@@ -562,6 +569,25 @@ pub(crate) mod tests {
         assert!(command(&engine, &account, &task, "status", &json!({}))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_input_and_uncertain_dispatch_are_distinct_and_sanitized() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (engine, account, task) = task(temporary.path()).await;
+        for (raw, expected) in [
+            (json!({"outcome":"rejected","error":"SECRET"}), "rejected"),
+            (json!({"outcome":"unknown","error":"SECRET"}), "unknown"),
+            (json!({"error":"SECRET"}), "unknown"),
+        ] {
+            let (port, request) = broker(raw.to_string(), "409 Conflict", "").await;
+            register(temporary.path(), &account, &task, port);
+            let result = command(&engine, &account, &task, "input",
+                &json!({"type":"key","key":"Enter","sequence":7})).await.unwrap();
+            assert_eq!(result, json!({"accepted":false,"outcome":expected}));
+            request.await.unwrap();
+        }
+        engine.cancel(&account, &task).unwrap();
     }
 
     #[tokio::test]

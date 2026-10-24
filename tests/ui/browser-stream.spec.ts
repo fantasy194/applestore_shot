@@ -200,3 +200,218 @@ test("桌面与Web消费相同增量状态且清理后丢弃迟到结果", async
     0, 1,
   ]);
 });
+
+test("代理拒绝WebSocket后降级同一增量事件且清理中止HTTP读取", async ({
+  page,
+}) => {
+  await page.goto("/transport-fixture", { waitUntil: "domcontentloaded" });
+  await page.evaluate(async () => {
+    const root = window as any;
+    root.fallbackSockets = [];
+    root.fallbackReads = [];
+    root.fallbackReadTimes = [];
+    root.fallbackStatuses = [];
+    const originalFetch = window.fetch;
+    window.fetch = async (input, init) =>
+      String(input) === "/api/browser-stream-session"
+        ? new Response(null, { status: 204 })
+        : originalFetch(input, init);
+    root.WebSocket = class {
+      onclose: any;
+      close() {}
+      constructor() {
+        root.fallbackSockets.push(this);
+      }
+    };
+    const path = "/src/browser-stream.ts";
+    const { connectBrowserStream } = await import(/* @vite-ignore */ path);
+    root.stopFallback = connectBrowserStream(
+      "account",
+      "task",
+      (status: any) => root.fallbackStatuses.push(status),
+      () => {},
+      async (after: number, signal: AbortSignal) => {
+        root.fallbackReads.push(after);
+        root.fallbackReadTimes.push(performance.now());
+        if (after === 0)
+          return {
+            active: true,
+            revision: 7,
+            frame_updated: true,
+            frame: { sequence: 7 },
+          };
+        root.pendingFallbackSignal = signal;
+        await new Promise<void>((resolve) => {
+          root.releaseFallback = resolve;
+        });
+        return { active: true, revision: 8, frame_updated: false, frame: null };
+      },
+    );
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fallbackSockets.length))
+    .toBe(1);
+  await page.evaluate(() => {
+    const socket = (window as any).fallbackSockets[0];
+    // One initial status must not hide repeatedly failing upgraded streams.
+    socket.onmessage({
+      data: JSON.stringify({
+        active: true,
+        connected: true,
+        frame_current: true,
+        frame_updated: false,
+        revision: 1,
+      }),
+    });
+    socket.onclose();
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fallbackSockets.length))
+    .toBe(2);
+  await page.evaluate(() => (window as any).fallbackSockets[1].onclose());
+  await expect
+    .poll(() => page.evaluate(() => (window as any).fallbackReads))
+    .toEqual([0, 7]);
+  await page.evaluate(() => {
+    const root = window as any;
+    window.dispatchEvent(new Event("focus"));
+    root.stopFallback();
+    root.releaseFallback();
+  });
+  await page.waitForTimeout(100);
+  expect(
+    await page.evaluate(() => (window as any).pendingFallbackSignal.aborted),
+  ).toBe(true);
+  expect(
+    await page.evaluate(() => (window as any).fallbackSockets.length),
+  ).toBe(2);
+  expect(
+    await page.evaluate(() =>
+      (window as any).fallbackStatuses.map((status: any) => status.revision),
+    ),
+  ).toEqual([1, 7]);
+  expect(
+    await page.evaluate(() => {
+      const times = (window as any).fallbackReadTimes;
+      return times[1] - times[0];
+    }),
+  ).toBeGreaterThanOrEqual(90);
+});
+
+test("聚焦输入控件保留健康实时连接", async ({ page }) => {
+  await page.goto("/transport-fixture", { waitUntil: "domcontentloaded" });
+  await page.evaluate(async () => {
+    const root = window as any;
+    root.focusSockets = [];
+    const originalFetch = window.fetch;
+    window.fetch = async (input, init) =>
+      String(input) === "/api/browser-stream-session"
+        ? new Response(null, { status: 204 })
+        : originalFetch(input, init);
+    root.WebSocket = class {
+      onmessage: any;
+      closed = false;
+      constructor() {
+        root.focusSockets.push(this);
+      }
+      close() {
+        this.closed = true;
+      }
+    };
+    const path = "/src/browser-stream.ts";
+    const { connectBrowserStream } = await import(/* @vite-ignore */ path);
+    root.stopFocusStream = connectBrowserStream(
+      "account",
+      "task",
+      () => {},
+      () => {},
+    );
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).focusSockets.length))
+    .toBe(1);
+  await page.evaluate(() => {
+    const root = window as any;
+    root.focusSockets[0].onmessage({
+      data: JSON.stringify({
+        active: true,
+        connected: true,
+        frame_current: true,
+        frame_updated: false,
+        revision: 1,
+      }),
+    });
+    window.dispatchEvent(new Event("focus"));
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await page.waitForTimeout(100);
+  expect(await page.evaluate(() => (window as any).focusSockets.length)).toBe(
+    1,
+  );
+  expect(
+    await page.evaluate(() => (window as any).focusSockets[0].closed),
+  ).toBe(false);
+  await page.evaluate(() => (window as any).stopFocusStream());
+});
+
+test("慢代理六秒状态空窗暂停期间不反复拆连接，十五秒后才重建", async ({
+  page,
+}) => {
+  await page.goto("/transport-fixture", { waitUntil: "domcontentloaded" });
+  await page.clock.install();
+  await page.evaluate(async () => {
+    const root = window as any;
+    root.slowSockets = [];
+    const originalFetch = window.fetch;
+    window.fetch = async (input, init) =>
+      String(input) === "/api/browser-stream-session"
+        ? new Response(null, { status: 204 })
+        : originalFetch(input, init);
+    root.WebSocket = class {
+      onmessage: any;
+      closed = false;
+      constructor() {
+        root.slowSockets.push(this);
+      }
+      close() {
+        this.closed = true;
+      }
+    };
+    const path = "/src/browser-stream.ts";
+    const { connectBrowserStream } = await import(/* @vite-ignore */ path);
+    root.stopSlowStream = connectBrowserStream(
+      "account",
+      "task",
+      () => {},
+      () => {},
+    );
+  });
+  await expect
+    .poll(() => page.evaluate(() => (window as any).slowSockets.length))
+    .toBe(1);
+  await page.clock.fastForward(6000);
+  expect(await page.evaluate(() => (window as any).slowSockets[0].closed)).toBe(
+    false,
+  );
+  await page.evaluate(() =>
+    (window as any).slowSockets[0].onmessage({
+      data: JSON.stringify({
+        active: true,
+        connected: true,
+        frame_current: true,
+        frame_updated: false,
+        revision: 1,
+      }),
+    }),
+  );
+  await page.clock.fastForward(15000);
+  expect(await page.evaluate(() => (window as any).slowSockets[0].closed)).toBe(
+    false,
+  );
+  await page.clock.fastForward(2000);
+  await page.clock.fastForward(500);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).slowSockets.length))
+    .toBe(2);
+  await page.evaluate(() => (window as any).stopSlowStream());
+});

@@ -91,7 +91,7 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
         assistant = Mock()
         with self.assertRaises(browser_login.BrowserSessionError) as raised:
             browser_login.wait_for_account_page(browser, process, Mock(), 12, network, assistant=assistant)
-        self.assertEqual(raised.exception.code, 'BROWSER_LOGIN_REJECTED')
+        self.assertEqual(raised.exception.code, 'BROWSER_LOGIN_AUTHENTICATION_FAILED')
         self.assertNotIn('private', str(raised.exception))
         assistant.step.assert_not_called()
         page.wait_for_timeout.assert_not_called()

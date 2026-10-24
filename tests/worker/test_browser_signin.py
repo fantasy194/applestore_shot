@@ -225,7 +225,7 @@ class BrowserSigninTests(unittest.TestCase):
     def setUp(self):
         self.page = Page()
         self.service = SimpleNamespace(account='owner@example.test', channel=SimpleNamespace(checkpoint=Mock()),
-                                       browser_password=Mock(return_value='private-fixture'), stage=Mock())
+                                       browser_password=Mock(return_value='private-fixture'), stage=Mock(), reject_password=Mock())
         self.assistant = BrowserSigninAssistant(self.service, headless=True)
         self.network = {'pending': {}, 'error': None}
 
@@ -390,6 +390,7 @@ class BrowserSigninTests(unittest.TestCase):
         with self.assertRaises(BrowserSessionError) as raised:
             self.assistant.step(self.page, self.network)
         self.assertEqual(raised.exception.code, 'BROWSER_LOGIN_AUTHENTICATION_FAILED')
+        self.service.reject_password.assert_called_once()
         self.assertEqual(button.clicks, 0)
         with self.assertRaises(BrowserSessionError):
             self.assistant.step(self.page, {'http_status': 401})

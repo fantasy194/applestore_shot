@@ -44,6 +44,7 @@ export function connectBrowserStream(
   taskId: string,
   onStatus: (status: Data) => void,
   onError: () => void,
+  readFallback?: (after: number, signal: AbortSignal) => Promise<Data>,
 ): () => void {
   let disposed = false;
   let socket: WebSocket | undefined;
@@ -53,6 +54,11 @@ export function connectBrowserStream(
   let received = performance.now();
   let generation = 0;
   let authentication: AbortController | undefined;
+  let fallback: AbortController | undefined;
+  let usingFallback = false;
+  let streamFailures = 0;
+  let connectedSince = performance.now();
+  let after = 0;
 
   function disconnect() {
     generation++;
@@ -70,10 +76,47 @@ export function connectBrowserStream(
       previous.close();
     }
   }
+  async function pollFallback() {
+    if (disposed || !usingFallback || !readFallback) return;
+    const controller = new AbortController();
+    fallback = controller;
+    const deadline = setTimeout(() => controller.abort(), 15000);
+    let delay = 100;
+    try {
+      const status = await readFallback(after, controller.signal);
+      if (disposed || controller.signal.aborted) return;
+      if (Number.isSafeInteger(status.revision))
+        after = Number(status.revision);
+      received = performance.now();
+      onStatus(status);
+      if (!status.active) delay = 1000;
+    } catch {
+      if (disposed) return;
+      onError();
+      delay = 1000;
+    } finally {
+      clearTimeout(deadline);
+      if (fallback === controller) fallback = undefined;
+      if (!disposed && usingFallback)
+        retry = setTimeout(() => {
+          retry = undefined;
+          void pollFallback();
+        }, delay);
+    }
+  }
   function reconnect() {
-    if (disposed || retry) return;
+    if (disposed || retry || usingFallback) return;
     disconnect();
     onError();
+    // Some reverse proxies reject upgrades or buffer a stream. Continue reading
+    // the same incremental events over authenticated HTTP; never retry inputs.
+    streamFailures++;
+    if (readFallback && streamFailures >= 2) {
+      usingFallback = true;
+      after = 0; // A replacement transport must receive its own initial frame.
+      void pollFallback();
+      return;
+    }
     retry = setTimeout(
       () => {
         retry = undefined;
@@ -109,6 +152,7 @@ export function connectBrowserStream(
       const current = new WebSocket(url);
       socket = current;
       received = performance.now();
+      connectedSince = received;
       current.onmessage = (event) => {
         if (disposed || socket !== current) return;
         try {
@@ -128,6 +172,7 @@ export function connectBrowserStream(
           )
             throw new Error("Invalid preview status");
           received = performance.now();
+          if (received - connectedSince >= 15000) streamFailures = 0;
           attempt = 0;
           onStatus(status);
         } catch {
@@ -136,7 +181,7 @@ export function connectBrowserStream(
       };
       current.onclose = current.onerror = reconnect;
       watchdog = setInterval(() => {
-        if (performance.now() - received > 5000) reconnect();
+        if (performance.now() - received > 15000) reconnect();
       }, 1000);
     } catch {
       if (!disposed && selectedGeneration === generation) reconnect();
@@ -147,6 +192,9 @@ export function connectBrowserStream(
   }
   const resume = () => {
     if (disposed || document.hidden) return;
+    // Focusing the local text field must not tear down a healthy stream.
+    if (usingFallback) return;
+    if (socket && performance.now() - received <= 5000) return;
     clearTimeout(retry);
     retry = undefined;
     disconnect();
@@ -158,6 +206,7 @@ export function connectBrowserStream(
   return () => {
     disposed = true;
     clearTimeout(retry);
+    fallback?.abort();
     disconnect();
     document.removeEventListener("visibilitychange", resume);
     window.removeEventListener("focus", resume);

@@ -243,9 +243,18 @@ struct Control {
     pid: Option<u32>,
     browser_pid: Option<u32>,
 }
+#[derive(Clone, Default)]
+struct SessionCredential {
+    password: Option<String>,
+    generation: u64,
+    rejected: bool,
+}
+
 pub struct Engine {
     pub root: PathBuf,
     accounts: Mutex<Vec<Account>>,
+    // Process-lifetime only; never part of snapshots, task files, or activity logs.
+    session_passwords: Mutex<HashMap<String, SessionCredential>>,
     tasks: Mutex<HashMap<String, Task>>,
     workspace_feed: Mutex<workspace_feed::WorkspaceFeed>,
     controls: Mutex<HashMap<String, Control>>,
@@ -428,6 +437,7 @@ impl Engine {
         Ok(Arc::new(Self {
             root,
             accounts: Mutex::new(accounts),
+            session_passwords: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tasks),
             workspace_feed: Mutex::new(workspace_feed::WorkspaceFeed::default()),
             controls: Mutex::new(HashMap::new()),
@@ -533,6 +543,7 @@ impl Engine {
         *accounts = next;
         self.tasks.lock().unwrap().retain(|_, t| t.account_id != id);
         self.locks.lock().unwrap().remove(id);
+        self.session_passwords.lock().unwrap().remove(id);
         Ok(())
     }
     fn sync_account_identity(
@@ -672,8 +683,15 @@ impl Engine {
         if params.to_string().len() > 900_000 {
             return Err("任务参数过大".into());
         }
-        let schedule = purchase_schedule(&action, &params, now_ms())?;
         let mut params = params;
+        // Accept prefilled credentials through the same account cache, but remove
+        // secrets before any business parameters can reach diagnostics/persistence.
+        let supplied_password = params.as_object_mut().unwrap().remove("password");
+        if supplied_password.as_ref().is_some_and(|value| value.as_str().is_none_or(|s| s.is_empty() || s.len()>4096)) {
+            return Err("密码必须为非空字符串且不超过 4096 字节".into());
+        }
+        let remember_password = params.as_object_mut().unwrap().remove("remember").is_some_and(|value| value==true);
+        let schedule = purchase_schedule(&action, &params, now_ms())?;
         normalize_purchase_params(&action, &mut params)?;
         if let Some(s) = &schedule {
             // Freeze purchase fields at scheduling time; the worker reads only saved contact details later.
@@ -806,6 +824,16 @@ impl Engine {
             .entry(account_id.clone())
             .or_insert_with(|| Arc::new(Semaphore::new(1)))
             .clone();
+        if action == "forget_password" || supplied_password.is_some() {
+            let mut credentials = self.session_passwords.lock().unwrap();
+            let state = credentials.entry(account_id.clone()).or_default();
+            state.generation += 1;
+            state.password = if action == "forget_password" { None } else {
+                supplied_password.and_then(|value| value.as_str().map(str::to_owned))
+            };
+            state.rejected = false;
+        }
+        if remember_password { params["_remember_password"] = json!(true); }
         self.update(&app, &id, |_| {});
         let engine = self.clone();
         let task_id = id.clone();
@@ -830,7 +858,12 @@ impl Engine {
         let mut tasks = self.tasks.lock().unwrap();
         let task = tasks.get_mut(task_id).ok_or("任务不存在")?;
         validate_reply(task, account_id, request_id, &value)?;
-        let message = json!({"type":"reply", "account_id": account_id, "task_id":task_id,"request_id":request_id,"value":value});
+        let password = (task.prompt.as_ref().is_some_and(|prompt| prompt["kind"]=="password"))
+            .then(|| value["password"].as_str().map(str::to_owned)).flatten();
+        let mut credentials = self.session_passwords.lock().unwrap();
+        let generation = credentials.get(account_id).map_or(1, |state| state.generation + 1);
+        let mut message = json!({"type":"reply", "account_id": account_id, "task_id":task_id,"request_id":request_id,"value":value});
+        if password.is_some() { message["_credential_generation"] = json!(generation); }
         self.controls
             .lock()
             .unwrap()
@@ -839,6 +872,10 @@ impl Engine {
             .input
             .try_send(message)
             .map_err(|_| "无法发送输入，任务可能已退出")?;
+        if let Some(password) = password {
+            credentials.insert(account_id.into(), SessionCredential {password:Some(password),generation,rejected:false});
+        }
+        drop(credentials);
         task.prompt = None;
         task.status = "running".into();
         task.stage = "继续执行".into();
@@ -931,7 +968,11 @@ impl Engine {
                 if *cancel.borrow() { return Err("cancelled".into()) }
                 check_schedule_lateness(s.at_ms, now_ms())?;
             }
-            stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params})).as_bytes()).await.map_err(|e| e.to_string())?;
+            let state = self.session_passwords.lock().unwrap().get(&account.id).cloned().unwrap_or_default();
+            let mut credential_generation = state.generation;
+            let credential = state.password;
+            let credential_rejected = state.rejected;
+            stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params,"credential":credential,"credential_rejected":credential_rejected})).as_bytes()).await.map_err(|e| e.to_string())?;
             let mut lines = BufReader::new(stdout).lines();
             self.update(&app, &id, |t| { t.status = "running".into(); t.stage = "开始执行".into();
                 t.execution_started_at_ms = Some(now_ms()); });
@@ -943,13 +984,27 @@ impl Engine {
                         if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await.is_err() { let _ = child.kill().await; }
                         return Err("cancelled".into());
                     },
-                    Some(message) = inputs.recv() => { stdin.write_all(format!("{message}\n").as_bytes()).await.map_err(|e| e.to_string())?; },
+                    Some(mut message) = inputs.recv() => {
+                        if let Some(generation) = message.as_object_mut().and_then(|value| value.remove("_credential_generation")).and_then(|value| value.as_u64()) {
+                            credential_generation = generation;
+                        }
+                        stdin.write_all(format!("{message}\n").as_bytes()).await.map_err(|e| e.to_string())?;
+                    },
                     line = lines.next_line() => {
                         let Some(line) = line.map_err(|e| e.to_string())? else { break; };
                         if line.len() > 4_000_000 { return Err("业务进程输出超出限制".into()); }
                         let mut event: Value = serde_json::from_str(&line).map_err(|_| "业务进程返回了无效的数据")?;
                         if event["account_id"] != account.id || event["task_id"] != id || event["v"] != 1 { return Err("业务进程的账号或任务标识不匹配".into()); }
                         let kind = event["type"].as_str().unwrap_or("").to_owned();
+                        if kind == "credential_rejected" {
+                            let mut credentials = self.session_passwords.lock().unwrap();
+                            let state = credentials.entry(account.id.clone()).or_default();
+                            if state.generation == credential_generation {
+                                state.password = None;
+                                state.rejected = true;
+                            }
+                            continue;
+                        }
                         if kind == "inventory" && action == "inventory_monitor" && !*cancel.borrow() {
                             let outcomes = self.inventory_dispatch(&app, &event["result"]);
                             event["result"]["dispatches"] = json!(outcomes);
@@ -1842,6 +1897,88 @@ mod tests {
         assert_eq!(task.status,"interrupted"); assert!(task.stage.contains("定时任务已停止"));
         assert!(restored.controls.lock().unwrap().is_empty());
     }
+    #[tokio::test]
+    async fn passwords_reuse_only_private_ipc_across_tasks_and_rejections_stop_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let account = engine.add_account("cache@example.test".into()).unwrap();
+        let another = engine.add_account("other@example.test".into()).unwrap();
+        for account in engine.accounts.lock().unwrap().iter_mut() { account.pending = false; }
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python = project.join(if cfg!(windows) {".venv/Scripts/python.exe"} else {".venv/bin/python"});
+        let script = temp.path().join("credential-fixture.py");
+        fs::write(&script, r#"import json,sys
+r=json.loads(sys.stdin.readline())
+def emit(kind, **data):
+ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type=kind,**data)),flush=True)
+assert 'password' not in r['params']
+if r['params'].get('ask'):
+ emit('prompt',prompt={'id':'fixture-password','kind':'password','label':'fixture'})
+ reply=json.loads(sys.stdin.readline())
+ assert reply['value']['password']=='fixture-secret-never-on-disk'
+if r['params'].get('reject_delay'):
+ import time
+ emit('stage',message='fixture-before-reject')
+ time.sleep(.5)
+ emit('credential_rejected')
+if r['params'].get('reject'):
+ emit('credential_rejected')
+emit('result',result={'success':True,'has_credential':r.get('credential')=='fixture-secret-never-on-disk','rejected':r.get('credential_rejected',False)})
+"#).unwrap();
+        let host = TaskHost { worker: python, script: Some(script), on_update: Arc::new(|_| {}) };
+        let id = engine.start(host.clone(), account.id.clone(), "bag".into(), json!({"ask":true})).unwrap();
+        for _ in 0..500 {
+            if engine.tasks.lock().unwrap()[&id].status=="waiting" { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(engine.reply(&host,&another.id,&id,"fixture-password",json!({"password":"fixture-secret-never-on-disk"})).is_err());
+        assert!(engine.session_passwords.lock().unwrap().is_empty());
+        engine.reply(&host,&account.id,&id,"fixture-password",json!({"password":"fixture-secret-never-on-disk","remember":false})).unwrap();
+        for _ in 0..500 {
+            if terminal(&engine.tasks.lock().unwrap()[&id].status) && !engine.controls.lock().unwrap().contains_key(&id) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        for (owner, params, has_credential, rejected) in [
+            (account.id.clone(),json!({}),true,false),
+            (another.id.clone(),json!({}),false,false),
+            (account.id.clone(),json!({"reject":true}),true,false),
+            (account.id.clone(),json!({}),false,true),
+            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk"}),true,false),
+        ] {
+            let id=engine.start(host.clone(),owner,"bag".into(),params).unwrap();
+            for _ in 0..500 {
+                if terminal(&engine.tasks.lock().unwrap()[&id].status) && !engine.controls.lock().unwrap().contains_key(&id) { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let task=engine.tasks.lock().unwrap()[&id].clone();
+            assert_eq!(task.status,"succeeded","{}",task.stage);
+            assert_eq!(task.result.as_ref().unwrap()["has_credential"],has_credential);
+            assert_eq!(task.result.as_ref().unwrap()["rejected"],rejected);
+            let disk=fs::read_to_string(scope_dir(temp.path(),&task.account_id).join("tasks").join(&id).join("task.json")).unwrap();
+            assert!(!disk.contains("fixture-secret-never-on-disk"));
+            assert!(!serde_json::to_string(&engine.snapshot()).unwrap().contains("fixture-secret-never-on-disk"));
+        }
+        let old=engine.start(host.clone(),account.id.clone(),"bag".into(),json!({"reject_delay":true})).unwrap();
+        for _ in 0..500 {
+            if engine.tasks.lock().unwrap()[&old].stage=="fixture-before-reject" { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let newer=engine.start(host.clone(),account.id.clone(),"bag".into(),json!({"password":"fixture-secret-never-on-disk"})).unwrap();
+        for _ in 0..500 {
+            if terminal(&engine.tasks.lock().unwrap()[&newer].status) && !engine.controls.lock().unwrap().contains_key(&newer) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(engine.tasks.lock().unwrap()[&newer].result.as_ref().unwrap()["has_credential"],true);
+        assert!(!engine.session_passwords.lock().unwrap().get(&account.id).unwrap().rejected);
+        let id=engine.start(host.clone(),account.id.clone(),"forget_password".into(),json!({})).unwrap();
+        assert!(engine.session_passwords.lock().unwrap().get(&account.id).unwrap().password.is_none());
+        for _ in 0..500 {
+            if terminal(&engine.tasks.lock().unwrap()[&id].status) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(Engine::new(temp.path().into()).unwrap().session_passwords.lock().unwrap().is_empty());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn scheduled_dispatch_runs_once_at_deadline_with_frozen_params() {

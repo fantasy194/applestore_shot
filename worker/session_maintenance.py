@@ -21,7 +21,7 @@ def record_maintenance_result(service, result, *, cooling=False, warm_only=False
 
 
 def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='login', sku=None, count=None):
-    if preheat_flow not in ('login', 'pickup_prepare'):
+    if preheat_flow not in ('login', 'pickup_prepare', 'browser_login'):
         raise ValueError('预热流程无效。')
     browser_mode = 'headless' if getattr(service, 'headless_browser', False) is True else 'visible'
     path = service.root / 'session-maintenance.json'
@@ -57,7 +57,10 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
                       **{key: prepared[key] for key in ('preparation_stage', 'blocked_reason',
                           'error_code', 'pickup_store', 'pickup_store_id', 'pickup_time_slot') if key in prepared}}
         else:
-            checked = service.warm_login() if warm_only else login_in_browser(service, timeout=12, maintenance=True)
+            if preheat_flow == 'browser_login':
+                checked = login_in_browser(service, timeout=12, maintenance=True, recover=True)
+            else:
+                checked = service.warm_login() if warm_only else login_in_browser(service, timeout=12, maintenance=True)
             status = checked.get('status', 'healthy' if checked.get('logged_in') is True else 'requires_login')
             status = status if status in ('healthy', 'requires_login', 'blocked', 'failed') else 'failed'
             result = {'success': status == 'healthy', 'status': status,

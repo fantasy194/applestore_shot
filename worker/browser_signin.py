@@ -204,6 +204,7 @@ class BrowserSigninAssistant:
             raise _error('BROWSER_LOGIN_INPUT_INTERRUPTED', '登录页面已变化，请在官网页面继续。')
         if network.get('authentication_failed') is True or any(network.get(key) == 401 for key in ('status', 'http_status', 'authentication_status', 'blocked_status')):
             self.terminal = True
+            self.service.reject_password()
             raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网拒绝了本次认证，请在官网确认账号和密码；未自动重试。')
         if network.get('pending') or network.get('error'):
             return 'waiting'
@@ -219,6 +220,7 @@ class BrowserSigninAssistant:
                     return 'verification'
                 alert = frame.get_by_role('alert').all_inner_texts()
                 if any(PASSWORD_ERROR.search(value[:4000]) for value in alert):
+                    self.service.reject_password()
                     raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网提示认证失败，请在官网检查；未自动重试。')
             for frame in frames:
                 accounts, passwords = _fields(frame)

@@ -25,6 +25,7 @@ class Service:
         self.vault = vault or Vault()
         self.password = None
         self.remember = False
+        self.password_rejected = False
         self.authentication_requested = False
         self.authentication_failed = False
         self.idle_maintenance = False
@@ -110,7 +111,7 @@ class Service:
                 '并发子任务需要重新认证，请先完成当前账号的官网登录。',
                 status='requires_login', requires_login=True)
         self.authentication_requested = True
-        if not self.password:
+        if not self.password and not self.password_rejected:
             try:
                 stored = self.vault.get(self.channel.account_id)
                 self.password = stored if isinstance(stored, str) and stored else None
@@ -123,6 +124,7 @@ class Service:
             if not isinstance(value, dict) or not isinstance(value.get('password'), str) or not value['password']:
                 raise ValueError('请输入密码。')
             self.password = value['password']
+            self.password_rejected = False
             self.remember = value.get('remember') is True
         return self.password
 
@@ -131,7 +133,7 @@ class Service:
         if self._parallel_child:
             raise ValueError('并发会话需要重新登录，请先预热账号后重新发起；本次未自动登录。')
         self.authentication_requested = True
-        if not self.password:
+        if not self.password and not self.password_rejected:
             try:
                 self.password = self.vault.get(self.channel.account_id)
             except Exception:
@@ -151,6 +153,7 @@ class Service:
             if not isinstance(value, dict) or not isinstance(value.get('password'), str) or not value['password']:
                 raise ValueError('请输入密码。')
             self.password = value['password']
+            self.password_rejected = False
             self.remember = value.get('remember') is True
         return self.account, self.password
 
@@ -314,7 +317,13 @@ class Service:
             try:
                 self.vault.save(self.channel.account_id, self.password)
             except Exception:
-                self.stage('操作成功，但系统未保存密码；下次登录需重新输入')
+                self.stage('系统保险库未保存密码；当前服务运行期间仍可复用，重启后需重新输入')
+
+    def reject_password(self):
+        if not self.password_rejected:
+            self.channel.emit('credential_rejected')
+        self.password_rejected = True
+        self.password = None
 
     def cleanup_credentials(self, error=None):
         # A rejected authentication is not permission to delete an existing
@@ -325,6 +334,22 @@ class Service:
             # Legacy failure cleanup may remove the account too. Keep the registry identity.
             data['account'] = self.account
             duo_killer.write_private_json(self.auth, data)
+        # Invalidate only an explicit credential rejection. 541, timeouts, OTP
+        # requests and generic failed account checks do not prove a wrong password.
+        rejected = False
+        cause = error
+        seen = set()
+        for _ in range(8):
+            if cause is None or id(cause) in seen:
+                break
+            seen.add(id(cause))
+            if (getattr(cause, 'code', None) == 'BROWSER_LOGIN_AUTHENTICATION_FAILED'
+                    or getattr(cause, 'status', None) == 401 and '-20101' in (getattr(cause, 'codes', None) or ())):
+                rejected = True
+                break
+            cause = getattr(cause, '__cause__', None)
+        if rejected:
+            self.reject_password()
         self.password = None
 
     def should_remove_account(self, error):
@@ -588,9 +613,11 @@ class Service:
             previous_headless = self.headless_browser
             self.headless_browser = True
             try:
-                result = maintain_session(self, warm_only=params.get('warm_only') is True,
-                                          preheat_flow=params.get('preheat_flow', 'login'),
-                                          sku=params.get('sku'), count=params.get('quantity'))
+                from browser_process import background_browser_scope
+                with background_browser_scope():
+                    result = maintain_session(self, warm_only=params.get('warm_only') is True,
+                                              preheat_flow=params.get('preheat_flow', 'login'),
+                                              sku=params.get('sku'), count=params.get('quantity'))
             finally:
                 self.idle_maintenance = previous_idle_maintenance
                 # Nested prepare-only purchases inherit this scope. Manual actions

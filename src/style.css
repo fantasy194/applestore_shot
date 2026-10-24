@@ -2789,6 +2789,10 @@ details[open] > .disclosure-summary ~ * {
   max-width: 420px;
   margin: 16px 0 10px;
 }
+.session-warm-flow .select-trigger > span {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 /* Shared editable numbers keep touch targets separate from the numeric input. */
 .number-field {
   min-width: 0;

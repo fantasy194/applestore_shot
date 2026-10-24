@@ -133,3 +133,14 @@
 队列链路入口见 [`purchase_queue.rs` 中的真实 Python 协调器测试](../src-tauri/src/purchase_queue.rs)及 [`tests/fixtures/queue_bridge_worker.py`](../tests/fixtures/queue_bridge_worker.py)、[`queue_bridge_child.py`](../tests/fixtures/queue_bridge_child.py)。Chrome 验证脚本见 [`scripts/verify-browser-remote-fixture.py`](../scripts/verify-browser-remote-fixture.py)，本次本地证据为 `artifacts/browser-remote-fixture.json`；旧会话诊断为 `artifacts/session-541-readonly.json`。`artifacts/` 是本机验证产物，不是分发包的必要文件。
 
 本轮另通过真实官网窗口 → 本机 Rust → Cloudflare → PWA 的画面验收，观察到 3 个更新帧及图片实际渲染，未输入密码或验证码，随后取消本次预览任务。初次只读维护要求登录，后续实际账号检查已返回成功，维护状态恢复等待；这不表示结账一定免认证。完整数字和现场结果见[验收记录](QUEUE-LOGS-SESSION-VERIFICATION.md)。实体 iPhone、完整官网恢复轨迹、真实库存触发下单和付款仍需分别列出现场证据，不能用离线链路替代。
+
+
+## 0.1.6：运行期间凭据复用与后台官网登录恢复
+
+账号密码通过应用密码提示或任务预填输入后，在当前服务进程内按账号复用，后续登录、结账认证与后台官网登录填写共用同一来源。缓存仅通过私有 worker stdin 传递，不进入任务参数、摘要、日志或账号 JSON；关闭服务后清空。“删除保存密码”和移除账号也清除运行内缓存。官网明确拒绝密码后停止复用，并阻止重新加载同一份系统保险库密码，等待本人重新输入；541、网络错误和验证码要求不当成密码错误。
+
+勾选保存仍使用原系统凭据保险库。当前 Linux / Docker 没有保险库后端，因此只支持当前服务运行期间复用，重启后需重新输入；没有明文密码文件回退。已有浏览器自动填写的密码直接沿用官网表单，不提取到应用缓存。通过官网窗口直接输入的文本也不自动认定为 Apple 密码。
+
+空闲预热增加“官网登录恢复（保留账号）”（`preheat_flow=browser_login`）。它复用手动官网登录恢复的官方入口、账号校验和同一浏览器资料，自动执行时保持无头、不加购、不提交订单，也不附加空购物袋预热。旧设置默认仍为“预热登录”。缺少凭据、验证码或安全挑战时停止并等待人工恢复，541 沿用冷却。
+
+后台 `session_maintain` 在服务策略与实际浏览器启动边界都强制无头，嵌套的浏览器上下文获取和自提准备继承该范围，结束或取消后恢复。手动官网登录恢复继续使用可见窗口。相关离线回归覆盖密码跨任务 / 跨账号隔离、错误凭据失效、重启清空、三个流程持久化、嵌套启动无头及浏览器资料标记保留；不代表真实 Apple 会话永久有效或结账不再要求验证。

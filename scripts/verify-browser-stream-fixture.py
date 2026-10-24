@@ -95,6 +95,33 @@ def main():
                     assert request('/input', {'type': 'text', 'text': 'stream fixture', 'sequence': current['sequence']})['accepted']
                     assert page.locator('#field').input_value() == 'stream fixture'
                     report['passes'].append('normal_mouse_keyboard_events')
+                    # Typing is deliberately 100-200ms per character. The input
+                    # owner must continue to serve independent live heartbeats
+                    # throughout a command longer than the UI's five-second gate.
+                    current = request()['frame']
+                    after = request()['revision']
+                    typed, errors = [], []
+                    def long_input():
+                        try:
+                            typed.append(request('/input', {'type': 'text', 'text': 'x' * 60,
+                                'sequence': current['sequence']}))
+                        except Exception as error:
+                            errors.append(type(error).__name__)
+                    typing = threading.Thread(target=long_input, daemon=True)
+                    started = time.monotonic()
+                    typing.start()
+                    samples = 0
+                    while typing.is_alive() and time.monotonic() - started < 20:
+                        state = request('/events?after=' + str(after))
+                        after = state['revision']
+                        assert state['connected'] and state['frame_current']
+                        samples += 1
+                        time.sleep(.15)
+                    typing.join(timeout=1)
+                    assert not typing.is_alive() and not errors and typed == [{'accepted': True}]
+                    assert time.monotonic() - started >= 5 and samples > 5
+                    assert page.locator('#field').input_value() == 'stream fixture' + 'x' * 60
+                    report['passes'].append('long_keyboard_input_preserves_live_heartbeats')
                     old = request()['frame']
                     page.reload()
                     until(lambda state: state.get('frame') and state.get('document_id') != changed['document_id'])

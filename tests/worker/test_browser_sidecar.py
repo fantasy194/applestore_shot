@@ -32,6 +32,20 @@ class BrowserSidecarTests(unittest.TestCase):
             self.assertIs(browser_process.launch_browser(args, stdout=-3), launch.return_value)
         launch.assert_called_once_with(args, stdout=-3)
 
+    def test_background_scope_forces_headless_for_nested_local_and_sidecar_launches(self):
+        args = ['fixture-chrome', '--restore-last-session', '--headless=old']
+        with patch.dict('os.environ', {}, clear=True), patch('subprocess.Popen') as launch:
+            with browser_process.background_browser_scope():
+                browser_process.launch_browser(args)
+            self.assertEqual(launch.call_args.args[0].count('--headless=new'), 1)
+            self.assertNotIn('--headless=old', launch.call_args.args[0])
+            browser_process.launch_browser(['fixture-chrome'])
+            self.assertNotIn('--headless=new', launch.call_args.args[0])
+        with patch.dict('os.environ', {'DUO_BROWSER_SOCKET': 'fixture-socket'}), patch('browser_process.SidecarProcess') as sidecar:
+            with browser_process.background_browser_scope():
+                browser_process.launch_browser(['fixture-chrome'])
+            self.assertIn('--headless=new', sidecar.call_args.args[0])
+
     def test_untrusted_or_truncated_response_is_bounded_and_redacted(self):
         for data in (b'', b'no json\n', b'[]\n', b'null\n', b'{"ok":false,"secret":"fixture"}\n', b'x' * 65538):
             with self.subTest(data=data[:40]), self.assertRaises(OSError) as error:

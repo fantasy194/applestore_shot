@@ -33,6 +33,32 @@ class SessionMaintenanceTests(unittest.TestCase):
         vault.get.return_value = None
         return Service(channel, self.service.root, self.service.root, 'fixture@example.test', vault)
 
+    def test_browser_login_recovery_flow_reuses_profile_without_warm_bag_or_visible_window(self):
+        service = self.real_service()
+        service.ensure_auth_file()
+        from apple_login import browser_profile_path
+        profile = browser_profile_path(service.auth)
+        profile.mkdir(parents=True)
+        marker = profile / 'fixture-trust-marker'
+        marker.write_text('preserve', encoding='utf-8')
+        def recover(owner, **options):
+            self.assertTrue(owner.headless_browser)
+            self.assertTrue(owner.idle_maintenance)
+            self.assertEqual(browser_profile_path(owner.auth), profile)
+            from browser_process import _background_browser
+            self.assertTrue(_background_browser.get())
+            return {'success': True, 'logged_in': True, 'status': 'healthy'}
+        with patch('browser_login.login_in_browser', side_effect=recover) as browser, \
+                patch.object(service, 'warm_login') as warm, patch('duo_killer.purchase_sku') as purchase:
+            result = service.run('session_maintain', {'warm_only': True, 'preheat_flow': 'browser_login'})
+        browser.assert_called_once_with(service, timeout=12, maintenance=True, recover=True)
+        warm.assert_not_called()
+        purchase.assert_not_called()
+        self.assertEqual(result['preheat_flow'], 'browser_login')
+        self.assertEqual(result['browser_mode'], 'headless')
+        self.assertEqual(marker.read_text(encoding='utf-8'), 'preserve')
+        self.assertFalse(service.headless_browser)
+
     def test_only_session_maintenance_scopes_headless_and_restores_after_error_or_cancellation(self):
         import asyncio
         service = self.real_service()

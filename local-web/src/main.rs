@@ -133,8 +133,11 @@ async fn browser_stream_loop(mut socket: WebSocket, s: LocalState, scope: Browse
         after = status["revision"].as_u64().unwrap_or(after);
         let active = status["active"] == true;
         // Slow peers get the latest bounded frame, never an unbounded backlog.
-        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2), socket.send(Message::Text(status.to_string().into()))).await, Ok(Ok(()))) { break; }
+        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(15), socket.send(Message::Text(status.to_string().into()))).await, Ok(Ok(()))) { break; }
         if !active { break; }
+        // Sample the newest worker state instead of filling proxy buffers with
+        // every animation frame. The worker retains only bounded frame metadata.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), socket.send(Message::Close(None))).await;
 }

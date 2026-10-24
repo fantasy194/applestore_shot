@@ -1,5 +1,5 @@
 import type { Bridge } from "./api";
-import type { Account, Snapshot, Task } from "./types";
+import type { Account, Data, Snapshot, Task } from "./types";
 import { connectBrowserStream } from "./browser-stream";
 import { webHeaders } from "./pwa";
 
@@ -72,7 +72,19 @@ export function localWebBridge(): Bridge {
     logs: (params = {}) => call("activity_logs", { params }),
     browser: (accountId, taskId, operation, params = {}) =>
       call("browser_command", { accountId, taskId, operation, params }),
-    browserStream: connectBrowserStream,
+    browserStream: (accountId, taskId, onStatus, onError) =>
+      connectBrowserStream(
+        accountId,
+        taskId,
+        onStatus,
+        onError,
+        (after, signal) =>
+          call<Data>(
+            "browser_command",
+            { accountId, taskId, operation: "events", params: { after } },
+            signal,
+          ),
+      ),
     maintenance: (operation, params = {}) =>
       call("maintenance_command", { operation, params }),
     subscribe: async (callback, onSnapshot) => {

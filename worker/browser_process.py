@@ -4,6 +4,8 @@ The sidecar's Unix socket is private to the shared data volume. A lifetime
 connection owns each process; losing the worker closes its browser as well.
 Only loopback CDP is forwarded, keeping existing preview/input code unchanged.
 """
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 import select
@@ -138,7 +140,25 @@ class SidecarProcess:
             self._finish(-1)
 
 
+_background_browser = ContextVar('duo_background_browser', default=False)
+
+
+@contextmanager
+def background_browser_scope():
+    """Nested login/context helpers cannot accidentally open a visible window."""
+    token = _background_browser.set(True)
+    try:
+        yield
+    finally:
+        _background_browser.reset(token)
+
+
 def launch_browser(args, **options):
+    if _background_browser.get():
+        args = [arg for arg in args if not arg.startswith('--headless')]
+        args.append('--headless=new')
+        if os.name == 'nt':
+            options['creationflags'] = options.get('creationflags', 0) | subprocess.CREATE_NO_WINDOW
     path = os.environ.get('DUO_BROWSER_SOCKET')
     if path:
         return SidecarProcess(args, path)

@@ -1295,7 +1295,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.5</span>
+          <span>DUO Killer · 0.1.6</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (
@@ -1581,7 +1581,10 @@ function SessionMaintenance({
   const current = Array.isArray(state?.last_runs)
     ? state.last_runs.find((run: Data) => run.account_id === account.id)
     : state?.last_runs?.[account.id];
-  const flow = state?.flow === "pickup_prepare" ? "pickup_prepare" : "login";
+  const flow =
+    state?.flow === "pickup_prepare" || state?.flow === "browser_login"
+      ? state.flow
+      : "login";
   const runningFlow = current?.flow || flow;
   const reason =
     current?.blocked_reason ||
@@ -1604,7 +1607,9 @@ function SessionMaintenance({
     : current?.status === "running"
       ? runningFlow === "pickup_prepare"
         ? "正在准备自提，不下单"
-        : "正在预热登录，不加购"
+        : runningFlow === "browser_login"
+          ? "正在恢复官网登录，不加购"
+          : "正在预热登录，不加购"
       : reason === "account_busy"
         ? "下单/账号任务进行中，暂缓预热"
         : reason === "order_unresolved"
@@ -1646,13 +1651,16 @@ function SessionMaintenance({
         options={[
           { value: "login", label: "预热登录（不加购）" },
           { value: "pickup_prepare", label: "提前准备自提（不下单）" },
+          { value: "browser_login", label: "官网登录恢复（保留账号）" },
         ]}
         onChange={(value) => void configure({ flow: value })}
       />
       <p className="ui-caption">
         {flow === "pickup_prepare"
-          ? "按各账号的商品、数量和自提偏好准备结算；可能加购，不提交订单。"
-          : "检查账号会话，不加购。"}
+          ? "按各账号的商品、数量和自提偏好准备结算；可能加购，不提交订单。浏览器按需无头运行。"
+          : flow === "browser_login"
+            ? "保留账号和浏览器登录资料，使用现有凭证恢复官网登录；不加购、不下单。浏览器按需无头运行。"
+            : "检查账号会话，不加购。浏览器按需无头运行。"}
       </p>
       <p className="session-warm-timing">
         最近预热：
@@ -1678,6 +1686,9 @@ function SessionMaintenance({
         </p>
         <p>
           登录预热不清空购物袋、不加购。自提准备使用本账号预设，不提交订单；准备记录最多复用5分钟，下单时仍会复核商品、库存、门店和时段。
+        </p>
+        <p>
+          官网登录恢复保留账号和浏览器资料，使用可用凭证完成普通登录。自动预热不弹出可见浏览器；缺少密码、需要验证码或官网验证时暂停并提示处理。手动登录和官网登录恢复仍打开可见窗口。
         </p>
         <a
           className="ui-action-link"
@@ -2335,14 +2346,19 @@ function PromptForm({
             </p>
           )}
           {password && (
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={remember}
-                onChange={(e) => setRemember(e.target.checked)}
-              />
-              保存到系统凭据保险库
-            </label>
+            <>
+              <p className="muted">
+                密码按账号在本次服务运行中复用。保存由系统凭据保险库决定；容器未配置可用保险库时，重启后需重新输入。
+              </p>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={remember}
+                  onChange={(e) => setRemember(e.target.checked)}
+                />
+                保存到系统凭据保险库
+              </label>
+            </>
           )}
         </>
       )}

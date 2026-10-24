@@ -195,6 +195,11 @@ def run_parent_serial(context, target):
     try:
         nested = Service(context.channel, context.root, context.task_dir, context.account,
                          vault=context.parent_service.vault)
+        parent = context.parent_service
+        password = getattr(parent, 'password', None)
+        nested.password = password if isinstance(password, str) else None
+        nested.remember = getattr(parent, 'remember', False) is True
+        nested.password_rejected = getattr(parent, 'password_rejected', False) is True
         nested.browser_task_id = context.channel.browser_task_id
         nested.browser_task_dir = context.channel.browser_task_dir
         # Only the outer per-target runner controls configured serial retries.
@@ -209,9 +214,16 @@ def run_parent_serial(context, target):
             for name in ('authentication_failed', 'authentication_requested', 'purchase_auth_interaction'):
                 if getattr(nested, name, False) is True:
                     setattr(context, name, True)
+            password, remember = nested.password, nested.remember
             try:
                 nested.cleanup_credentials(error)
             finally:
+                # Sequential jobs are one account execution owner. A newly entered
+                # password or a rejection must survive the nested Service cleanup.
+                parent = context.parent_service
+                parent.password_rejected = nested.password_rejected
+                parent.password = None if nested.password_rejected else password
+                parent.remember = remember
                 for name, value in saved_shop.items():
                     setattr(shop, name, value)
                 alipay_qr.ROOT, interaction.handler = saved_qr, saved_handler

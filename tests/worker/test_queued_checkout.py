@@ -169,6 +169,42 @@ class QueueTests(unittest.TestCase):
         self.assertNotIn('payment_url',disk)
         self.assertNotIn('qr_data',disk)
 
+    def test_serial_nested_service_shares_credentials_and_propagates_new_input_or_rejection(self):
+        from service import Service
+        from types import SimpleNamespace
+        import interaction, duo_killer, alipay_qr
+        originals = {key:getattr(duo_killer,key) for key in ('ROOT','AUTH_PATH','LOG_PATH','PAYMENT_ROOT')}
+        handler, qr = interaction.handler, alipay_qr.ROOT
+        try:
+            parent = Service(self.channel,self.root,self.task,'fixture@example.test',vault=Mock())
+            parent.password = 'private-parent-fixture'
+            parent.vault.get.side_effect = AssertionError('vault must not be needed')
+            channel = Mock(browser_task_id='fixture',browser_task_dir=self.task)
+            context = SimpleNamespace(channel=channel,root=self.root,task_dir=self.task,
+                                      account=parent.account,parent_service=parent,submitted=False)
+            calls = []
+            def purchase(_sku, **_options):
+                nested = interaction.handler
+                calls.append(nested.credentials(nested.auth)[1])
+                nested.password = 'private-replacement-fixture'
+                return {'success':True,'status':'fixture'}
+            with patch('duo_killer.purchase_sku',side_effect=purchase), patch('requests.Session.request',side_effect=AssertionError('network forbidden')):
+                run_parent_serial(context,{'sku':'MLH74FE','quantity':1,'fulfillment':'HOME'})
+                run_parent_serial(context,{'sku':'MLH74FE','quantity':1,'fulfillment':'HOME'})
+            self.assertEqual(calls,['private-parent-fixture','private-replacement-fixture'])
+            self.assertEqual(parent.password,'private-replacement-fixture')
+            def rejected(_sku, **_options):
+                interaction.handler.reject_password()
+                raise ValueError('fixture authentication refused')
+            with patch('duo_killer.purchase_sku',side_effect=rejected), self.assertRaises(ValueError):
+                run_parent_serial(context,{'sku':'MLH74FE','quantity':1,'fulfillment':'HOME'})
+            self.assertTrue(parent.password_rejected)
+            self.assertIsNone(parent.password)
+            channel.emit.assert_any_call('credential_rejected')
+        finally:
+            interaction.handler, alipay_qr.ROOT = handler, qr
+            for key,value in originals.items(): setattr(duo_killer,key,value)
+
     def test_clean_failure_retries_only_that_target_serially(self):
         called = []
         def executor(context,item):

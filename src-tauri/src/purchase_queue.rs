@@ -166,7 +166,17 @@ impl QueueState {
             }
         }
         let mut recovered=false;
+        let mut migrated_stock_time=false;
+        let current=now_ms();
         for job in &mut state.jobs {
+            // Before dedicated timeline fields existed, enqueue stored the
+            // original available sample's checked_at_ms (not insertion time).
+            // Recover that durable evidence, never the latest sample or now.
+            if job.stock_detected_at_ms.is_none() && job.enqueued_at_ms>0
+                && job.enqueued_at_ms<=current.saturating_add(1000) {
+                job.stock_detected_at_ms=Some(job.enqueued_at_ms);
+                migrated_stock_time=true;
+            }
             if job.inflight() {
                 job.status="interrupted".into();
                 job.message="本地服务重启，已派发任务已中断，未自动重放；请先查询官网订单".into();
@@ -179,7 +189,7 @@ impl QueueState {
             }
         }
         if recovered { state.paused=true; }
-        if exists && recovered { state.save(root)?; }
+        if exists && (recovered || migrated_stock_time) { state.save(root)?; }
         Ok(state)
     }
     fn limit(&self) -> usize { if self.mode=="parallel" {self.max_concurrency as usize} else {1} }
@@ -1281,6 +1291,9 @@ mod tests {
         observe(&engine,&host,vec![target(&account,"R390",detected),target(&account,"R391",detected)]);
         let before=jobs(&engine);assert_eq!(before[0].stock_detected_at_ms,Some(detected));
         assert_eq!(before[0].enqueued_at_ms,detected);assert!(before[0].queued_at_ms.is_some_and(|at|at>detected&&at<=now_ms()));
+        let view=engine.queue_command(host.clone(),"status",&json!({})).unwrap();
+        assert_eq!(view["jobs"][0]["stock_detected_at_ms"],detected);
+        assert_eq!(view["jobs"][0]["queued_at_ms"],before[0].queued_at_ms.unwrap());
         observe(&engine,&host,vec![target(&account,"R390",now_ms()),negative(target(&account,"R391",now_ms()))]);
         let after=jobs(&engine);
         for (old,new) in before.iter().zip(&after) {
@@ -1294,6 +1307,59 @@ mod tests {
         let mut legacy=serde_json::to_value(&before[0]).unwrap();
         legacy.as_object_mut().unwrap().remove("stock_detected_at_ms");legacy.as_object_mut().unwrap().remove("queued_at_ms");
         let old:QueueJob=serde_json::from_value(legacy).unwrap();assert!(old.stock_detected_at_ms.is_none()&&old.queued_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_stock_times_recover_original_sample_without_inventing_other_events() {
+        let (root,engine,host,account)=fixture();
+        let original=now_ms().saturating_sub(500);
+        observe(&engine,&host,(390..395).map(|store|target(&account,&format!("R{store}"),original)).collect());
+        let path=root.path().join("settings/purchase_queue.json");
+        let mut disk:Value=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let rows=disk["jobs"].as_array_mut().unwrap();
+        for row in rows.iter_mut() {
+            row["status"]=json!("succeeded");
+            row["checked_at_ms"]=json!(original+300);
+            for field in ["stock_detected_at_ms","queued_at_ms","started_at_ms","order_confirmed_at_ms"] {
+                row.as_object_mut().unwrap().remove(field);
+            }
+        }
+        rows[1]["status"]=json!("waiting_stock");
+        rows[2]["enqueued_at_ms"]=json!(0);
+        rows[3]["enqueued_at_ms"]=json!(now_ms()+60_000);
+        rows[4]["stock_detected_at_ms"]=json!(original-100);
+        private_json(&path,&disk).unwrap();
+
+        let loaded=QueueState::load(root.path(),&HashMap::new()).unwrap();
+        // Load sorts FIFO, so inspect identity rather than the pre-load position.
+        for row in disk["jobs"].as_array().unwrap() {
+            let job=loaded.jobs.iter().find(|job|job.id==row["id"]).unwrap();
+            let expected=if row["enqueued_at_ms"]==0 || row["enqueued_at_ms"].as_u64().unwrap()>now_ms()+1000 {None}
+                else if row["stock_detected_at_ms"].is_number() {row["stock_detected_at_ms"].as_u64()}
+                else {Some(original)};
+            assert_eq!(job.stock_detected_at_ms,expected);
+            assert_eq!(job.enqueued_at_ms,row["enqueued_at_ms"].as_u64().unwrap());
+            assert!(job.queued_at_ms.is_none()&&job.started_at_ms.is_none()&&job.order_confirmed_at_ms.is_none());
+            if row["status"]=="waiting_stock" {assert_eq!(job.checked_at_ms,0);assert!(!job.authorization_confirmed);}
+        }
+        let persisted:QueueState=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.jobs.iter().map(|job|(&job.id,job.stock_detected_at_ms)).collect::<Vec<_>>(),
+            loaded.jobs.iter().map(|job|(&job.id,job.stock_detected_at_ms)).collect::<Vec<_>>());
+        let reloaded=QueueState::load(root.path(),&HashMap::new()).unwrap();
+        assert_eq!(serde_json::to_value(&reloaded.jobs).unwrap(),serde_json::to_value(&loaded.jobs).unwrap());
+
+        // Terminal-only history must persist the migration too: it does not
+        // otherwise enter restart recovery or trigger a queue write.
+        let mut terminal=serde_json::to_value(&loaded).unwrap();
+        for row in terminal["jobs"].as_array_mut().unwrap() {
+            row["status"]=json!("succeeded");
+            row.as_object_mut().unwrap().remove("stock_detected_at_ms");
+        }
+        private_json(&path,&terminal).unwrap();
+        let terminal_loaded=QueueState::load(root.path(),&HashMap::new()).unwrap();
+        let terminal_persisted:QueueState=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(terminal_loaded.jobs.iter().any(|job|job.stock_detected_at_ms==Some(original)));
+        assert_eq!(serde_json::to_value(&terminal_persisted.jobs).unwrap(),serde_json::to_value(&terminal_loaded.jobs).unwrap());
     }
 
     #[tokio::test]
