@@ -1295,7 +1295,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.8</span>
+          <span>DUO Killer · 0.1.9</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (
@@ -1587,12 +1587,7 @@ function SessionMaintenance({
       : "login";
   const runningFlow = current?.flow || flow;
   const reason =
-    current?.blocked_reason ||
-    (current?.requires_login
-      ? "requires_login"
-      : current?.busy
-        ? "account_busy"
-        : "");
+    current?.blocked_reason || (current?.busy ? "account_busy" : "");
   const remaining = Number.isFinite(current?.remaining_seconds)
     ? Math.max(
         0,
@@ -1614,13 +1609,11 @@ function SessionMaintenance({
         ? "下单/账号任务进行中，暂缓预热"
         : reason === "order_unresolved"
           ? "订单结果待确认，暂缓预热"
-          : reason === "requires_login"
-            ? "需要官网登录恢复，暂缓预热"
-            : remaining === 0
-              ? "空闲时间已满足，等待预热"
-              : remaining !== null
-                ? `距离预热 ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`
-                : "等待账号空闲";
+          : remaining === 0
+            ? "空闲时间已满足，等待预热"
+            : remaining !== null
+              ? `距离预热 ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`
+              : "等待账号空闲";
   return (
     <section
       className="ui-panel session-maintenance"
@@ -1660,7 +1653,10 @@ function SessionMaintenance({
           ? "按各账号的商品、数量和自提偏好准备结算；可能加购，不提交订单。浏览器按需无头运行。"
           : flow === "browser_login"
             ? "保留账号和浏览器登录资料，使用现有凭证恢复官网登录；不加购、不下单。浏览器按需无头运行。"
-            : "检查账号会话，不加购。浏览器按需无头运行。"}
+            : "自动维护账号会话，失效时使用保存的凭证登录；不加购、不下单。"}
+      </p>
+      <p className="ui-caption">
+        会话失效会自动登录；需要六位验证码时，在当前任务输入后继续。预热间隔不会阻止购买。
       </p>
       <p className="session-warm-timing">
         最近预热：

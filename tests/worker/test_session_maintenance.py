@@ -47,11 +47,11 @@ class SessionMaintenanceTests(unittest.TestCase):
             self.assertEqual(browser_profile_path(owner.auth), profile)
             from browser_process import _background_browser
             self.assertTrue(_background_browser.get())
-            return {'success': True, 'logged_in': True, 'status': 'healthy'}
+            return {'success': True, 'logged_in': True, 'status': 'healthy','apple_id':owner.account}
         with patch('browser_login.login_in_browser', side_effect=recover) as browser, \
                 patch.object(service, 'warm_login') as warm, patch('duo_killer.purchase_sku') as purchase:
             result = service.run('session_maintain', {'warm_only': True, 'preheat_flow': 'browser_login'})
-        browser.assert_called_once_with(service, timeout=12, maintenance=True, recover=True)
+        browser.assert_called_once_with(service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
         warm.assert_not_called()
         purchase.assert_not_called()
         self.assertEqual(result['preheat_flow'], 'browser_login')
@@ -104,18 +104,18 @@ class SessionMaintenanceTests(unittest.TestCase):
         self.assertEqual(second['cooldown_until_ms'], first['cooldown_until_ms'])
         self.assertFalse(service.headless_browser)
 
-    def test_headless_saved_password_is_reused_but_verification_code_never_prompts(self):
+    def test_headless_saved_password_is_reused_and_code_waits_in_current_task(self):
         from browser_login import BrowserSessionError
         service = self.real_service()
         service.vault.get.return_value = 'private-fixture-password'
         service.headless_browser = True
         self.assertEqual(service.credentials(service.auth), (service.account, 'private-fixture-password'))
-        for label in ('输入验证码', '其他人工认证'):
-            with self.assertRaises(BrowserSessionError) as raised:
-                service.text(label)
-            self.assertEqual(raised.exception.code, 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
-            self.assertTrue(raised.exception.requires_login)
-        service.channel.prompt.assert_not_called()
+        service.channel.prompt.return_value='123456'
+        self.assertEqual(service.text('输入验证码'), '123456')
+        service.channel.prompt.assert_called_once_with('code','输入验证码',default='')
+        with self.assertRaises(BrowserSessionError) as raised:
+            service.text('其他人工认证')
+        self.assertEqual(raised.exception.code, 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
         self.assertNotIn('private-fixture-password', str(raised.exception))
 
     def test_visible_missing_password_and_code_still_use_manual_prompts(self):
@@ -130,7 +130,7 @@ class SessionMaintenanceTests(unittest.TestCase):
         with patch('browser_login.login_in_browser', return_value={
                 'logged_in': True, 'status': 'healthy', 'message': 'fixture verified'}) as browser:
             result = maintain_session(self.service, now=lambda: 100)
-        browser.assert_called_once_with(self.service, timeout=12, maintenance=True)
+        browser.assert_called_once_with(self.service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
         self.assertEqual(result['status'], 'healthy')
         self.assertEqual(result['checked_at_ms'], 100000)
         self.assertEqual(result['cooldown_until_ms'], 0)
@@ -147,8 +147,29 @@ class SessionMaintenanceTests(unittest.TestCase):
         browser.assert_called_once()
         self.assertEqual(first['status'], 'blocked')
         self.assertTrue(first['requires_login'])
-        self.assertEqual(second['cooldown_until_ms'], 3700000)
+        self.assertEqual(second['cooldown_until_ms'], 700000)
         self.assertNotIn('private fixture', json.dumps(second))
+
+    def test_failure_retries_next_ten_minute_cycle_instead_of_old_hour_cooldown(self):
+        failure={'status':'blocked','requires_login':True,'http_status':541}
+        healthy={'success':True,'logged_in':True,'status':'healthy'}
+        with patch('browser_login.login_in_browser',side_effect=[failure,healthy]) as browser:
+            first=maintain_session(self.service,now=lambda:100)
+            maintain_session(self.service,now=lambda:101)
+            recovered=maintain_session(self.service,now=lambda:700)
+        self.assertEqual(first['cooldown_until_ms'],700000)
+        self.assertEqual(browser.call_count,2)
+        self.assertTrue(recovered['success'])
+        self.assertEqual(recovered['cooldown_until_ms'],0)
+
+    def test_old_hour_record_is_only_ten_minute_background_schedule(self):
+        (self.service.root/'session-maintenance.json').write_text(json.dumps({
+            'status':'blocked','checked_at_ms':100000,'cooldown_until_ms':3700000}),encoding='utf-8')
+        with patch('browser_login.login_in_browser',return_value={
+                'success':True,'logged_in':True,'status':'healthy'}) as browser:
+            result=maintain_session(self.service,now=lambda:701)
+        browser.assert_called_once()
+        self.assertTrue(result['success'])
 
     def test_missing_login_never_starts_automatic_authentication(self):
         with patch('browser_login.login_in_browser', return_value={
@@ -156,7 +177,7 @@ class SessionMaintenanceTests(unittest.TestCase):
             result = maintain_session(self.service, now=lambda: 100)
         login.assert_not_called()
         self.assertFalse(result['success'])
-        self.assertEqual(result['cooldown_until_ms'], 1900000)
+        self.assertEqual(result['cooldown_until_ms'], 700000)
 
     def test_local_browser_failures_are_not_login_expiry(self):
         from browser_login import BrowserSessionError
@@ -173,7 +194,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                 self.assertEqual(result['error_code'], code)
                 self.assertTrue(result['browser_started'])
                 self.assertFalse(result['browser_connected'])
-                self.assertEqual(result['cooldown_until_ms'], 400000)
+                self.assertEqual(result['cooldown_until_ms'], 700000)
 
     def test_network_and_unknown_errors_do_not_leak_or_expire_session(self):
         for error, code in ((requests.ConnectionError('https://fixture.test/?token=private-fixture'),
@@ -220,7 +241,7 @@ class SessionMaintenanceTests(unittest.TestCase):
         self.service.warm_login.assert_called_once_with()
         self.assertTrue(result['requires_login'])
         self.assertEqual(result['error_code'], 'WARM_LOGIN_REQUIRES_ATTENTION')
-        self.assertEqual(again['cooldown_until_ms'], 1900000)
+        self.assertEqual(again['cooldown_until_ms'], 700000)
         self.assertNotIn('private-fixture', json.dumps(again))
 
     def test_pickup_preheat_preserves_full_and_partial_preparation_without_healthy_claim(self):
@@ -283,18 +304,19 @@ class SessionMaintenanceTests(unittest.TestCase):
                 Service.warm_pickup_prepare(self.service, sku, count)
             self.service.run.assert_not_called()
 
-    def test_pickup_preheat_cannot_restart_quarantined_541_authentication(self):
+    def test_pickup_preheat_old_marker_does_not_stop_current_automatic_recovery(self):
         from apple_login import browser_profile_path
-        from browser_login import BrowserSessionError
-        self.service.auth = self.service.root / 'auth.json'
-        profile = browser_profile_path(self.service.auth)
-        profile.mkdir(parents=True)
-        (profile / '.authx-541').touch()
-        with self.assertRaises(BrowserSessionError) as raised:
-            Service.warm_pickup_prepare(self.service, 'MK2P4CH', 1)
-        self.assertEqual(raised.exception.http_status, 541)
-        self.service.run.assert_not_called()
-        self.assertTrue((profile / '.authx-541').exists())
+        service=self.real_service(); service.action='session_maintain'
+        service.ensure_auth_file()
+        profile=browser_profile_path(service.auth);profile.mkdir(parents=True)
+        (profile/'.authx-541').touch()
+        with patch('browser_login.login_in_browser',return_value={
+                'success':True,'logged_in':True,'status':'healthy','apple_id':service.account}) as browser, \
+                patch.object(service,'run',return_value={'success':True,'status':'waiting_stock'}) as run:
+            service.warm_pickup_prepare('MK2P4CH',1)
+        browser.assert_called_once_with(service,timeout=120,maintenance=True,storefront=True,recover=True,automatic=True)
+        run.assert_called_once()
+        self.assertTrue((profile/'.authx-541').exists())
 
     def test_service_pickup_flow_uses_account_saved_policy_and_hard_prepare_flag(self):
         import interaction
@@ -325,11 +347,11 @@ class SessionMaintenanceTests(unittest.TestCase):
             with patch('duo_killer.purchase_sku', side_effect=offline_prepare) as purchase, \
                     patch.object(service, 'prepare_purchase_session'), \
                     patch('browser_login.login_in_browser', return_value={
-                        'success': True, 'logged_in': True, 'status': 'healthy'}) as browser, \
+                        'success': True, 'logged_in': True, 'status': 'healthy', 'apple_id':service.account}) as browser, \
                     patch('requests.Session.request', side_effect=AssertionError('network forbidden')):
                 result = service.run('session_maintain', {'warm_only': True,
                     'preheat_flow': 'pickup_prepare', 'sku': 'MK2P4CH', 'quantity': 2})
-            browser.assert_called_once_with(service, timeout=12, maintenance=True, storefront=True)
+            browser.assert_called_once_with(service, timeout=120, maintenance=True, storefront=True, recover=True, automatic=True)
             purchase.assert_called_once()
             self.assertEqual(result['status'], 'waiting_stock')
             self.assertEqual(result['browser_mode'], 'headless')
@@ -394,7 +416,7 @@ class SessionMaintenanceTests(unittest.TestCase):
             with patch('browser_login.login_in_browser', return_value={'success': True, 'logged_in': True}) as browser, \
                     patch('duo_killer.login') as login:
                 result = service.run('login', {'browser_login': True})
-            browser.assert_called_once_with(service)
+            browser.assert_called_once_with(service, automatic=True, recover=True)
             login.assert_not_called()
             self.assertTrue(result['logged_in'])
             self.assertTrue(service.auth.exists())

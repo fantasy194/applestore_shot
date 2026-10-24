@@ -110,7 +110,8 @@ async function fixture(page: Page, busy = false, attention = false) {
       ];
       if (attention) {
         queueState.blocked_accounts = [
-          { account_id: "a", reason: "authentication" },
+          { account_id: "legacy-auth-account", reason: "authentication" },
+          { account_id: "a", reason: "submission_unknown" },
         ];
         queueState.jobs.push(
           {
@@ -375,7 +376,14 @@ test("相同入队时间按序号倒序，付款和未知结果常显且保留�
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "登录恢复后继续此账号" }),
-  ).toBeVisible();
+  ).toHaveCount(0);
+  await expect(page.getByText("需要恢复官网登录", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(page.locator(".queue-blocked")).toHaveCount(1);
+  await expect(page.locator(".queue-blocked")).toContainText(
+    "订单提交结果未知，请先查询订单确认",
+  );
   await expect(page.getByRole("link", { name: "查看账号日志" })).toHaveClass(
     /ui-action-link/,
   );

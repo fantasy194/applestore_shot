@@ -7,7 +7,7 @@ import re
 import time
 from urllib.parse import urlsplit
 
-from browser_input import BrowserInputInterrupted, _navigation_guard, click_control, replace_field, validate_keyboard_text
+from browser_input import BrowserInputInterrupted, _navigation_guard, click_control, replace_field, validate_keyboard_text, interaction_delay
 
 
 ACCOUNT_NAMES = re.compile(r'^(?:Apple (?:ID|账户|账号|Account)|电子邮件(?:或电话号码)?|电子邮件地址|邮箱|账号|账户|Email(?: or phone number)?|Account name)$', re.I)
@@ -84,9 +84,12 @@ def step_browser_signin(assistant, page, network, remote=None):
 
 
 class BrowserSigninAssistant:
-    def __init__(self, service, *, headless=False):
+    def __init__(self, service, *, headless=False, automatic=False):
         self.service = service
         self.headless = headless
+        self.automatic = automatic
+        self.otp_wait_seconds = 0.0
+        self.authenticated_account = False
         self.submitted = set()
         self.interrupted = False
         self.deadline = None
@@ -134,6 +137,88 @@ class BrowserSigninAssistant:
             return True
         body = frame.locator('body').inner_text(timeout=500)
         return isinstance(body, str) and bool(CHALLENGE_TEXT.search(body[:16000]))
+
+    def _verification_step(self, page, frame):
+        """Only a recognized six digit form is eligible for app-mediated OTP."""
+        if not self.automatic:
+            return 'verification'
+        if _visible(frame.locator('iframe[src*="captcha" i], iframe[title*="captcha" i]')):
+            raise _error('BROWSER_LOGIN_SECURITY_CHALLENGE', '官网要求安全验证，自动认证无法继续。')
+        body = frame.locator('body').inner_text(timeout=500)
+        if isinstance(body, str) and re.search(r'captcha|图形验证|人机验证|verify you are human', body[:16000], re.I):
+            raise _error('BROWSER_LOGIN_SECURITY_CHALLENGE', '官网要求安全验证，自动认证无法继续。')
+        split_fields = _visible(frame.locator('input[id^="char"][maxlength="1"], input[inputmode="numeric"][maxlength="1"], input[autocomplete="one-time-code"][maxlength="1"]'))
+        fields = split_fields if len(split_fields) == 6 else _visible(frame.locator('input[autocomplete="one-time-code"]'))
+        if len(fields) == 1 and fields[0].get_attribute('maxlength') == '1':
+            return 'unrecognized'
+        if len(fields) not in (1, 6):
+            # The challenge heading can precede its inputs during rendering.
+            # Use the wait loop's bounded recognition budget before failing.
+            return 'unrecognized'
+        # A fresh browser can already be on the OTP step. In that case require
+        # its exact rendered account rather than guessing from the profile.
+        accounts, _ = _fields(frame)
+        if not self.authenticated_account and not self._identity(frame, accounts):
+            raise _error('BROWSER_LOGIN_ACCOUNT_MISMATCH', '官网验证码页面未确认当前账号，已停止认证。')
+        if 'otp' in self.submitted:
+            return 'waiting'
+        handles = [field.element_handle(timeout=500) for field in fields]
+        try:
+            with _navigation_guard(page, self.service.channel.checkpoint, None, frame=frame) as check:
+                check()
+                started = time.monotonic()
+                try:
+                    code = self.service.channel.prompt('code', '输入 Apple 六位验证码，随后自动继续登录', account=self.service.account)
+                finally:
+                    self.otp_wait_seconds += time.monotonic() - started
+                check()
+                for current in page.frames:
+                    if _auth_frame(current) or current == page.main_frame:
+                        account_fields, _ = _fields(current)
+                        self._identity(current, account_fields)
+                if not isinstance(code, str) or re.fullmatch(r'[0-9]{6}', code) is None:
+                    raise _error('BROWSER_LOGIN_CODE_INVALID', '请输入六位数字验证码；本次未向官网提交。')
+                for field, original in zip(fields, handles):
+                    if original is None or field.evaluate('(element, original) => element === original', original) is not True:
+                        raise BrowserInputInterrupted('官网验证码字段已变化，已停止输入。')
+                self.deadline = time.monotonic() + 60
+                # Reserve before the first event: a timeout after typing does
+                # not establish that the official automatic submit did not run.
+                self.submitted.add('otp')
+                self.on_interaction()
+                if len(fields) == 1:
+                    replace_field(page, frame, fields[0], code[:5], check, deadline=self.deadline)
+                    check()
+                    focused = '(element, original) => element === original && element === element.ownerDocument.activeElement'
+                    if (fields[0].evaluate(focused, handles[0]) is not True
+                            or fields[0].input_value(timeout=500) != code[:5]):
+                        raise BrowserInputInterrupted('官网验证码输入已变化，已停止输入。')
+                    page.keyboard.type(code[-1], delay=interaction_delay())
+                else:
+                    # Apple advances focus within six one-character inputs.
+                    # Revalidate each original element before its normal event.
+                    for field, original, digit in zip(fields, handles, code):
+                        check()
+                        if field.evaluate('(element, original) => element === original', original) is not True:
+                            raise BrowserInputInterrupted('官网验证码字段已变化，已停止输入。')
+                        click_control(field)
+                        check()
+                        focused = '(element, original) => element === original && element === element.ownerDocument.activeElement'
+                        if field.evaluate(focused, original) is not True:
+                            raise BrowserInputInterrupted('官网验证码输入焦点已变化，已停止输入。')
+                        page.keyboard.press('ControlOrMeta+A')
+                        check()
+                        if field.evaluate(focused, original) is not True:
+                            raise BrowserInputInterrupted('官网验证码输入焦点已变化，已停止输入。')
+                        page.keyboard.type(digit, delay=interaction_delay())
+                # Apple submits the final digit itself, sometimes after a
+                # delayed callback. Never add click/Enter: an enabled button or
+                # a quiet network interval cannot prove no submit is pending.
+                return 'acted'
+        finally:
+            for original in handles:
+                if original is not None:
+                    original.dispose()
 
     def _identity(self, frame, accounts):
         expected = self.service.account.strip().casefold()
@@ -186,6 +271,7 @@ class BrowserSigninAssistant:
                     replace_field(page, frame, password, secret, bound_check, deadline=self.deadline)
                     self.password_input_incomplete = False
                 bound_check()
+                self.authenticated_account = True
                 if password.evaluate('(element) => Boolean(element.value)') is not True:
                     raise BrowserInputInterrupted('官网密码字段已变化，已停止继续。')
                 if not button.is_enabled():
@@ -204,7 +290,8 @@ class BrowserSigninAssistant:
             raise _error('BROWSER_LOGIN_INPUT_INTERRUPTED', '登录页面已变化，请在官网页面继续。')
         if network.get('authentication_failed') is True or any(network.get(key) == 401 for key in ('status', 'http_status', 'authentication_status', 'blocked_status')):
             self.terminal = True
-            self.service.reject_password()
+            if network.get('credential_rejected') is True:
+                self.service.reject_password()
             raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网拒绝了本次认证，请在官网确认账号和密码；未自动重试。')
         if network.get('pending') or network.get('error'):
             return 'waiting'
@@ -217,7 +304,7 @@ class BrowserSigninAssistant:
                 frames.append(page.main_frame)
             for frame in frames:
                 if self._verification(frame):
-                    return 'verification'
+                    return self._verification_step(page, frame)
                 alert = frame.get_by_role('alert').all_inner_texts()
                 if any(PASSWORD_ERROR.search(value[:4000]) for value in alert):
                     self.service.reject_password()

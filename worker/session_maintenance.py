@@ -31,8 +31,12 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
             previous = json.loads(path.read_text(encoding='utf-8'))
         except (ValueError, OSError):
             previous = {}
-        if previous.get('cooldown_until_ms', 0) > stamp:
-            result = {**previous, 'preheat_flow': preheat_flow, 'browser_mode': browser_mode, 'message': '会话维护处于冷却期，请按提示处理官网登录；未重复请求。'}
+        previous = previous if isinstance(previous, dict) else {}
+        checked_at = previous.get('checked_at_ms', 0)
+        if (previous.get('status') not in ('healthy', 'prepared', 'waiting_stock')
+                and type(checked_at) in (int, float) and checked_at > 0
+                and 0 <= stamp - checked_at < 600_000):
+            result = {**previous, 'preheat_flow': preheat_flow, 'browser_mode': browser_mode, 'cooldown_until_ms': checked_at + 600_000, 'message': '等待下一次空闲会话维护；购买可立即自动核验。'}
             record_maintenance_result(service, result, cooling=True, warm_only=warm_only)
             return result
     from browser_login import login_in_browser, BrowserSessionError
@@ -58,9 +62,9 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
                           'error_code', 'pickup_store', 'pickup_store_id', 'pickup_time_slot') if key in prepared}}
         else:
             if preheat_flow == 'browser_login':
-                checked = login_in_browser(service, timeout=12, maintenance=True, recover=True)
+                checked = login_in_browser(service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
             else:
-                checked = service.warm_login() if warm_only else login_in_browser(service, timeout=12, maintenance=True)
+                checked = service.warm_login() if warm_only else login_in_browser(service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
             status = checked.get('status', 'healthy' if checked.get('logged_in') is True else 'requires_login')
             status = status if status in ('healthy', 'requires_login', 'blocked', 'failed') else 'failed'
             result = {'success': status == 'healthy', 'status': status,
@@ -79,7 +83,7 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
         if http_status in (403, 429, 541):
             result = {'success': False, 'status': 'blocked', 'requires_login': True,
                       'http_status': http_status, 'error_code': 'APPLE_SESSION_BLOCKED',
-                      'message': '官网限制了本次会话检查，已进入冷却；请在官网窗口恢复。'}
+                      'message': '官网限制了本次自动会话恢复，将在下一空闲周期重试。'}
         elif isinstance(error, BrowserSessionError):
             result = {'success': False, 'status': error.status, 'requires_login': error.requires_login,
                       'error_code': error.code, 'message': str(error),
@@ -88,7 +92,7 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
                             or getattr(service, 'authentication_requested', False) is True):
             result = {'success': False, 'status': 'requires_login', 'requires_login': True,
                       'error_code': 'WARM_LOGIN_REQUIRES_ATTENTION',
-                      'message': '空闲预热需要人工完成认证，请打开账号任务处理；未创建订单。'}
+                      'message': '本次自动认证未完成，将在下一空闲周期重试；未创建订单。'}
         else:
             network = isinstance(error, requests.RequestException)
             local_io = isinstance(error, OSError)
@@ -102,8 +106,7 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
     result['preheat_flow'] = preheat_flow
     result['checked_at_ms'] = stamp
     result['cooldown_until_ms'] = (0 if result['status'] in ('healthy', 'prepared', 'waiting_stock') else stamp +
-        (60 * 60 * 1000 if result['status'] == 'blocked' else
-         30 * 60 * 1000 if result['requires_login'] else 5 * 60 * 1000))
+        600_000)
     duo_killer.write_private_json(path, result)
     record_maintenance_result(service, result, warm_only=warm_only)
     return result

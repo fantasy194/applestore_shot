@@ -1,4 +1,4 @@
-"""Immediate action-owned browser preparation; no cross-action session proof.
+"""Immediate action-owned account verification; no cross-action session proof.
 
 The queue wave window is local policy, never Apple session expiry.
 """
@@ -21,37 +21,65 @@ def _identity(service):
 
 
 def record_action_session(service, *, now_ms=None):
-    # This proof belongs only to the browser operation in the current action.
+    # This proof belongs only to the current action account verification.
     service._purchase_session_proof = {**_identity(service),
         'verified_at_ms': int(time.time() * 1000) if now_ms is None else now_ms}
 
 
-def _guard(service, current):
-    from apple_login import browser_profile_path
+def verify_account_session(service, *, force_browser=False):
+    """One current read, then at most one official browser authentication.
+
+    A maintenance record is scheduling metadata, never a purchase veto.
+    The read is authenticated with this account's current HTTP session and
+    cannot submit credentials or a purchase.
+    """
+    service.channel.checkpoint()
+    if Path(duo_killer.AUTH_PATH).resolve() != Path(service.auth).resolve():
+        raise ValueError('当前会话存储与任务账号归属不一致，未发起官网请求。')
+    service.ensure_auth_file()
+    if not force_browser:
+        return _read_or_restore(service)
+    return _restore_browser(service)
+
+
+def _read_or_restore(service):
     from browser_login import BrowserSessionError
-    if (browser_profile_path(service.auth) / '.authx-541').exists():
-        raise BrowserSessionError('APPLE_SESSION_BLOCKED',
-            '商城会话需要官网登录恢复；账号和浏览器资料已保留，未开始购买。',
-            status='blocked', requires_login=True, http_status=541)
-    path = Path(service.root) / 'session-maintenance.json'
-    if path.exists():
+    with requests.Session() as session:
+        duo_killer.load_auth(session, json.loads(Path(service.auth).read_text(encoding='utf-8')))
         try:
-            previous = json.loads(path.read_text(encoding='utf-8'))
-            until = previous.get('cooldown_until_ms', 0)
-            if type(until) not in (int, float):
-                raise ValueError()
-        except (ValueError, OSError, AttributeError):
-            raise ValueError('会话维护记录无法确认，请核对官网会话后重试；未开始购买。') from None
-        if until > current:
-            raise BrowserSessionError('PURCHASE_SESSION_COOLDOWN',
-                '官网会话维护仍在冷却，请先完成官网登录恢复；未开始购买。',
-                status='blocked', requires_login=True,
-                http_status=previous.get('http_status'))
+            result = duo_killer.account_info(session, reauthenticate=False)
+        except (ValueError, requests.RequestException):
+            result = None
+        if isinstance(result, dict) and result.get('success') is True and result.get('logged_in') is True:
+            if str(result.get('apple_id', '')).strip().casefold() != service.account.strip().casefold():
+                raise BrowserSessionError('APPLE_ACCOUNT_MISMATCH',
+                    '官网当前登录账号与任务账号不一致，未开始购买。',
+                    status='failed', requires_login=False)
+            duo_killer.save_auth(session)
+            return {**result, 'status': 'healthy'}
+    return _restore_browser(service)
+
+
+def _restore_browser(service):
+    from browser_login import BrowserSessionError, login_in_browser
+    service.stage('正在使用已保存凭据自动恢复官网会话')
+    result = login_in_browser(service, timeout=120, maintenance=True, storefront=True,
+                              recover=True, automatic=True)
+    if (not isinstance(result, dict) or result.get('success') is not True
+            or result.get('logged_in') is not True or result.get('status') not in (None, 'healthy')
+            or str(result.get('apple_id', '')).strip().casefold() != service.account.strip().casefold()):
+        result = result if isinstance(result, dict) else {}
+        failure_status = result.get('status')
+        raise BrowserSessionError(result.get('error_code', 'PURCHASE_SESSION_UNVERIFIED'),
+            result.get('message', '官网自动登录未完成，未开始加购或下单。'),
+            status=failure_status if failure_status in ('blocked', 'failed', 'requires_login') else 'requires_login',
+            requires_login=result.get('requires_login') is True or failure_status == 'requires_login',
+            http_status=result.get('http_status'))
+    return result
 
 
 def session_ready(service, *, now_ms=None):
     current = int(time.time() * 1000) if now_ms is None else now_ms
-    _guard(service, current)
     proof = getattr(service, '_purchase_session_proof', None)
     return (isinstance(proof, dict)
             and all(proof.get(key) == value for key, value in _identity(service).items())
@@ -66,8 +94,6 @@ def ensure_purchase_session(service):
     if owner is not None:
         # A nested serial executor shares the current queue wave, never creates
         # a second browser or starts a refresh from a retry.
-        current = int(time.time() * 1000)
-        _guard(owner, current)
         proof = getattr(owner, '_purchase_session_proof', None)
         if (not isinstance(proof, dict)
                 or any(proof.get(key) != value for key, value in _identity(service).items())):
@@ -75,7 +101,7 @@ def ensure_purchase_session(service):
         return
     if session_ready(service):
         return
-    from browser_login import BrowserSessionError, login_in_browser
+    from browser_login import BrowserSessionError
     from browser_process import background_browser_scope
     previous_headless, previous_idle = service.headless_browser, service.idle_maintenance
     previous_auth_requested = service.authentication_requested
@@ -83,19 +109,9 @@ def ensure_purchase_session(service):
     service.headless_browser = True
     service.idle_maintenance = True
     try:
-        service.stage('购买前刷新官网浏览器会话并核对账号，尚未加购或下单')
+        service.stage('购买前快速核对官网账号会话，尚未加购或下单')
         with background_browser_scope():
-            result = login_in_browser(service, timeout=12, maintenance=True, storefront=True)
-        if (not isinstance(result, dict) or result.get('success') is not True
-                or result.get('logged_in') is not True or result.get('status') not in (None, 'healthy')
-                or str(result.get('apple_id', '')).strip().casefold() != service.account.strip().casefold()):
-            result = result if isinstance(result, dict) else {}
-            failure_status = result.get('status')
-            raise BrowserSessionError(result.get('error_code', 'PURCHASE_SESSION_UNVERIFIED'),
-                result.get('message', '官网购买会话尚未核验，未开始加购或下单。'),
-                status=failure_status if failure_status in ('blocked', 'failed', 'requires_login') else 'requires_login',
-                requires_login=(result.get('requires_login') is True or failure_status != 'failed'),
-                http_status=result.get('http_status'))
+            verify_account_session(service)
         record_action_session(service)
         # Successful browser credential entry belongs to preparation, not a
         # later failed checkout round. Actual later checkout auth remains sticky.
@@ -115,14 +131,14 @@ def ensure_purchase_session(service):
                    'requires_login': blocked or attention, 'checked_at_ms': stamp,
                    'http_status': http_status if type(http_status) is int else None,
                    'error_code': 'APPLE_SESSION_BLOCKED' if blocked else getattr(error, 'code', 'PURCHASE_SESSION_CHECK_FAILED'),
-                   'message': '购买前官网会话核验未通过，请在官网恢复后重试；未开始加购或下单。',
-                   'cooldown_until_ms': stamp + (3_600_000 if blocked else 1_800_000 if attention else 300_000)}
+                   'message': '本次官网自动会话恢复未完成，未开始加购或下单；后续购买可立即重新核验。',
+                   'cooldown_until_ms': stamp + 600_000}
         duo_killer.write_private_json(Path(service.root) / 'session-maintenance.json', failure)
         if blocked and not isinstance(error, BrowserSessionError):
             # Raw requests errors can contain private URLs. Report only the
             # confirmed response status while retaining the original cause.
             raise BrowserSessionError('APPLE_SESSION_BLOCKED',
-                f'官网购买会话核验返回 HTTP {http_status}，请先完成官网登录恢复；未开始加购或下单。',
+                f'官网购买会话核验返回 HTTP {http_status}，自动恢复未完成；未开始加购或下单。',
                 status='blocked', requires_login=True, http_status=http_status) from error
         raise
     finally:

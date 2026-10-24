@@ -489,14 +489,19 @@ class AutoCheckoutTests(unittest.TestCase):
         self.assertTrue(event['qr_loading'])
 
     def test_warm_login_never_adds_checks_out_or_submits(self):
-        with patch.object(self.service, 'warm_start_context', return_value=False) as warm, \
+        with patch('browser_login.login_in_browser', return_value={
+                'success': True, 'logged_in': True, 'status': 'healthy',
+                'apple_id': self.service.account, 'browser_started': True}) as browser, \
+                patch.object(self.service, 'warm_start_context') as warm, \
                 patch.object(duo_killer, 'warm_empty_bag', return_value=True) as bag, \
-                patch.object(self.service, 'check_account', return_value={'logged_in': True}) as check, \
+                patch.object(self.service, 'check_account') as check, \
                 patch.object(duo_killer, 'login') as login, patch.object(duo_killer, 'add_to_bag') as add, \
-                patch.object(duo_killer, 'purchase_sku') as purchase, patch.object(duo_killer, 'pay_bag') as checkout:
+                patch.object(duo_killer, 'purchase_sku') as purchase, patch.object(duo_killer, 'pay_bag') as checkout, \
+                patch('requests.Session.request', side_effect=AssertionError('Synthetic warm fixture forbids real network')):
             result = self.service.run('login', {'warm_only': True})
-        check.assert_called_once_with(enrolling=False)
-        warm.assert_called_once_with()
+        browser.assert_called_once_with(self.service, timeout=120, maintenance=True,
+                                        storefront=True, recover=True, automatic=True)
+        check.assert_not_called(); warm.assert_not_called(); bag.assert_called_once_with()
         login.assert_not_called(); add.assert_not_called(); purchase.assert_not_called(); checkout.assert_not_called()
         self.assertTrue(result['warm_login'])
         self.assertFalse(self.service.submitted)

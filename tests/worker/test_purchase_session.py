@@ -45,10 +45,12 @@ class PurchaseSessionTests(unittest.TestCase):
         network.start();self.addCleanup(network.stop)
         browser=patch('browser_login.login_in_browser',side_effect=self.browser_refresh)
         self.browser=browser.start();self.addCleanup(browser.stop)
+        account=patch('duo_killer.account_info',return_value={'success':True,'logged_in':False})
+        self.account_read=account.start();self.addCleanup(account.stop)
         self.events=[]
 
     def browser_refresh(self,owner,**options):
-        self.assertEqual(options,{'timeout':12,'maintenance':True,'storefront':True})
+        self.assertEqual(options,{'timeout':120,'maintenance':True,'storefront':True,'recover':True,'automatic':True})
         self.assertTrue(owner.headless_browser)
         self.assertTrue(owner.idle_maintenance)
         from browser_process import _background_browser
@@ -127,25 +129,42 @@ class PurchaseSessionTests(unittest.TestCase):
             self.service.run('purchase',{'sku':'MK2M4CH','quantity':1})
         purchase.assert_called_once();self.browser.assert_called_once()
 
-    def test_marker_and_cooldown_override_recent_proof_without_browser_or_mutation(self):
-        record_action_session(self.service)
-        profile=browser_profile_path(self.service.auth);profile.mkdir(parents=True)
-        marker=profile/'.authx-541';marker.touch()
-        with patch('duo_killer.purchase_sku') as purchase:
-            with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})
-            marker.unlink()
-            duo_killer.write_private_json(self.root/'session-maintenance.json',
-                {'cooldown_until_ms':int(time.time()*1000)+60_000,'http_status':541})
-            with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})
-        self.browser.assert_not_called();purchase.assert_not_called()
-
-    def test_canonical_storefront_option_preserves_browser_541_guard(self):
+    def test_marker_and_old_cooldown_do_not_block_immediate_purchase_recovery(self):
         profile=browser_profile_path(self.service.auth);profile.mkdir(parents=True)
         (profile/'.authx-541').touch()
-        with patch('browser_login.find_browser',side_effect=AssertionError('must stop before browser launch')):
-            with self.assertRaises(BrowserSessionError) as raised:
-                actual_browser_login(self.service,timeout=12,maintenance=True,storefront=True)
-        self.assertEqual(raised.exception.http_status,541)
+        duo_killer.write_private_json(self.root/'session-maintenance.json',
+            {'cooldown_until_ms':int(time.time()*1000)+3_600_000,'http_status':541})
+        with patch('duo_killer.purchase_sku',return_value={'success':True,'status':'pending_payment'}) as purchase:
+            self.service.run('purchase',{'sku':'MK2M4CH'})
+        self.browser.assert_called_once();purchase.assert_called_once()
+
+    def test_current_verified_http_session_skips_browser_despite_old_failure(self):
+        self.account_read.return_value={'success':True,'logged_in':True,'apple_id':self.service.account}
+        duo_killer.write_private_json(self.root/'session-maintenance.json',
+            {'cooldown_until_ms':int(time.time()*1000)+3_600_000,'http_status':541})
+        with patch('duo_killer.purchase_sku',return_value={'success':True,'status':'pending_payment'}) as purchase:
+            self.service.run('purchase',{'sku':'MK2M4CH'})
+        self.browser.assert_not_called();purchase.assert_called_once()
+        self.assertFalse(self.account_read.call_args.kwargs['reauthenticate'])
+
+    def test_http_541_gets_one_automatic_recovery_before_exactly_one_purchase(self):
+        self.account_read.side_effect=ValueError('HTTP 541')
+        with patch('duo_killer.purchase_sku',return_value={'success':True,'status':'pending_payment'}) as purchase:
+            self.service.run('purchase',{'sku':'MK2M4CH'})
+        self.account_read.assert_called_once();self.browser.assert_called_once();purchase.assert_called_once()
+
+    def test_another_service_global_auth_binding_is_rejected_before_network(self):
+        duo_killer.AUTH_PATH=self.root/'other-account'/'auth.json'
+        with patch('duo_killer.purchase_sku') as purchase:
+            with self.assertRaisesRegex(ValueError,'归属不一致'):
+                self.service.run('purchase',{'sku':'MK2M4CH'})
+        self.account_read.assert_not_called();self.browser.assert_not_called();purchase.assert_not_called()
+
+    def test_current_wrong_account_stops_without_browser_or_purchase(self):
+        self.account_read.return_value={'success':True,'logged_in':True,'apple_id':'other@example.test'}
+        with patch('duo_killer.purchase_sku') as purchase:
+            with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})
+        self.browser.assert_not_called();purchase.assert_not_called()
 
     def test_refresh_block_and_challenge_stop_before_mutation_and_enter_cooldown(self):
         for result in ({'status':'blocked','http_status':541,'error_code':'APPLE_SESSION_BLOCKED'},
@@ -157,7 +176,7 @@ class PurchaseSessionTests(unittest.TestCase):
                     with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})
                     with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})
                 purchase.assert_not_called()
-        self.assertEqual(self.browser.call_count,2)
+        self.assertEqual(self.browser.call_count,4)
         self.assertFalse(self.service.headless_browser);self.assertFalse(self.service.idle_maintenance)
 
     def test_legacy_http_block_errors_share_hour_cooldown_and_stop_all_purchase_work(self):
@@ -185,7 +204,7 @@ class PurchaseSessionTests(unittest.TestCase):
                     self.assertEqual(saved['status'],'blocked')
                     self.assertEqual(saved['error_code'],'APPLE_SESSION_BLOCKED')
                     self.assertEqual(saved['http_status'],status)
-                    self.assertEqual(saved['cooldown_until_ms']-saved['checked_at_ms'],3_600_000)
+                    self.assertEqual(saved['cooldown_until_ms']-saved['checked_at_ms'],600_000)
                     self.assertGreaterEqual(saved['checked_at_ms'],before)
                     self.assertNotIn('synthetic-private',path.read_text(encoding='utf-8'))
                     self.assertFalse(self.service.headless_browser);self.assertFalse(self.service.idle_maintenance)

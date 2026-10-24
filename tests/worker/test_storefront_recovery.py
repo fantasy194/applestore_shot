@@ -100,6 +100,18 @@ class StorefrontRecoveryTests(unittest.TestCase):
                 context.clear_cookies.assert_not_called()
                 context.add_cookies.assert_not_called()
 
+    def test_automatic_authenticated_menu_redirect_continues_same_official_login(self):
+        context, page = self.context([{'type': 'signOut'}, {'type': 'account', 'url': ACCOUNT}], [COOKIE])
+        def goto(url, **kwargs):
+            page.url = ENTRY if url == ACCOUNT else url
+            return Mock(status=200)
+        page.goto.side_effect = goto
+        result = browser_login.open_storefront_login(context, Mock(), automatic=True)
+        self.assertEqual(result, ACCOUNT)
+        self.assertFalse(getattr(result, 'read_only', False))
+        self.assertEqual(page.url, ENTRY)
+        self.assertEqual(page.goto.call_count, 4)
+
     def test_authenticated_menu_can_refresh_cookie_without_new_login(self):
         links = [{'type': 'signOut', 'url': '/shop/signOut'},
                  {'type': 'account', 'url': ACCOUNT}]

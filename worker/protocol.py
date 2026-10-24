@@ -5,10 +5,15 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 
 class Cancelled(BaseException):
     pass
+
+
+class PromptClosed(ValueError):
+    """The process owning a prompt ended; no user reply was synthesized."""
 
 
 class Channel:
@@ -21,8 +26,11 @@ class Channel:
         self.command_error = None
         self.lock = threading.Lock()
         self.activity = None
+        self._checkout_auth_lease = None
 
     def emit(self, kind, **payload):
+        if kind == 'credential_rejected' and self._checkout_auth_lease is not None:
+            payload['checkout_auth_lease'] = self._checkout_auth_lease
         if self.activity is not None:
             try:
                 self.activity.observe(kind, payload)
@@ -75,23 +83,62 @@ class Channel:
             self.cancelled.set()
             self.responses.put(None)
 
-    def prompt(self, kind, label, *, timeout=None, **fields):
+    def prompt(self, kind, label, *, timeout=None, _alive=None, **fields):
         self.checkpoint()
+        if _alive is not None and not _alive():
+            raise PromptClosed('认证步骤已结束。')
         deadline = time.monotonic() + timeout if timeout is not None else None
         request_id = str(uuid.uuid4())
+        if kind == 'code' and self._checkout_auth_lease is not None:
+            fields['checkout_auth_lease'] = self._checkout_auth_lease
         self.emit('prompt', prompt=dict(id=request_id, kind=kind, label=label, **fields))
         while True:
+            self.checkpoint()
+            if _alive is not None and not _alive():
+                self.emit('prompt_closed', request_id=request_id)
+                raise PromptClosed('认证步骤已结束。')
             remaining = max(0, deadline - time.monotonic()) if deadline is not None else None
+            polling = min(remaining, .05) if remaining is not None else .05
             try:
-                response = self.responses.get(timeout=remaining)
+                response = self.responses.get(timeout=polling if _alive is not None else remaining)
             except queue.Empty:
                 self.checkpoint()
+                if _alive is not None and (deadline is None or time.monotonic() < deadline):
+                    continue
                 raise ValueError('准备等待已超时，请重新准备；未提交订单。') from None
             self.checkpoint()
             if deadline is not None and time.monotonic() >= deadline:
                 raise ValueError('准备等待已超时，请重新准备；未提交订单。')
             if response and response.get('request_id') == request_id:
                 return response.get('value')
+
+    @contextmanager
+    def checkout_authentication(self):
+        """Private child-parent lease; credentials never appear on event output."""
+        if self._checkout_auth_lease is not None:
+            raise ValueError('结账认证范围不能重复进入。')
+        reply = self.prompt('_checkout_authentication', '请求当前结账认证')
+        if not isinstance(reply, dict) or not isinstance(reply.get('lease'), str):
+            raise ValueError('结账认证授权无效。')
+        lease = reply['lease']
+        try:
+            if str(uuid.UUID(lease)) != lease:
+                raise ValueError()
+        except (ValueError, AttributeError):
+            raise ValueError('结账认证授权无效。') from None
+        self._checkout_auth_lease = lease
+        try:
+            password = reply.get('password')
+            if password is not None and (not isinstance(password, str) or not password
+                                         or len(password.encode('utf-8')) > 4096):
+                raise ValueError('结账凭据无效。')
+            yield {'password': password, 'remember': reply.get('remember') is True}
+        except Exception:
+            self.emit('checkout_auth_failed', checkout_auth_lease=lease)
+            raise
+        finally:
+            self.emit('checkout_auth_release', checkout_auth_lease=lease)
+            self._checkout_auth_lease = None
 
 
 class LogStream:

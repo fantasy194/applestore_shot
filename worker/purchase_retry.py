@@ -137,7 +137,7 @@ def _summary(configured, made, reason):
 def _failure_progress(service, summary):
     reason = summary['stop_reason']
     suffix = {'submitted': '发现提交或待付款记录，已停止自动重试，请先核对订单。',
-              'authentication': '需要处理登录或验证，已停止自动重试。',
+              'authentication': '本次认证未完成，当前下单尝试已结束。',
               'non_retryable': '当前失败需要人工处理，已停止自动重试。',
               'exhausted': '失败重试次数已用完。'}[reason]
     service.channel.emit('progress_result', result={'success': False, 'status': 'purchase_retry',

@@ -211,6 +211,11 @@ export function PurchaseQueue({
   const accountName = (id: string) =>
     format(accounts.find((account) => account.id === id)?.name || id);
   const completed = jobs.filter((job) => terminal(job.status)).length;
+  // Older servers may still report an authentication lock. Session recovery is
+  // automatic; only an unresolved order may require an account-level stop.
+  const blockedAccounts: Data[] = (state?.blocked_accounts || []).filter(
+    (blocked: Data) => blocked.reason !== "authentication",
+  );
   return (
     <main className="local-page purchase-queue">
       <header className="local-heading">
@@ -311,7 +316,7 @@ export function PurchaseQueue({
               </div>
               <p className="muted">
                 有货信号触发入队，后续监控显示无货、未知或样本过期不会阻止排队执行。
-                下单失败记录实际原因，并按目标设置的次数重试；提交结果未知或需要重新登录时停止重试。
+                下单失败记录实际原因，并按目标设置的次数重试；自动登录失败会结束本次任务，提交结果未知时先查询订单核实。
               </p>
               <p className="muted">
                 默认逐个执行，可同时执行 1–10
@@ -375,7 +380,7 @@ export function PurchaseQueue({
               </div>
             </section>
           ))}
-          {state?.blocked_accounts?.map((blocked: Data) => (
+          {blockedAccounts.map((blocked: Data) => (
             <section
               className="ui-panel queue-blocked"
               key={blocked.account_id}
@@ -384,22 +389,8 @@ export function PurchaseQueue({
                 <h2>{accountName(blocked.account_id)}</h2>
                 <span className="status blocked">需要处理</span>
               </div>
-              <p>
-                {blocked.reason === "authentication"
-                  ? "需要恢复官网登录"
-                  : "订单提交结果未知，请先查询订单确认"}
-              </p>
+              <p>订单提交结果未知，请先查询订单确认</p>
               <div className="ui-toolbar">
-                {blocked.reason === "authentication" && (
-                  <button
-                    disabled={busy}
-                    onClick={() =>
-                      command("resume", { account_id: blocked.account_id })
-                    }
-                  >
-                    登录恢复后继续此账号
-                  </button>
-                )}
                 <a
                   className="ui-action-link"
                   href={logsHref({ account_id: blocked.account_id })}

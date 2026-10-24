@@ -865,24 +865,29 @@ def reauthenticate_checkout(flow):
     client = AppleStoreLogin(auth_path=AUTH_PATH, session=flow.session)
     client.store_request = request_get
     client.store_referrer = flow.url
-    try:
-        account, password = load_credentials(AUTH_PATH)
-        response = client.login(account, password, signin_url=flow.url, signin_response=flow.page_response)
-    except LoginError as error:
-        raise ValueError("结账重新认证失败：" + str(error)) from error
-    except EOFError:
-        raise ValueError("结账验证码输入已取消，请在终端重新运行 -p。") from None
-    flow.read_page(response, "结账重新认证")
-    if urlsplit(flow.url).path.startswith("/shop/signIn"):
-        interaction.report_stage("结账重新认证后仍要求登录", authentication_failed=True)
-    if not any(isinstance(field(flow.model, 'checkout.' + step), dict)
-               for step in ('fulfillment', 'shipping', 'billing', 'review')):
-        raise ValueError("结账重新认证后仍未进入配送页面，已停止；未重复提交 checkout。")
-    # Persist renewed cookies before the long shipping/payment stages. A task
-    # interruption must not lose a successful authentication.
-    save_auth(flow.session)
-    log.info("[结账认证] 已恢复到有效结算步骤。")
-    return True
+    # Preserve the original Checkout Session and the exact signIn response.
+    # A child lease serializes only authentication; it never restarts checkout.
+    scope = (interaction.handler.checkout_authentication()
+             if hasattr(interaction.handler, 'checkout_authentication') else nullcontext())
+    with scope:
+        try:
+            account, password = load_credentials(AUTH_PATH)
+            response = client.login(account, password, signin_url=flow.url, signin_response=flow.page_response)
+        except LoginError as error:
+            raise ValueError("结账重新认证失败：" + str(error)) from error
+        except EOFError:
+            raise ValueError("结账验证码输入已取消，请在终端重新运行 -p。") from None
+        flow.read_page(response, "结账重新认证")
+        if urlsplit(flow.url).path.startswith("/shop/signIn"):
+            interaction.report_stage("结账重新认证后仍要求登录", authentication_failed=True)
+        if not any(isinstance(field(flow.model, 'checkout.' + step), dict)
+                   for step in ('fulfillment', 'shipping', 'billing', 'review')):
+            raise ValueError("结账重新认证后仍未进入配送页面，已停止；未重复提交 checkout。")
+        # Persist renewed cookies before the long shipping/payment stages. A task
+        # interruption must not lose a successful authentication.
+        save_auth(flow.session)
+        log.info("[结账认证] 已恢复到有效结算步骤。")
+        return True
 
 
 def checkout_delivery(flow):

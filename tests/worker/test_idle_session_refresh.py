@@ -1,4 +1,4 @@
-"""Idle preheat refreshes existing browser context without starting authentication."""
+"""Idle preheat refreshes existing browser context with automatic official authentication when needed."""
 import json
 from pathlib import Path
 import tempfile
@@ -59,10 +59,10 @@ class IdleSessionRefreshTests(unittest.TestCase):
 
         def browser(service, **kwargs):
             self.assertIs(service, self.service)
-            self.assertEqual(kwargs, {'timeout': 12, 'maintenance': True})
+            self.assertEqual(kwargs, {'timeout':120,'maintenance':True,'storefront':True,'recover':True,'automatic':True})
             self.assertTrue(service.headless_browser)
             events.append('browser-refreshed-and-verified')
-            return {'success': True, 'logged_in': True, 'status': 'healthy', 'scope': 'account'}
+            return {'success': True, 'logged_in': True, 'status': 'healthy', 'scope': 'account','apple_id':service.account,'browser_started':True}
 
         def bag():
             self.assertEqual(events, ['browser-refreshed-and-verified'])
@@ -92,7 +92,8 @@ class IdleSessionRefreshTests(unittest.TestCase):
                 self.forbid_auth_and_purchase(stack)
                 stack.enter_context(patch('browser_login.login_in_browser', return_value=result))
                 bag = stack.enter_context(patch('duo_killer.warm_empty_bag'))
-                self.assertIs(self.service.warm_login(), result)
+                with self.assertRaises(BrowserSessionError):
+                    self.service.warm_login()
                 bag.assert_not_called()
 
     def test_browser_exception_propagates_without_bag_or_authentication(self):
@@ -107,41 +108,26 @@ class IdleSessionRefreshTests(unittest.TestCase):
             self.assertIs(raised.exception, failure)
             bag.assert_not_called()
 
-    def test_known_541_marker_prevents_browser_refresh_and_preserves_profile(self):
-        profile = browser_profile_path(self.service.auth)
-        profile.mkdir(parents=True)
-        marker = profile / '.authx-541'
-        marker.touch()
-        trust = profile / 'fixture-device-trust'
-        trust.write_text('keep', encoding='utf-8')
-        before = self.service.auth.read_bytes()
-        with ExitStack() as stack:
-            self.forbid_auth_and_purchase(stack)
-            browser = stack.enter_context(patch('browser_login.login_in_browser'))
-            bag = stack.enter_context(patch('duo_killer.warm_empty_bag'))
-            with self.assertRaises(BrowserSessionError) as raised:
-                self.service.warm_login()
-            self.assertEqual(raised.exception.status, 'blocked')
-            self.assertEqual(raised.exception.http_status, 541)
-            browser.assert_not_called()
-            bag.assert_not_called()
+    def test_known_541_marker_does_not_suppress_current_automatic_browser_refresh(self):
+        profile=browser_profile_path(self.service.auth);profile.mkdir(parents=True)
+        marker=profile/'.authx-541';marker.touch()
+        with patch('browser_login.login_in_browser',return_value={
+                'success':True,'logged_in':True,'status':'healthy','apple_id':self.service.account}) as browser, \
+                patch('duo_killer.warm_empty_bag',return_value=True):
+            self.service.warm_login()
+        browser.assert_called_once()
         self.assertTrue(marker.exists())
-        self.assertEqual(trust.read_text(encoding='utf-8'), 'keep')
-        self.assertEqual(self.service.auth.read_bytes(), before)
 
-    def test_manual_warm_login_keeps_existing_explicit_behavior(self):
-        self.service.action = 'login'
-        self.service.headless_browser = False
-        with patch.object(self.service, 'warm_start_context', return_value=False) as warm, \
-                patch.object(self.service, 'check_account', return_value={'logged_in': True}) as check, \
-                patch('browser_login.login_in_browser') as browser, \
-                patch('duo_killer.warm_empty_bag', return_value=True) as bag:
-            result = self.service.warm_login()
-        warm.assert_called_once_with()
-        check.assert_called_once_with(enrolling=False)
-        browser.assert_not_called()
-        bag.assert_called_once_with()
-        self.assertFalse(result['browser_context_refreshed'])
+    def test_manual_warm_login_uses_same_automatic_flow_in_visible_window(self):
+        self.service.action='login';self.service.headless_browser=False
+        def refresh(owner,**options):
+            self.assertFalse(owner.headless_browser)
+            self.assertTrue(options['automatic'])
+            return {'success':True,'logged_in':True,'apple_id':owner.account}
+        with patch('browser_login.login_in_browser',side_effect=refresh) as browser, \
+                patch('duo_killer.warm_empty_bag',return_value=True) as bag:
+            self.service.warm_login()
+        browser.assert_called_once();bag.assert_called_once()
 
     def test_idle_maintenance_scope_refuses_saved_password_and_restores_on_cancel(self):
         from asyncio import CancelledError
@@ -182,7 +168,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
         def browser(*args, **kwargs):
             events.append('browser')
             self.assertTrue(service.idle_maintenance)
-            return {'success': True, 'logged_in': True, 'status': 'healthy'}
+            return {'success': True, 'logged_in': True, 'status': 'healthy','apple_id':service.account}
 
         def prepare(sku, *, quantity, prepare_only):
             events.append('prepare')

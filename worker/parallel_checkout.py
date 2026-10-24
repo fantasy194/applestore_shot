@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 
-from protocol import Cancelled
+from protocol import Cancelled, PromptClosed
 from platform_support import private_fd
 
 
@@ -28,10 +28,14 @@ MAX_CONCURRENCY = 10
 MAX_FILE_BYTES = 4_000_000
 ORDER_NUMBER = re.compile(r'W\d{6,20}')
 AUTH_GUARD = '并发会话需要重新登录'
-CHECKOUT_AUTH_MESSAGE = ('Apple 要求本次结账重新认证，账户页已登录并不代表结账已授权。'
-                         '并发子任务已停止且不会自动登录，请改用并发数 1 的串行下单完成认证。')
-SESSION_AUTH_MESSAGE = ('并发子任务的商城会话需要重新认证，已停止且不会自动登录。'
-                        '请改用并发数 1 的串行下单，在账号工作台完成认证。')
+CHECKOUT_AUTH_MESSAGE = 'Apple 要求本次结账认证，原会话认证未完成；本次未创建订单。'
+SESSION_AUTH_MESSAGE = '当前购买会话尚未完成认证；本次未自动重放购买。'
+
+
+# A queue can own multiple PurchaseBatch threads for the same account. Keep
+# authentication ownership here, across batches, while purchases stay parallel.
+_AUTHENTICATION_LOCK = threading.RLock()
+_AUTHENTICATION_LEASES = {}
 
 
 def concurrency(params):
@@ -147,6 +151,7 @@ class PurchaseBatch:
     def __init__(self, service, params, *, worker_command=None, skip_preflight=False,
                  process_slots=None):
         self.service, self.params = service, copy.deepcopy(params)
+        self.credential_owner = vars(service).get('parent_service') or service
         if 'pickup_policy' in self.params and 'queue_job_id' in self.params:
             # Lazy import avoids the queue/coordinator import cycle.
             from queued_checkout import normalize_queue_pickup_policy
@@ -162,6 +167,7 @@ class PurchaseBatch:
         self.attempts = []
         self.children = {}
         self.pending_prompts = deque()
+        self.stopping = threading.Event()
         self.job = None
         self.created = int(time.time())
         self.finished = False
@@ -318,6 +324,16 @@ class PurchaseBatch:
         child.stdin.flush()
         item['status'] = 'running'
 
+        done = threading.Event()
+        item['_collector_done'] = done
+        def queue_event(event):
+            while not self.stopping.is_set():
+                try:
+                    self.events.put((item, event), timeout=.05)
+                    return
+                except queue.Full:
+                    continue
+
         def collect():
             try:
                 while True:
@@ -325,38 +341,154 @@ class PurchaseBatch:
                     if not raw:
                         break
                     if len(raw) > MAX_FILE_BYTES:
-                        self.events.put((item, {'type': 'invalid'}))
+                        queue_event({'type': 'invalid'})
                         break
                     try:
                         event = json.loads(raw)
                     except (ValueError, TypeError):
-                        self.events.put((item, {'type': 'invalid'}))
+                        queue_event({'type': 'invalid'})
                         break
-                    self.events.put((item, event))
+                    if not self._private_authentication_event(item, event):
+                        queue_event(event)
+            except (OSError, UnicodeError, ValueError):
+                queue_event({'type': 'invalid'})
+            except Cancelled:
+                pass
             finally:
-                self.events.put((item, {'type': '_eof'}))
+                # Drain private events in stdout order: explicit password
+                # invalidation must finish before a released/EOF lease is reused.
+                self._release_authentication(item)
+                queue_event({'type': '_eof'})
+                try:
+                    child.stdout.close()
+                except (OSError, ValueError):
+                    pass
+                done.set()
         threading.Thread(target=collect, daemon=True).start()
 
-    def _reply(self, item, prompt):
+    def _release_authentication(self, item):
+        with _AUTHENTICATION_LOCK:
+            owned = _AUTHENTICATION_LEASES.get(self.channel.account_id)
+            if owned is not None and owned[0] is self and owned[1] == item['id']:
+                _AUTHENTICATION_LEASES.pop(self.channel.account_id, None)
+            item.pop('_checkout_auth_lease', None)
+
+    def _owns_authentication(self, item, lease):
+        with _AUTHENTICATION_LOCK:
+            owned = _AUTHENTICATION_LEASES.get(self.channel.account_id)
+            return (isinstance(lease, str) and owned is not None and owned[0] is self
+                    and owned[1] == item['id'] and owned[2] == lease)
+
+    def _private_authentication_event(self, item, event):
+        if (not isinstance(event, dict) or event.get('v') != 1
+                or event.get('account_id') != self.channel.account_id
+                or event.get('task_id') != item['task_id']):
+            return False
+        kind = event.get('type')
+        if kind not in ('checkout_auth_release', 'credential_rejected', 'checkout_auth_failed'):
+            return False
+        with _AUTHENTICATION_LOCK:
+            if self._owns_authentication(item, event.get('checkout_auth_lease')):
+                if kind == 'credential_rejected':
+                    self.service.authentication_failed = True
+                    self.credential_owner.reject_password()
+                elif kind == 'checkout_auth_failed':
+                    self.service.authentication_failed = True
+                else:
+                    self._release_authentication(item)
+        return True
+
+    def _send_reply(self, item, prompt, value):
         child = self.children[item['id']]
-        # Credentials in children must never be requested or re-entered.
-        if prompt.get('kind') in ('password', 'code'):
+        try:
+            child.stdin.write(json.dumps({
+                'type': 'reply', 'account_id': self.channel.account_id,
+                'task_id': item['task_id'], 'request_id': prompt.get('id'), 'value': value}) + '\n')
+            child.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            # One dead IPC consumer must not abort unrelated purchase routes.
+            if child.poll() is None:
+                try:
+                    child.kill()
+                except OSError:
+                    pass
+            try:
+                child.wait(timeout=.3)
+            except subprocess.TimeoutExpired:
+                pass
+            item.update(status='submission_unknown' if item['order_submitted'] else 'failed',
+                        terminal=True, retryable=False, error='当前购买子任务已结束，未自动重发。')
+            return False
+
+    def _reply(self, item, prompt):
+        if item.get('terminal'):
+            return
+        child = self.children[item['id']]
+        if not isinstance(prompt, dict) or not isinstance(prompt.get('id'), str) or not 1 <= len(prompt['id']) <= 200:
+            raise ValueError('并发子任务交互标识无效。')
+        kind = prompt.get('kind')
+        if kind == '_checkout_authentication':
+            owner = self.credential_owner
+            if (owner.channel.account_id != self.channel.account_id
+                    or not isinstance(owner.account, str) or not isinstance(self.service.account, str)
+                    or owner.account.strip().casefold() != self.service.account.strip().casefold()):
+                raise ValueError('结账认证的账号归属不一致。')
+            with _AUTHENTICATION_LOCK:
+                if child.poll() is not None:
+                    return
+                if item.get('_checkout_auth_granted') is True:
+                    self._stop_attempt(item)
+                    item.update(status='failed', terminal=True, retryable=False,
+                                error='同一购买尝试不能重复申请结账认证。')
+                    return
+                if self.channel.account_id in _AUTHENTICATION_LEASES:
+                    self.pending_prompts.append((item, prompt))
+                    return
+                lease = str(uuid.uuid4())
+                _AUTHENTICATION_LEASES[self.channel.account_id] = (self, item['id'], lease)
+                item['_checkout_auth_lease'] = lease
+                item['_checkout_auth_granted'] = True
+                item['_authentication_scope'] = 'checkout'
+            try:
+                # Reading the owner's credential is not a failed authentication
+                # in that parent's purchase round. The child's private outcome
+                # sets authentication_failed only when authentication fails.
+                previous_authentication = getattr(owner, 'authentication_requested', False)
+                try:
+                    password = owner.browser_password(allow_prompt=False)
+                finally:
+                    owner.authentication_requested = previous_authentication
+                if not isinstance(password, str) or not password:
+                    password = None
+                self._send_reply(item, prompt, {'lease': lease, 'password': password,
+                                              'remember': getattr(self.credential_owner, 'remember', False) is True})
+            except BaseException:
+                self._release_authentication(item)
+                raise
+            return
+        checkout_code = kind == 'code' and self._owns_authentication(item, prompt.get('checkout_auth_lease'))
+        if kind == 'password' or kind == 'code' and not checkout_code:
             self._stop_attempt(item)
             item.update(status='submission_unknown' if item['order_submitted'] else 'failed',
                         error=SESSION_AUTH_MESSAGE, terminal=True, retryable=False)
             if not item['order_submitted']:
                 item.update(error_code='PARALLEL_VERIFICATION_REQUIRED', requires_serial_checkout=True)
             return
-        kind = prompt.get('kind')
-        if kind not in ('confirm', 'select', 'text'):
+        if kind not in ('confirm', 'select', 'text', 'code'):
             raise ValueError('并发子任务返回了不支持的交互。')
         fields = {key: value for key, value in prompt.items()
-                  if key not in ('id', 'kind', 'label')}
-        value = self.channel.prompt(kind, f"[尝试 {item['attempt']}/{self.count}] {prompt.get('label', '')}", **fields)
-        child.stdin.write(json.dumps({
-            'type': 'reply', 'account_id': self.channel.account_id,
-            'task_id': item['task_id'], 'request_id': prompt.get('id'), 'value': value}) + '\n')
-        child.stdin.flush()
+                  if key not in ('id', 'kind', 'label', 'checkout_auth_lease')}
+        if checkout_code:
+            fields['_alive'] = lambda: child.poll() is None and self._owns_authentication(item, prompt.get('checkout_auth_lease'))
+        try:
+            value = self.channel.prompt(kind, f"[尝试 {item['attempt']}/{self.count}] {prompt.get('label', '')}", **fields)
+        except PromptClosed:
+            self._stop_attempt(item)
+            item.update(status='submission_unknown' if item['order_submitted'] else 'failed',
+                        error='结账认证已结束，验证码提示已撤回。', terminal=True, retryable=False)
+            return
+        self._send_reply(item, prompt, value)
 
     def _event(self, item, event):
         if not isinstance(event, dict):
@@ -376,6 +508,8 @@ class PurchaseBatch:
             self._stop_attempt(item)
             item.update(status='submission_unknown' if item['order_submitted'] else 'failed',
                         error='并发子任务的协议标识无效，已停止。', terminal=True)
+            return
+        if self._private_authentication_event(item, event):
             return
         if event.get('order_submitted') is True:
             item['order_submitted'] = True
@@ -431,6 +565,7 @@ class PurchaseBatch:
                 pass
 
     def _stop(self):
+        self.stopping.set()
         for item in self.attempts:
             self._stop_attempt(item)
         deadline = time.monotonic() + 0.7
@@ -452,9 +587,14 @@ class PurchaseBatch:
                 child.wait(timeout=0.3)
             except subprocess.TimeoutExpired:
                 pass
-            for stream in (child.stdin, child.stdout):
-                if stream:
-                    stream.close()
+            if child.stdin:
+                child.stdin.close()
+        # Private stdout is drained before ownership ends. In particular a
+        # preceding credential rejection cannot be skipped by process cleanup.
+        for item in self.attempts:
+            done = item.get('_collector_done')
+            if done is not None:
+                done.wait(timeout=1)
 
     def run(self):
         self.channel.checkpoint()
@@ -476,9 +616,10 @@ class PurchaseBatch:
                 try:
                     item, event = self.events.get(timeout=0.1)
                 except queue.Empty:
-                    continue
-                self._event(item, event)
-                self.persist()
+                    pass
+                else:
+                    self._event(item, event)
+                    self.persist()
                 if self.pending_prompts:
                     self._reply(*self.pending_prompts.popleft())
             # Read durable child evidence before constructing the return value;

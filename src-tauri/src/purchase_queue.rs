@@ -160,6 +160,11 @@ impl QueueState {
                 if episode.attempted { state.episodes.entry(key.clone()).or_insert_with(|| "legacy-attempt".into()); }
             }
         }
+        // Authentication is recovered within the owning worker. Older versions
+        // persisted this as a manual-resume gate; retain only unrelated blocks.
+        let previous_blocks=state.blocked_accounts.len();
+        state.blocked_accounts.retain(|_,reason|reason!="authentication");
+        let migrated_authentication=previous_blocks!=state.blocked_accounts.len();
         let mut recovered=false;
         let mut migrated_stock_time=false;
         let current=now_ms();
@@ -184,8 +189,13 @@ impl QueueState {
             }
         }
         if recovered { state.paused=true; }
-        if exists && (recovered || migrated_stock_time) { state.save(root)?; }
+        if exists && (recovered || migrated_stock_time || migrated_authentication) { state.save(root)?; }
         Ok(state)
+    }
+    pub(super) fn owns_active_prompt_assignment(&self,account:&str,task:&str,event:&Value)->bool {
+        self.jobs.iter().any(|job|job.account_id==account && job.task_id.as_deref()==Some(task)
+            && event["queue_job_id"]==job.id && event["queue_assignment"].as_u64()==Some(job.assignment)
+            && job.inflight())
     }
     fn limit(&self) -> usize { if self.mode=="parallel" {self.max_concurrency as usize} else {1} }
     fn active(&self) -> usize { self.jobs.iter().filter(|job| job.inflight()).count() }
@@ -333,15 +343,24 @@ fn queue_order_confirmation_at(result:&Value,enqueued:u64,received:u64)->Option<
 }
 
 pub(super) fn contains_unknown(result: &Value) -> bool {
-    if matches!(result["status"].as_str(),Some("submission_unknown"|"payment_unknown")) {return true}
-    let known=result["order_number"].as_str().is_some_and(|number|!number.is_empty())
-        || result["result"]["order_number"].as_str().is_some_and(|number|!number.is_empty())
-        || result["pending_orders"].as_array().is_some_and(|orders|!orders.is_empty())
-        || result["result"]["pending_orders"].as_array().is_some_and(|orders|!orders.is_empty());
-    let has_children=["attempts","queue_jobs","jobs"].iter().any(|key|result[*key].as_array().is_some_and(|rows|!rows.is_empty()));
-    if result["order_submitted"]==true && !known && !has_children {return true}
-    result.get("result").filter(|value|value.is_object()).is_some_and(contains_unknown)
-        || ["attempts","queue_jobs","jobs"].iter().any(|key|result[*key].as_array().is_some_and(|rows|rows.iter().any(contains_unknown)))
+    const CHILDREN: [&str;5] = ["result","attempts","queue_jobs","jobs","pending_orders"];
+    fn children_any(node:&Value,predicate:fn(&Value)->bool)->bool {
+        CHILDREN.iter().any(|key|match node.get(*key) {
+            Some(Value::Object(_))=>predicate(&node[*key]),
+            Some(Value::Array(rows))=>rows.iter().filter(|child|child.is_object()).any(predicate),
+            _=>false,
+        })
+    }
+    fn known_order(node:&Value)->bool {
+        node["order_number"].as_str().is_some_and(|number|!number.trim().is_empty())
+            || children_any(node,known_order)
+    }
+    if !result.is_object() {return false}
+    if matches!(result["status"].as_str(),Some("submission_unknown"|"unknown_submission"|"payment_unknown"|"verification_required")) {return true}
+    // Inspect each outcome before considering aggregate evidence. One known
+    // order cannot resolve another submitted child whose order is unknown.
+    if children_any(result,contains_unknown) {return true}
+    (result["order_submitted"]==true || result["submitted"]==true) && !known_order(result)
 }
 
 impl Engine {
@@ -700,7 +719,6 @@ impl Engine {
                 let account=job.account_id.clone();
                 let waiting=if let Some(reason)=queue.blocked_accounts.get(&account) {Some(match reason.as_str() {
                     "submission_unknown"=>"该账号存在未知提交，未重放任务",
-                    "authentication"=>"结账需要重新认证，请在原账号工作台完成后继续",
                     _=>"账号准备未完成，任务保留排队；请核实连接和登录状态后继续",
                 }.into())}
                     else if let Some(coordinator)=runtime.coordinators.get(&account) {
@@ -812,9 +830,11 @@ impl Engine {
                                     queue.jobs[index].status="queued".into();
                                     queue.jobs[index].message="已收到有货信号，继续按原排队位置执行".into();
                                 } else {
-                                    queue.jobs[index].status="queued".into();
-                                    queue.jobs[index].message=result["message"].as_str().unwrap_or("账号准备未完成，任务保留原排队位置，请核实后继续").chars().take(2000).collect();
-                                    queue.blocked_accounts.insert(account.into(),result["pause_reason"].as_str().unwrap_or("authentication").into());
+                                    // The worker already owns automatic authentication and its
+                                    // bounded retry budget. Finish this allocation on failure;
+                                    // returning it to queued would create an unbounded retry loop.
+                                    queue.jobs[index].status="failed".into();
+                                    queue.jobs[index].message=result["message"].as_str().unwrap_or("本次账号准备未完成，下单失败").chars().take(2000).collect();
                                 }
                             } else {
                                 queue.jobs[index].status=if status=="cancelled" {"cancelled"} else if result["success"]==true || status=="pending_payment" || status=="succeeded" {"succeeded"} else {"failed"}.into();
@@ -822,9 +842,6 @@ impl Engine {
                             }
                         }
                         queue.jobs[index].result=Some(result);
-                        if !unknown && queue.jobs[index].result.as_ref().is_some_and(|result|result["requires_serial_checkout"]==true) {
-                            queue.blocked_accounts.insert(account.into(),"authentication".into());
-                        }
                     }
                     if matches!(kind,"queue_started"|"queue_finished") {self.append_event(kind,&queue.jobs[index].context());}
                 }
@@ -1616,17 +1633,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authentication_pause_preserves_position_and_resume_needs_explicit_account() {
-        let (_root,engine,host,account)=fixture();observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);engine.queue_pump_once();
-        let first=jobs(&engine)[0].clone();
-        ack(&engine,&first,"queue_finished",json!({"status":"paused","started":false,"order_submitted":false,"pause_reason":"authentication","message":"结账需要重新认证"}));
-        let after=jobs(&engine);assert_eq!(after[0].status,"queued");assert_eq!(after[0].sequence,first.sequence);
-        assert_eq!(engine.purchase_queue.lock().unwrap().blocked_accounts[&account],"authentication");
-        engine.queue_command(host.clone(),"resume",&json!({})).unwrap();assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.contains_key(&account));
-        engine.queue_worker_ended(&account,first.task_id.as_deref().unwrap());
-        engine.queue_command(host,"resume",&json!({"account_id":account})).unwrap();assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.is_empty());
-        // The formerly allocated but explicitly unstarted job is eligible for a new assignment, never a submitted job.
-        assert_eq!(jobs(&engine)[0].id,first.id);assert_eq!(jobs(&engine)[0].status,"queued");
+    async fn prompt_closed_rejects_old_assignment_even_when_a_stale_prompt_still_matches() {
+        let (_root,engine,host,account)=fixture();observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();
+        let job=jobs(&engine)[0].clone();let task_id=job.task_id.as_deref().unwrap();
+        let event=json!({"type":"prompt_closed","request_id":"code","queue_job_id":job.id,"queue_assignment":job.assignment});
+        {
+            let mut tasks=engine.tasks.lock().unwrap();let task=tasks.get_mut(task_id).unwrap();task.status="waiting".into();
+            task.prompt=Some(json!({"id":"code","kind":"code","queue_job_id":job.id,"queue_assignment":job.assignment}));
+        }
+        // The prompt itself can remain from an older generation; current durable
+        // allocation ownership is checked before it may update the task UI.
+        engine.purchase_queue.lock().unwrap().jobs[0].assignment+=1;
+        engine.apply_worker_event(&host,&account,task_id,&event,true);
+        assert!(engine.tasks.lock().unwrap()[task_id].prompt.is_some());
+        engine.purchase_queue.lock().unwrap().jobs[0].assignment=job.assignment;
+        engine.apply_worker_event(&host,&account,task_id,&event,true);
+        assert!(engine.tasks.lock().unwrap()[task_id].prompt.is_none());
+        assert_eq!(engine.tasks.lock().unwrap()[task_id].status,"running");
+    }
+
+    #[tokio::test]
+    async fn exhausted_authentication_is_terminal_without_reassignment_or_account_gate() {
+        let (_root,engine,host,account)=fixture();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);engine.queue_pump_once();
+        let first=jobs(&engine)[0].clone();ready(&engine,&first);
+        ack(&engine,&first,"queue_finished",json!({"status":"paused","started":false,"order_submitted":false,
+            "pause_reason":"authentication","requires_serial_checkout":true,"message":"自动登录失败"}));
+        let after=jobs(&engine);assert_eq!(after[0].status,"failed");assert_eq!(after[0].sequence,first.sequence);
+        assert_eq!(after[0].message,"自动登录失败");
+        assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.is_empty());
+        for _ in 0..3 {engine.queue_pump_once();}
+        let continued=jobs(&engine);assert_eq!(continued[0].status,"failed");assert_eq!(continued[0].assignment,first.assignment);
+        assert!(continued[1].inflight());assert_eq!(continued[1].account_id,account);
+        // An old completion/start acknowledgement cannot revive the completed allocation.
+        ack(&engine,&first,"queue_started",Value::Null);assert_eq!(jobs(&engine)[0].status,"failed");
+        ack(&engine,&continued[1],"queue_finished",json!({"success":false,"status":"failed","order_submitted":false}));
+        let second=engine.add_account("after-auth-failure@example.test".into()).unwrap();engine.accounts.lock().unwrap()[1].pending=false;
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms()),target(&second.id,"R392",now_ms())]);
+        engine.queue_pump_once();let final_jobs=jobs(&engine);assert_eq!(final_jobs.len(),3);assert!(final_jobs[2].inflight());
+        assert_eq!(final_jobs[0].assignment,first.assignment);
+    }
+
+    #[tokio::test]
+    async fn restart_removes_legacy_authentication_gate_but_preserves_unknown_cancelled_and_new_signal_requirement() {
+        let (root,engine,host,account)=fixture();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms()),target(&account,"R392",now_ms())]);
+        let unknown_account=Uuid::new_v4().to_string();
+        {
+            let mut queue=engine.purchase_queue.lock().unwrap();
+            queue.blocked_accounts.insert(account.clone(),"authentication".into());
+            queue.blocked_accounts.insert(unknown_account.clone(),"submission_unknown".into());
+            queue.jobs[1].status="cancelled".into();
+            queue.jobs[2].status="running".into();
+            queue.jobs[2].account_id=unknown_account.clone();
+            queue.save(root.path()).unwrap();
+        }
+        let migrated=QueueState::load(root.path(),&HashMap::new()).unwrap();
+        assert!(!migrated.blocked_accounts.contains_key(&account));
+        assert_eq!(migrated.blocked_accounts[&unknown_account],"submission_unknown");
+        assert_eq!(migrated.jobs[0].status,"waiting_stock");assert!(!migrated.jobs[0].eligible());
+        assert_eq!(migrated.jobs[1].status,"cancelled");
+        assert_eq!(migrated.jobs[2].status,"interrupted");
+        assert!(migrated.paused);
+        let restored=Engine::new(root.path().into()).unwrap();restored.queue_stopping.store(true,Ordering::SeqCst);
+        restored.accounts.lock().unwrap()[0].pending=false;
+        restored.queue_command(host.clone(),"resume",&json!({})).unwrap();restored.queue_pump_once();
+        assert!(restored.snapshot().tasks.is_empty());
+        observe(&restored,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);restored.queue_pump_once();
+        let jobs=jobs(&restored);assert!(jobs[0].inflight());assert_eq!(jobs[1].status,"cancelled");assert_eq!(jobs[2].status,"interrupted");
+        assert_eq!(restored.purchase_queue.lock().unwrap().blocked_accounts[&unknown_account],"submission_unknown");
     }
 
     #[test]
@@ -1639,6 +1714,43 @@ mod tests {
         assert!(contains_unknown(&json!({"status":"failed","order_submitted":true})));
         assert!(!contains_unknown(&json!({"status":"failed","order_submitted":false})));
         assert!(!contains_unknown(&json!({"status":"queue_complete","order_submitted":true,"queue_jobs":[known]})));
+    }
+
+    #[test]
+    fn aggregate_submission_requires_order_evidence_and_never_masks_unknown_children() {
+        for status in ["submission_unknown","unknown_submission","payment_unknown","verification_required"] {
+            assert!(contains_unknown(&json!({"status":status,"order_number":"KNOWN-001"})));
+        }
+        assert!(contains_unknown(&json!({"submitted":true,"status":"failed"})));
+        assert!(contains_unknown(&json!({"submitted":true,"attempts":[{"status":"failed"}]})));
+        assert!(contains_unknown(&json!({"order_submitted":true,"queue_jobs":[{"status":"failed"}],"pending_orders":[{}]})));
+        assert!(contains_unknown(&json!({"order_submitted":true,"pending_orders":[{"order_number":"   "}]})));
+        for key in ["result","attempts","queue_jobs","jobs","pending_orders"] {
+            let mut aggregate=json!({"order_submitted":true,"order_number":"KNOWN-001"});
+            aggregate[key]=json!([{"submitted":true,"status":"failed"}]);
+            assert!(contains_unknown(&aggregate),"unknown child hidden under {key}");
+            aggregate[key]=json!({"submitted":true,"status":"failed"});
+            assert!(contains_unknown(&aggregate),"unknown object hidden under {key}");
+        }
+        assert!(!contains_unknown(&json!({"submitted":true,"pending_orders":[{"order_number":"KNOWN-001"}]})));
+        assert!(!contains_unknown(&json!({"submitted":true,"queue_jobs":[{"result":{"order_number":"KNOWN-001"}}]})));
+        assert!(!contains_unknown(&json!({"success":false,"attempts":[{"status":"failed","submitted":false}]})));
+        let mixed=json!({"submitted":true,"pending_orders":[{"order_number":"KNOWN-001"},
+            {"status":"verification_required","order_submitted":true}]});
+        assert!(contains_unknown(&mixed));
+    }
+
+    #[tokio::test]
+    async fn submitted_alias_aggregate_without_number_blocks_only_the_owning_account() {
+        let (_root,engine,host,account)=fixture();
+        let second=engine.add_account("alias-unknown@example.test".into()).unwrap();engine.accounts.lock().unwrap()[1].pending=false;
+        observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms()),target(&second.id,"R392",now_ms())]);
+        engine.queue_pump_once();let first=jobs(&engine)[0].clone();ready(&engine,&first);
+        ack(&engine,&first,"queue_finished",json!({"status":"failed","submitted":true,"attempts":[{"status":"failed"}]}));
+        assert_eq!(jobs(&engine)[0].status,"submission_unknown");
+        assert_eq!(engine.purchase_queue.lock().unwrap().blocked_accounts[&account],"submission_unknown");
+        engine.queue_pump_once();let after=jobs(&engine);assert!(after[1].pending());assert!(after[2].inflight());
+        assert_eq!(after[0].assignment,first.assignment);
     }
 
     #[tokio::test]

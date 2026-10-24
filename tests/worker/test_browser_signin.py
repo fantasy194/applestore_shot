@@ -10,9 +10,10 @@ from browser_login import BrowserSessionError
 
 
 class Field:
-    def __init__(self, frame, kind, value='', *, visible=True, autocomplete='', name=''):
+    def __init__(self, frame, kind, value='', *, visible=True, autocomplete='', name='', maxlength=None):
         self.frame, self.kind, self.value = frame, kind, value
         self.visible, self.autocomplete, self.name = visible, autocomplete, name
+        self.maxlength = maxlength
         self.clicks = 0
         self.on_click = None
 
@@ -21,6 +22,9 @@ class Field:
         self.frame.page.focus = self
         if self.on_click:
             self.on_click()
+
+    def get_attribute(self, name):
+        return self.maxlength if name == 'maxlength' else None
 
     def input_value(self, **_):
         return self.value
@@ -87,6 +91,8 @@ class Frame:
             return Locator([])
         if selector == 'input[type="password"]':
             return Locator([field for field in self.fields if field.kind == 'password'])
+        if 'input[id^="char"]' in selector:
+            return Locator([field for field in self.fields if field.kind == 'otp' and field.maxlength == '1'])
         if 'one-time-code' in selector:
             return Locator([field for field in self.fields if field.autocomplete == 'one-time-code'])
         if 'username' in selector:
@@ -119,6 +125,7 @@ class Page:
         self.listeners, self.events = {}, []
         self.closed = False
         self.after_type = None
+        self.wait_for_timeout = lambda milliseconds: None
         self.keyboard = SimpleNamespace(type=self.type, press=self.press)
 
     def is_closed(self):
@@ -236,6 +243,96 @@ class BrowserSigninTests(unittest.TestCase):
         if password:
             self.page.auth.fields.append(Field(self.page.auth, 'password', name='Password'))
         return account, button
+
+    def otp_form(self, code='012345', identity=True):
+        self.assistant = BrowserSigninAssistant(self.service, headless=True, automatic=True)
+        self.service.channel.prompt = Mock(return_value=code)
+        self.page.auth.body = 'Verification code'
+        field = Field(self.page.auth, 'otp', autocomplete='one-time-code')
+        self.page.auth.fields = [field]
+        if identity:
+            self.page.auth.fields.append(Field(self.page.auth, 'identity', self.service.account))
+        return field
+
+    def test_automatic_otp_uses_bound_code_prompt_and_submits_once(self):
+        field = self.otp_form()
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.assertEqual(field.value, '012345')
+        self.service.channel.prompt.assert_called_once_with('code',
+            '输入 Apple 六位验证码，随后自动继续登录', account=self.service.account)
+        self.assertEqual(self.assistant.step(self.page, self.network), 'waiting')
+        self.service.channel.prompt.assert_called_once()
+        self.service.browser_password.assert_not_called()
+
+    def test_otp_heading_before_fields_uses_recognition_budget_without_prompt(self):
+        self.otp_form()
+        self.page.auth.fields = []
+        self.assertEqual(self.assistant.step(self.page, self.network), 'unrecognized')
+        self.service.channel.prompt.assert_not_called()
+
+    def test_single_otp_focus_moved_after_fifth_digit_does_not_send_last_digit(self):
+        field = self.otp_form()
+        other = Field(self.page.auth, 'other')
+        self.page.after_type = lambda: setattr(self.page, 'focus', other) if len(field.value) == 5 else None
+        with self.assertRaises(BrowserSessionError) as error:
+            self.assistant.step(self.page, self.network)
+        self.assertEqual(error.exception.code, 'BROWSER_LOGIN_INPUT_INTERRUPTED')
+        self.assertEqual(field.value, '01234')
+        self.assertEqual(other.value, '')
+
+    def test_six_fields_with_only_first_autocomplete_use_all_six(self):
+        self.otp_form()
+        fields = [Field(self.page.auth, 'otp', maxlength='1',
+                    autocomplete='one-time-code' if index == 0 else '') for index in range(6)]
+        self.page.auth.fields = fields + [Field(self.page.auth, 'identity', self.service.account)]
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.assertEqual(''.join(field.value for field in fields), '012345')
+
+    def test_six_field_focus_interference_stops_before_more_code(self):
+        self.otp_form()
+        fields = [Field(self.page.auth, 'otp', maxlength='1',
+                    autocomplete='one-time-code' if index == 0 else '') for index in range(6)]
+        fields[1].on_click = lambda: setattr(self.page, 'focus', fields[5])
+        self.page.auth.fields = fields + [Field(self.page.auth, 'identity', self.service.account)]
+        with self.assertRaises(BrowserSessionError) as error:
+            self.assistant.step(self.page, self.network)
+        self.assertEqual(error.exception.code, 'BROWSER_LOGIN_INPUT_INTERRUPTED')
+        self.assertEqual(''.join(field.value for field in fields), '0')
+
+    def test_otp_rejection_does_not_invalidate_saved_password(self):
+        self.otp_form()
+        self.assistant.submitted.update(('password', 'otp'))
+        with self.assertRaises(BrowserSessionError):
+            self.assistant.step(self.page, {'authentication_failed': True, 'credential_rejected': False})
+        self.service.reject_password.assert_not_called()
+
+    def test_automatic_otp_needs_confirmed_account_and_six_digits(self):
+        for identity, code, expected in ((False, '012345', 'BROWSER_LOGIN_ACCOUNT_MISMATCH'),
+                                         (True, '12345', 'BROWSER_LOGIN_CODE_INVALID'),
+                                         (True, '1234567', 'BROWSER_LOGIN_CODE_INVALID')):
+            with self.subTest(identity=identity, code_length=len(code)):
+                self.setUp()
+                self.otp_form(code, identity)
+                with self.assertRaises(BrowserSessionError) as error:
+                    self.assistant.step(self.page, self.network)
+                self.assertEqual(error.exception.code, expected)
+                self.assertEqual(self.page.events, [])
+
+    def test_automatic_otp_cancel_preserves_cancellation_without_keyboard_events(self):
+        from protocol import Cancelled
+        self.otp_form()
+        self.service.channel.prompt.side_effect = Cancelled()
+        with self.assertRaises(Cancelled):
+            self.assistant.step(self.page, self.network)
+        self.assertEqual(self.page.events, [])
+
+    def test_automatic_captcha_does_not_prompt_for_otp_or_guess(self):
+        self.otp_form()
+        self.page.auth.body = 'Captcha: verify you are human'
+        with self.assertRaises(BrowserSessionError) as error:
+            self.assistant.step(self.page, self.network)
+        self.assertEqual(error.exception.code, 'BROWSER_LOGIN_SECURITY_CHALLENGE')
+        self.service.channel.prompt.assert_not_called()
 
     def test_account_first_step_types_and_clicks_only_once(self):
         account, button = self.form()
@@ -432,7 +529,7 @@ class BrowserSigninTests(unittest.TestCase):
     def test_explicit_existing_credentials_never_retries_failed_authentication(self):
         self.form(account=self.service.account, password=True)
         with self.assertRaises(BrowserSessionError):
-            self.assistant.step(self.page, {'authentication_failed': True})
+            self.assistant.step(self.page, {'authentication_failed': True, 'credential_rejected': True})
         self.assertFalse(self.assistant.request_existing_credentials())
         self.service.browser_password.assert_not_called()
 

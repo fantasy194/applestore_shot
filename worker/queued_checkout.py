@@ -24,6 +24,36 @@ MAX_BUFFERED = 200
 MAX_JOBS = 1000
 
 
+def _contains_unknown_submission(result):
+    if not isinstance(result, dict):
+        return False
+    if result.get('status') in ('submission_unknown', 'unknown_submission', 'payment_unknown', 'verification_required'):
+        return True
+    children = []
+    for key in ('result', 'attempts', 'queue_jobs', 'jobs', 'pending_orders'):
+        value = result.get(key)
+        if isinstance(value, dict):
+            children.append(value)
+        elif isinstance(value, list):
+            children.extend(item for item in value if isinstance(item, dict))
+    if any(_contains_unknown_submission(child) for child in children):
+        return True
+    def known(node):
+        if not isinstance(node, dict):
+            return False
+        number = node.get('order_number')
+        if isinstance(number, str) and number.strip():
+            return True
+        for key in ('result', 'attempts', 'queue_jobs', 'jobs', 'pending_orders'):
+            value = node.get(key)
+            if isinstance(value, dict) and known(value):
+                return True
+            if isinstance(value, list) and any(known(item) for item in value):
+                return True
+        return False
+    return (result.get('order_submitted') is True or result.get('submitted') is True) and not known(result)
+
+
 def normalize_queue_pickup_policy(value):
     """Freeze only authorized public pickup fields, never contact/signing data."""
     from pickup_options import validate_policy, validate_time_rule
@@ -170,10 +200,16 @@ class TargetChannel:
 
     def prompt(self, kind, label, **fields):
         # Channel has one current prompt; serialize interactions across jobs.
+        alive = fields.pop('_alive', None)
+        from protocol import PromptClosed
         while not self.owner.prompt_lock.acquire(timeout=.05):
             self.checkpoint()
+            if alive is not None and not alive():
+                raise PromptClosed('认证步骤已结束。')
         try:
             self.checkpoint()
+            if alive is not None and not alive():
+                raise PromptClosed('认证步骤已结束。')
             timeout = fields.pop('timeout', None)
             deadline = time.monotonic() + timeout if timeout is not None else None
             request_id = str(uuid.uuid4())
@@ -184,6 +220,9 @@ class TargetChannel:
                 queue_job_id=self.identity, queue_assignment=self.assignment)
             while True:
                 self.checkpoint()
+                if alive is not None and not alive():
+                    self.emit('prompt_closed', request_id=request_id)
+                    raise PromptClosed('认证步骤已结束。')
                 if deadline is not None and time.monotonic() >= deadline:
                     raise ValueError('队列交互等待已超时，未自动继续。')
                 try:
@@ -387,11 +426,13 @@ class QueuedCheckout:
         result = None
         try:
             def attempt():
-                if context.parent_serial:
-                    return self.parent_executor(context, target)
-                batch = self.batch_factory(context, target, worker_command=self.command,
-                                           skip_preflight=True, process_slots=self.slots)
-                return batch.run()
+                from purchase_execution import execute_purchase_attempt
+                def isolated(service, params):
+                    batch = self.batch_factory(service, params, worker_command=self.command,
+                                               skip_preflight=True, process_slots=self.slots)
+                    return batch.run()
+                return execute_purchase_attempt(context, target, isolated=not context.parent_serial,
+                    parallel_executor=isolated, serial_executor=self.parent_executor)
             result = run_purchase(context, target, attempt, backoff_seconds=self.backoff)
         except Cancelled:
             result = {**self._recover(context), 'success': False,
@@ -418,7 +459,7 @@ class QueuedCheckout:
             if result['order_submitted']:
                 self.service.submitted = True
             if result.get('requires_serial_checkout') or result.get('retry_summary', {}).get('stop_reason') == 'authentication':
-                result['pause_reason'] = 'authentication'
+                result['authentication_recovery_failed'] = True
             if result.get('status') == 'parallel_complete':
                 unknown = any(item.get('status') == 'submission_unknown' for item in result.get('attempts', []))
                 result['status'] = 'submission_unknown' if unknown else 'succeeded' if result.get('success') else 'failed'
@@ -435,6 +476,12 @@ class QueuedCheckout:
                 prior = self.jobs[identity].get('progress') or {}
                 if prior.get('status') == 'pending_payment' and prior.get('order_number') == result['order_number']:
                     result['pending_orders'] = [{**prior,'task_id':context.channel.task_id}]
+            # Stop locally before emitting the ACK: waiting for Rust to observe
+            # the durable submission marker would allow the next job to race.
+            if _contains_unknown_submission(result):
+                result['status'] = 'submission_unknown'
+                result['success'] = False
+                result['retryable'] = False
             try:
                 _write(context.task_dir / 'task.json', {
                     'id': context.channel.task_id, 'account_id': context.channel.account_id,
@@ -471,8 +518,10 @@ class QueuedCheckout:
             self.running.pop(identity, None)
             if result.get('status') == 'submission_unknown':
                 self.paused = 'submission_unknown'
-            elif result.get('pause_reason') == 'authentication' and self.paused is None:
-                self.paused = 'authentication'
+            elif result.get('authentication_recovery_failed'):
+                # A completed failed attempt is final. Recheck only for the next
+                # distinct authorized target, after every active child drains.
+                self.service._purchase_session_proof = None
             self._finish(identity, result)
             self.channel.emit('progress_result', result=self.snapshot())
 
@@ -512,6 +561,16 @@ class QueuedCheckout:
                     self._finish(identity, {'status': 'cancelled', 'success': False,
                                             'started': False, 'order_submitted': False, 'retryable': False})
 
+    def _fail_preparation(self, error):
+        message = self._preparation_error(error)
+        while self.waiting:
+            identity = self.waiting.popleft()
+            self._finish(identity, {'status': 'failed', 'success': False,
+                                   'started': False, 'order_submitted': False,
+                                   'message': message, 'retryable': False,
+                                   'error_code': getattr(error, 'code', 'PURCHASE_SESSION_CHECK_FAILED')})
+        self.channel.emit('stage', message='本次官网自动会话恢复未完成，当前队列目标已结束。')
+
     def run(self):
         self.channel.checkpoint()
         self._add(self.initial)
@@ -519,15 +578,7 @@ class QueuedCheckout:
             try:
                 self.service.prepare_purchase_session()
             except Exception as error:
-                import requests
-                authentication = (not isinstance(error, requests.RequestException)
-                                  and (getattr(error, 'requires_login', False) is True
-                                       or getattr(self.service, 'authentication_requested', False) is True
-                                       or getattr(self.service, 'authentication_failed', False) is True
-                                       or bool(re.search(r'登录|认证|验证码', str(error)))))
-                self.paused = 'authentication' if authentication else 'preflight_failed'
-                self.pause_message = self._preparation_error(error)
-                self.channel.emit('stage', message='账号预检未通过，尚未启动下单任务，请处理后手动恢复队列。')
+                self._fail_preparation(error)
             else:
                 self.channel.emit('queue_ready')
             while True:
@@ -552,8 +603,7 @@ class QueuedCheckout:
                                 break  # Drain current checkout before refreshing shared auth.
                             self.service.prepare_purchase_session()
                     except Exception as error:
-                        self.paused = 'authentication' if getattr(error, 'requires_login', False) is True else 'preflight_failed'
-                        self.pause_message = self._preparation_error(error)
+                        self._fail_preparation(error)
                         break
                     self._launch(self.waiting.popleft())
                 if not self.running and not self.waiting:

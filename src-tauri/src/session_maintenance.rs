@@ -24,13 +24,6 @@ fn configure_flow(settings: &mut Settings, value: &Value, current: u64) -> Resul
     if settings.flow != flow {
         settings.enabled_at_ms = current;
         settings.flow = flow.into();
-        if flow == "browser_login" {
-            // A deliberate change to recovery authorizes one background attempt.
-            // Keep cooldown/markers; saving the same flow cannot re-arm a refusal.
-            for run in &mut settings.last_runs {
-                if run.status != "running" { run.requires_login = false; }
-            }
-        }
     }
     Ok(())
 }
@@ -112,13 +105,9 @@ fn load(root: &Path) -> (Settings, Option<String>) {
         Some(mut settings) if (5..=240).contains(&settings.interval_minutes)
             && settings.last_runs.len() <= 1000 && valid_flow(&settings.flow)
             && settings.last_runs.iter().all(|run| valid_flow(&run.flow)) => {
-                if settings.mode != warm_mode() {
-                    // Legacy read-only sign-in redirects are not a failed login attempt.
-                    // Preserve their cooldown, and preserve manual recovery for 541 blocks.
-                    for run in &mut settings.last_runs {
-                        if run.status == "requires_login" { run.requires_login = false; }
-                    }
-                }
+                // Historical authentication failures are diagnostics, not a permanent
+                // manual-recovery gate. Automatic retries follow the idle interval.
+                for run in &mut settings.last_runs { run.cooldown_until_ms = 0; }
                 settings.mode = warm_mode();
                 settings.interval_minutes = 10;
                 (settings, None)
@@ -156,7 +145,6 @@ fn next_check(snapshot: &Snapshot, run: &Run, settings: &Settings, started_at: u
     started_at.max(settings.enabled_at_ms).max(last_order_activity(snapshot, &run.account_id))
         .max(run.last_checked_at_ms).max(run.last_warm_at_ms)
         .saturating_add(u64::from(settings.interval_minutes) * 60_000)
-        .max(run.cooldown_until_ms)
 }
 
 impl Maintenance {
@@ -192,11 +180,17 @@ impl Maintenance {
                     run.order_ready = result["order_ready"] == true && result["review_verified"] == true && run.status == "prepared";
                     run.message = result["message"].as_str().unwrap_or(&task.stage).chars().take(400).collect();
                     run.requires_login = result["requires_login"] == true;
-                    run.cooldown_until_ms = result["cooldown_until_ms"].as_u64().unwrap_or(0);
+                    run.cooldown_until_ms = 0;
                     if task.status == "interrupted" || task.status == "cancelled" {
                         run.message = "上次空闲预热已中断，下单优先；未重放购买。".into();
                     }
                 }
+            }
+            if run.status == "running" && !run.task_id.as_ref().is_some_and(|id|
+                snapshot.tasks.iter().any(|task| &task.id == id && active(&task.status))) {
+                run.status = "failed".into();
+                run.message = "上次空闲预热已结束或中断，等待下次空闲维护。".into();
+                run.cooldown_until_ms = 0;
             }
             if run.requires_login && snapshot.tasks.iter().any(|task| task.account_id == run.account_id
                 && matches!(task.action.as_str(), "login" | "enroll" | "me")
@@ -224,8 +218,7 @@ impl Maintenance {
         if let Some(runs) = result["last_runs"].as_array_mut() {
             for run in runs {
                 let account = run["account_id"].as_str().unwrap_or("").to_owned();
-                let reason = blocked_reason(&snapshot, &account).or_else(||
-                    (run["requires_login"] == true).then_some("requires_login"));
+                let reason = blocked_reason(&snapshot, &account);
                 run["last_order_activity_at_ms"] = json!(last_order_activity(&snapshot, &account));
                 run["remaining_seconds"] = json!(run["next_check_at_ms"].as_u64().unwrap_or(0)
                     .saturating_sub(current).saturating_add(999) / 1000);
@@ -282,7 +275,7 @@ impl Maintenance {
         // One browser at a time for idle maintenance; purchase dispatch takes priority.
         if snapshot.tasks.iter().any(|task| task.action == "session_maintain" && active(&task.status)) { return; }
         for run in settings.last_runs {
-            if run.requires_login || run.status == "running" || run.next_check_at_ms > current { continue; }
+            if run.status == "running" || run.next_check_at_ms > current { continue; }
             if blocked_reason(&snapshot, &run.account_id).is_some() { continue; }
             if self.run_account(engine, host, &run.account_id).is_ok() { break; }
         }
@@ -374,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_changes_delay_next_preheat_but_freeze_the_active_run_and_preserve_blocks() {
+    fn flow_changes_delay_next_preheat_but_freeze_the_active_run_and_diagnostics() {
         let mut settings = Settings::default();
         settings.last_runs.push(Run { flow: "login".into(), account_id: "fixture".into(), preparation_stage: None, order_ready: false,
             status: "running".into(), last_checked_at_ms: 10, last_warm_at_ms: 20,
@@ -402,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn choosing_browser_recovery_arms_once_without_clearing_cooldown_or_active_runs() {
+    fn flow_selection_preserves_failure_diagnostics_without_rearming_authentication() {
         let mut settings = Settings::default();
         settings.last_runs.push(Run { flow: "login".into(), account_id: "fixture".into(), preparation_stage: None,
             order_ready: false, status: "blocked".into(), last_checked_at_ms: 10, last_warm_at_ms: 20,
@@ -412,11 +405,11 @@ mod tests {
         active.account_id = "busy".into(); active.status = "running".into();
         settings.last_runs.push(active);
         configure_flow(&mut settings, &json!("browser_login"), 1000).unwrap();
-        assert!(!settings.last_runs[0].requires_login);
+        assert!(settings.last_runs[0].requires_login);
         assert_eq!(settings.last_runs[0].cooldown_until_ms, 3_600_000);
         assert_eq!(settings.last_runs[0].status, "blocked");
         assert!(settings.last_runs[1].requires_login);
-        settings.last_runs[0].requires_login = true; // This attempt needs a human.
+        settings.last_runs[0].requires_login = true; // Preserve the last attempt's diagnosis.
         configure_flow(&mut settings, &json!("browser_login"), 2000).unwrap();
         assert!(settings.last_runs[0].requires_login);
         assert_eq!(settings.enabled_at_ms, 1000);
@@ -497,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_read_only_settings_migrate_to_ten_minute_warm_login_without_erasing_blocks() {
+    fn legacy_settings_remove_manual_recovery_gates_without_erasing_failure_diagnostics() {
         let temporary = tempfile::tempdir().unwrap();
         fs::create_dir_all(temporary.path().join("settings")).unwrap();
         fs::write(temporary.path().join("settings/session-maintenance.json"), serde_json::to_vec(&json!({
@@ -511,9 +504,14 @@ mod tests {
         assert!(error.is_none());
         assert_eq!(settings.mode, "idle_warm_login");
         assert_eq!(settings.interval_minutes, 10);
-        assert!(!settings.last_runs[0].requires_login);
-        assert_eq!(settings.last_runs[0].cooldown_until_ms, 900);
+        assert!(settings.last_runs[0].requires_login);
+        assert_eq!(settings.last_runs[0].cooldown_until_ms, 0);
         assert!(settings.last_runs[1].requires_login);
+        assert_eq!(settings.last_runs[1].cooldown_until_ms, 0);
+        assert_eq!(settings.last_runs[1].status, "blocked");
+        assert_eq!(settings.last_runs[1].message, "fixture");
+        save(temporary.path(), &settings).unwrap();
+        assert_eq!(load(temporary.path()).0.last_runs[1].cooldown_until_ms, 0);
     }
 
     #[test]
@@ -554,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_maintenance_keeps_cooldown_until_a_later_verified_login() {
+    fn failed_maintenance_retries_at_idle_interval_and_preserves_diagnosis_until_verified_login() {
         let temporary = tempfile::tempdir().unwrap();
         let (engine, account) = fixture_engine(temporary.path());
         let service = fixture_service(temporary.path(), 1000);
@@ -582,7 +580,8 @@ mod tests {
         assert!(blocked.requires_login);
         assert_eq!(blocked.status, "blocked");
         assert_eq!(blocked.last_checked_at_ms, 200700);
-        assert_eq!(blocked.next_check_at_ms, 3800700);
+        assert_eq!(blocked.cooldown_until_ms, 0);
+        assert_eq!(blocked.next_check_at_ms, 801000);
         login.created_at = 202;
         login.updated_at = 203;
         snapshot.tasks = vec![maintenance, login];
@@ -591,6 +590,94 @@ mod tests {
         assert!(!recovered.requires_login);
         assert_eq!(recovered.cooldown_until_ms, 0);
         assert_eq!(recovered.status, "waiting");
+    }
+
+    #[test]
+    fn current_mode_persisted_failure_cooldown_is_migrated_and_missing_task_cannot_stall() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (engine, account) = fixture_engine(temporary.path());
+        let initial = fixture_service(temporary.path(), 1000);
+        initial.refresh(&engine.snapshot());
+        let mut settings = initial.settings.lock().unwrap().clone();
+        settings.last_runs[0].status = "blocked".into();
+        settings.last_runs[0].requires_login = true;
+        settings.last_runs[0].cooldown_until_ms = 99_000_000;
+        save(temporary.path(), &settings).unwrap();
+        let service = fixture_service(temporary.path(), 1000);
+        service.refresh(&engine.snapshot());
+        let run = service.settings.lock().unwrap().last_runs[0].clone();
+        assert_eq!(run.cooldown_until_ms, 0);
+        assert_eq!(run.next_check_at_ms, 601_000);
+        assert!(run.requires_login);
+        let status = service.status(&engine);
+        assert!(status["last_runs"][0]["blocked_reason"].is_null());
+        assert_eq!(status["last_runs"][0]["requires_login"], true);
+        {
+            let mut settings = service.settings.lock().unwrap();
+            settings.last_runs[0].status = "running".into();
+            settings.last_runs[0].task_id = Some("task-removed-from-history".into());
+        }
+        service.refresh(&engine.snapshot());
+        let settings = service.settings.lock().unwrap();
+        assert_eq!(settings.last_runs[0].status, "failed");
+        assert_eq!(settings.last_runs[0].account_id, account);
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_retries_after_ten_minutes_but_waiting_otp_never_duplicates() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let (engine, account) = fixture_engine(root);
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python = project.join(if cfg!(windows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" });
+        let script = root.join("retry-maintenance-fixture.py");
+        fs::write(&script, r#"import json,sys,pathlib,time
+r=json.loads(sys.stdin.readline())
+marker=pathlib.Path(__file__).with_suffix('.attempted')
+def emit(kind, **data):
+ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type=kind,**data)),flush=True)
+if not marker.exists():
+ marker.touch()
+ emit('result',result={'success':False,'status':'blocked','requires_login':True,'cooldown_until_ms':int(time.time()*1000)+3600000,'message':'Fixture previous login failed'})
+else:
+ emit('prompt',prompt={'id':'fixture-otp','kind':'code','label':'Fixture six digit code'})
+ for line in sys.stdin:
+  if json.loads(line).get('type')=='cancel':
+   emit('cancelled'); break
+"#).unwrap();
+        let host = TaskHost { worker: python, script: Some(script), on_update: Arc::new(|_|{}) };
+        let current = now_ms();
+        let service = fixture_service(root, current - 11 * 60_000);
+        service.tick_at(&engine, &host, current);
+        for _ in 0..400 {
+            if engine.snapshot().tasks.iter().all(|task| !active(&task.status)) { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        service.refresh(&engine.snapshot());
+        let failed = service.settings.lock().unwrap().last_runs[0].clone();
+        assert_eq!(failed.status, "blocked");
+        assert!(failed.requires_login);
+        assert_eq!(failed.cooldown_until_ms, 0);
+        assert_eq!(failed.next_check_at_ms, failed.last_warm_at_ms + 600_000);
+        service.tick_at(&engine, &host, failed.next_check_at_ms - 1);
+        assert_eq!(engine.snapshot().tasks.len(), 1);
+        service.tick_at(&engine, &host, failed.next_check_at_ms);
+        for _ in 0..400 {
+            // A result event precedes worker exit and release of its account permit.
+            // Subsequent scheduler ticks retry admission once cleanup finishes.
+            service.tick_at(&engine, &host, failed.next_check_at_ms);
+            if engine.snapshot().tasks.iter().any(|task| task.status == "waiting") { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.tasks.len(), 2);
+        let otp = snapshot.tasks.iter().find(|task| task.status == "waiting").expect("same maintenance task waits for OTP");
+        assert_eq!(otp.account_id, account);
+        assert_eq!(otp.prompt.as_ref().unwrap()["kind"], "code");
+        service.tick_at(&engine, &host, failed.next_check_at_ms + 3_600_000);
+        assert_eq!(engine.snapshot().tasks.len(), 2);
+        assert_eq!(blocked_reason(&engine.snapshot(), &account), Some("account_busy"));
+        engine.shutdown().await;
     }
 
     #[tokio::test]

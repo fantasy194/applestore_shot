@@ -313,16 +313,64 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result['pause_reason'],'submission_unknown')
         self.assertEqual(result['queue_jobs'][1]['status'],'paused')
 
-    def test_authentication_pauses_without_nested_login_or_retry(self):
+    def test_failed_return_with_submission_stops_next_job_before_ack_round_trip(self):
+        called=[]
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            context.submitted=True
+            return {'success':False,'status':'failed','message':'官网提交响应丢失'}
+        result,_=self.execute([target('a'),target('b','R002')],execute)
+        self.assertEqual(called,['a'])
+        self.assertEqual(result['pause_reason'],'submission_unknown')
+        self.assertEqual(self.finished()[0]['result']['status'],'submission_unknown')
+        self.assertEqual(self.finished()[1]['result']['status'],'paused')
+
+    def test_nested_submitted_without_order_is_unknown_even_with_another_known_order(self):
+        called=[]
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            return {'success':False,'status':'failed','attempts':[
+                {'status':'pending_payment','order_number':'W12345678','order_submitted':True},
+                {'status':'failed','result':{'submitted':True}}]}
+        result,_=self.execute([target('a'),target('b','R002')],execute)
+        self.assertEqual(called,['a'])
+        self.assertEqual(result['pause_reason'],'submission_unknown')
+        self.assertEqual(self.finished()[0]['result']['status'],'submission_unknown')
+
+    def test_empty_pending_order_object_does_not_prove_known_submission(self):
+        called=[]
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            context.submitted=True
+            return {'success':False,'status':'failed','pending_orders':[{}]}
+        result,_=self.execute([target('a'),target('b','R002')],execute)
+        self.assertEqual(called,['a'])
+        self.assertEqual(result['pause_reason'],'submission_unknown')
+
+    def test_failed_return_with_confirmed_order_preserves_evidence_and_next_target(self):
+        called=[]
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            context.submitted=True
+            return {'success':False,'status':'failed','order_number':'W12345678',
+                    'message':'已确认订单，二维码读取失败'}
+        result,_=self.execute([target('a'),target('b','R002')],execute)
+        self.assertEqual(called,['a','b'])
+        self.assertIsNone(result['pause_reason'])
+        self.assertEqual(self.finished()[0]['result']['order_number'],'W12345678')
+
+    def test_authentication_failure_finishes_target_then_parent_rechecks_next_target(self):
+        self.service.purchase_session_ready.side_effect=lambda: self.service._purchase_session_proof is not None
         called=[]
         def executor(context,item):
             called.append(item['queue_job_id'])
             return {'success':False,'status':'failed','error_code':'CHECKOUT_REAUTH_REQUIRED',
                     'requires_serial_checkout':True,'retryable':False}
         result,_=self.execute([target('a',retry_count=2),target('b','R002')],executor)
-        self.assertEqual(called,['a'])
-        self.assertEqual(result['pause_reason'],'authentication')
-        self.assertEqual(self.finished()[1]['result']['status'],'paused')
+        self.assertEqual(called,['a','b'])
+        self.assertIsNone(result['pause_reason'])
+        self.assertTrue(all(event['result']['status']=='failed' for event in self.finished()))
+        self.assertEqual(self.service.prepare_purchase_session.call_count,2)
 
     def test_cancel_queued_job_is_acknowledged_once(self):
         def executor(context,item):
@@ -512,24 +560,45 @@ class QueueTests(unittest.TestCase):
         executor.assert_not_called()
         self.assertEqual(len(self.finished()),2)
         for event in self.finished():
-            self.assertEqual(event['result']['status'],'paused')
+            self.assertEqual(event['result']['status'],'failed')
             self.assertFalse(event['result']['started'])
             self.assertFalse(event['order_submitted'])
-            self.assertEqual(event['result']['pause_reason'],'preflight_failed')
-        self.assertEqual(result['pause_reason'],'preflight_failed')
+            self.assertNotIn('pause_reason',event['result'])
+        self.assertIsNone(result['pause_reason'])
         self.assertNotIn('private-url-token',self.channel.output.getvalue())
         self.assertFalse(any(event['type']=='queue_started' for event in self.channel.events))
 
-    def test_parent_preflight_authentication_failure_pauses_for_manual_resume(self):
+    def test_parent_preflight_authentication_failure_finishes_without_permanent_account_pause(self):
         from browser_login import BrowserSessionError
         self.service.prepare_purchase_session.side_effect=BrowserSessionError('OFFICIAL_SIGNIN_REQUIRED',
             '官网登录需要人工验证',status='requires_login',requires_login=True)
         executor=Mock(side_effect=AssertionError('no target may start'))
         result,_=self.execute([target('a')],executor)
         executor.assert_not_called()
-        self.assertEqual(result['pause_reason'],'authentication')
-        self.assertTrue(result['requires_serial_checkout'])
+        self.assertIsNone(result['pause_reason'])
+        self.assertFalse(result['requires_serial_checkout'])
+        self.assertEqual(self.finished()[0]['result']['status'],'failed')
         self.assertFalse(self.finished()[0]['result']['started'])
+
+    def test_failed_preparation_does_not_replay_old_target_or_block_new_distinct_target(self):
+        from browser_login import BrowserSessionError
+        self.service.prepare_purchase_session.side_effect=[BrowserSessionError(
+            'APPLE_SESSION_BLOCKED','当前官网返回 HTTP 541',status='blocked',http_status=541),None]
+        self.service.purchase_session_ready.return_value=False
+        arrived=[]
+        def next_arrival(kind,payload):
+            if kind=='queue_idle' and not arrived:
+                arrived.append(True)
+                self.channel.send('queue_add',queue_targets=[target('a'),target('b','R002')])
+        self.channel.callback=next_arrival
+        executor=Mock(return_value={'success':False,'status':'failed','message':'官网门店无货'})
+        result,_=self.execute([target('a')],executor)
+        self.assertEqual(self.service.prepare_purchase_session.call_count,2)
+        executor.assert_called_once()
+        self.assertEqual(executor.call_args.args[1]['queue_job_id'],'b')
+        self.assertEqual([event['queue_job_id'] for event in self.finished()],['a','b'])
+        self.assertTrue(all(event['result']['status']=='failed' for event in self.finished()))
+        self.assertIsNone(result['pause_reason'])
 
     def test_result_without_status_still_acknowledges_and_does_not_strand_slot(self):
         result,_=self.execute([target('a')],lambda context,item:{'success':False})

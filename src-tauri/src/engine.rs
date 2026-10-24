@@ -640,6 +640,10 @@ impl Engine {
     fn apply_worker_event(&self, app: &TaskHost, account: &str, id: &str, event: &Value, queue_stream: bool) {
         if event.get("account_id").is_some_and(|owner|owner!=account) || event.get("task_id").is_some_and(|owner|owner!=id) {return}
         let kind=event["type"].as_str().unwrap_or("");
+        if queue_stream && kind=="prompt_closed" && (event.get("queue_job_id").is_some() || event.get("queue_assignment").is_some()) {
+            let queue=self.purchase_queue.lock().unwrap();
+            if !queue.owns_active_prompt_assignment(account,id,event) {return}
+        }
         if queue_stream && matches!(kind,"queue_ready"|"queue_started"|"queue_progress"|"queue_finished"|"queue_idle"|"stage")
             && !self.queue_worker_event(account,id,event) {return}
         self.update(app,id,|task|apply_event(task,event));
@@ -1149,6 +1153,19 @@ pub fn apply_event(task: &mut Task, event: &Value) {
                 .unwrap_or("等待输入")
                 .into();
         }
+        "prompt_closed" => {
+            let owned=event.get("account_id").is_none_or(|owner|owner==&task.account_id)
+                && event.get("task_id").is_none_or(|owner|owner==&task.id);
+            let matches_prompt=task.prompt.as_ref().is_some_and(|prompt|
+                event["request_id"].as_str().is_some_and(|id|!id.is_empty() && prompt["id"]==id)
+                    && prompt["queue_job_id"]==event["queue_job_id"]
+                    && prompt["queue_assignment"]==event["queue_assignment"]);
+            if owned && task.status=="waiting" && matches_prompt {
+                task.prompt=None;
+                task.status="running".into();
+                task.stage=if task.queue_job_ids.is_empty() {"正在处理任务结果"} else {"正在执行门店下单队列"}.into();
+            }
+        }
         "stage" => {
             task.stage = event["message"].as_str().unwrap_or("执行中").into();
         }
@@ -1391,6 +1408,36 @@ mod tests {
         assert_eq!(task.status,"failed");
         assert!(task.stage.contains("已跳过"),"{}",task.stage);
         assert!(task.execution_started_at_ms.is_none());
+    }
+
+    #[test]
+    fn prompt_closed_matches_current_request_and_never_clears_new_or_foreign_prompt() {
+        let mut current=task();current.status="waiting".into();
+        current.prompt=Some(json!({"id":"new-code","kind":"code","label":"六位验证码"}));
+        for event in [json!({"type":"prompt_closed","request_id":"old-code"}),
+            json!({"type":"prompt_closed"}),json!({"type":"prompt_closed","request_id":""}),
+            json!({"type":"prompt_closed","request_id":"new-code","account_id":"foreign"}),
+            json!({"type":"prompt_closed","request_id":"new-code","task_id":"foreign"})] {
+            apply_event(&mut current,&event);assert!(current.prompt.is_some());assert_eq!(current.status,"waiting");
+        }
+        apply_event(&mut current,&json!({"type":"prompt_closed","request_id":"new-code"}));
+        assert!(current.prompt.is_none());assert_eq!(current.status,"running");
+        current.status="failed".into();current.prompt=Some(json!({"id":"late-code","kind":"code"}));
+        apply_event(&mut current,&json!({"type":"prompt_closed","request_id":"late-code"}));
+        assert_eq!(current.status,"failed");
+    }
+
+    #[test]
+    fn prompt_closed_queue_binding_requires_the_exact_target_assignment() {
+        let mut current=task();current.status="waiting".into();current.queue_job_ids=vec!["job-a".into()];
+        current.prompt=Some(json!({"id":"code","kind":"code","queue_job_id":"job-a","queue_assignment":2}));
+        for event in [json!({"type":"prompt_closed","request_id":"code"}),
+            json!({"type":"prompt_closed","request_id":"code","queue_job_id":"job-b","queue_assignment":2}),
+            json!({"type":"prompt_closed","request_id":"code","queue_job_id":"job-a","queue_assignment":1})] {
+            apply_event(&mut current,&event);assert!(current.prompt.is_some());
+        }
+        apply_event(&mut current,&json!({"type":"prompt_closed","request_id":"code","queue_job_id":"job-a","queue_assignment":2}));
+        assert!(current.prompt.is_none());assert_eq!(current.status,"running");
     }
 
     #[test]

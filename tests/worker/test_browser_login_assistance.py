@@ -1,6 +1,6 @@
 """Shared browser wait loop permits bounded UI login while preserving human OTP."""
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import browser_login
 from browser_signin import BrowserSigninAssistant
@@ -37,6 +37,22 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
         self.assertEqual(result, ([COOKIE], 'fixture-agent'))
         assistant.step.assert_called_once_with(page, network)
         page.wait_for_timeout.assert_not_called()
+
+    def test_automatic_otp_wait_is_excluded_from_short_refresh_deadline(self):
+        page, browser, process, network = self.waiting()
+        assistant = Mock(otp_wait_seconds=0.0)
+        clock = [0.0]
+        def advance(*args):
+            clock[0] = 180.0
+            assistant.otp_wait_seconds = 180.0
+            return 'acted'
+        assistant.step.side_effect = advance
+        page.wait_for_timeout.side_effect = lambda _: setattr(page, 'url', ACCOUNT)
+        with patch('browser_login.time.monotonic', side_effect=lambda: clock[0]):
+            result = browser_login.wait_for_account_page(browser, process, Mock(), 12, network,
+                headless=True, automatic=True, assistant=assistant, settle_seconds=0)
+        self.assertEqual(result, ([COOKIE], 'fixture-agent'))
+        assistant.step.assert_called_once()
 
     def test_headless_verification_stops_before_more_input_or_account_probe(self):
         page, browser, process, network = self.waiting()

@@ -16,6 +16,8 @@ from protocol import Channel, Cancelled
 
 FAKE_WORKER = r'''
 import argparse, json, os, pathlib, sys, time
+for stream in (sys.stdin, sys.stdout):
+    stream.reconfigure(encoding='utf-8')
 p = argparse.ArgumentParser()
 p.add_argument('--data-dir'); p.add_argument('--account-id'); p.add_argument('--task-id')
 a = p.parse_args()
@@ -57,11 +59,44 @@ if mode in ('checkout_auth', 'session_auth'):
     from service import Service
     from types import SimpleNamespace
     try:
-        Service.credentials(SimpleNamespace(_parallel_child=True), root / 'auth.json')
+        Service.credentials(SimpleNamespace(_parallel_child=True, _checkout_auth_active=False), root / 'auth.json')
     except ValueError as error:
         emit('error', message=str(error), order_submitted=False)
         sys.exit(0)
     raise AssertionError('child credential guard was bypassed')
+if mode in ('ipc_auth', 'ipc_otp', 'ipc_eof', 'ipc_reject', 'ipc_cancel', 'ipc_otp_exit_then_valid', 'ipc_auth_failed', 'ipc_plain_failure'):
+    sys.path[:0] = [params['fixture_worker_path']]
+    import threading
+    from protocol import Channel
+    channel = Channel(a.account_id, a.task_id)
+    threading.Thread(target=channel.read_replies, args=(sys.stdin,), daemon=True).start()
+    if mode == 'ipc_otp_exit_then_valid' and index == 2:
+        time.sleep(.4)
+    with channel.checkout_authentication() as credential:
+        assert credential['password'] == params.get('expected_fixture_password', 'ipc-private-fixture')
+        write(task / 'fixture-auth-start.json', {'time':time.time()})
+        if mode == 'ipc_otp_exit_then_valid' and index == 1:
+            channel.emit('prompt', prompt={'id':'dying-otp','kind':'code','label':'输入六位验证码',
+                         'checkout_auth_lease':channel._checkout_auth_lease})
+            time.sleep(.25)
+            os._exit(20)
+        if mode in ('ipc_otp', 'ipc_otp_exit_then_valid'):
+            code = channel.prompt('code', '输入六位验证码')
+            assert code == '012345'
+        if mode == 'ipc_eof':
+            os._exit(19)
+        if mode == 'ipc_cancel':
+            while True:
+                channel.checkpoint(); time.sleep(.02)
+        if mode == 'ipc_reject':
+            channel.emit('credential_rejected')
+        if mode == 'ipc_auth_failed':
+            raise ValueError('synthetic authentication failure')
+        time.sleep(.15)
+        write(task / 'fixture-auth-end.json', {'time':time.time()})
+if mode == 'ipc_plain_failure':
+    emit('error', message='synthetic temporary failure', order_submitted=False)
+    sys.exit(0)
 if mode == 'prompts':
     prompt_id = 'prompt-' + str(index)
     emit('prompt', prompt={'id':prompt_id,'kind':'select','label':'选择本次选项',
@@ -121,6 +156,8 @@ class ParallelPurchaseTests(unittest.TestCase):
                             auth=self.root / 'auth.json', checkout=self.root / 'checkout.json',
                             account='fixture@example.test', submitted=False)
         self.service.check_account.return_value = {'logged_in':True}
+        self.service.browser_password.return_value = 'ipc-private-fixture'
+        self.service.remember = False
         self.script = base / 'fake_worker.py'
         self.script.write_text(FAKE_WORKER, encoding='utf-8')
 
@@ -130,6 +167,183 @@ class ParallelPurchaseTests(unittest.TestCase):
                                      'retry_count':9,
                                      'fixture_worker_path':str(Path(__file__).resolve().parents[2] / 'worker')},
                                      worker_command=[sys.executable, str(self.script)])
+
+    def test_private_checkout_authentication_supplies_password_without_frontend_prompt(self):
+        result = self.run_batch('ipc_auth', count=3)
+        self.assertEqual(len(result['pending_orders']), 3)
+        self.assertEqual(self.channel.labels, [])
+        self.service.browser_password.assert_called_with(allow_prompt=False)
+        self.assertEqual(self.service.browser_password.call_count, 3)
+        public = self.channel.output.getvalue()
+        self.assertNotIn('ipc-private-fixture', public)
+        self.assertNotIn('_checkout_authentication', public)
+        intervals = []
+        for child in (self.task_dir / 'parallel').glob('*/accounts/*/tasks/*'):
+            intervals.append((json.loads((child/'fixture-auth-start.json').read_text())['time'],
+                              json.loads((child/'fixture-auth-end.json').read_text())['time']))
+            for path in child.parents[1].rglob('*.json'):
+                self.assertNotIn('ipc-private-fixture', path.read_text(encoding='utf-8'))
+        intervals.sort()
+        self.assertTrue(all(intervals[index][1] <= intervals[index+1][0]
+                            for index in range(len(intervals)-1)))
+
+    def test_checkout_otp_preserves_leading_zero_and_task_binding(self):
+        self.channel.prompt = Mock(return_value='012345')
+        result = self.run_batch('ipc_otp', count=2)
+        self.assertEqual(len(result['pending_orders']), 2)
+        self.assertEqual(self.channel.prompt.call_count, 2)
+        self.assertTrue(all(call.args[0] == 'code' for call in self.channel.prompt.call_args_list))
+        self.assertTrue(all('checkout_auth_lease' not in call.kwargs for call in self.channel.prompt.call_args_list))
+        self.assertNotIn('ipc-private-fixture', self.channel.output.getvalue())
+
+    def test_child_eof_releases_authentication_for_another_attempt(self):
+        result = self.run_batch('ipc_eof', count=3)
+        self.assertFalse(result['success'])
+        self.assertEqual(self.service.browser_password.call_count, 3)
+        from parallel_checkout import _AUTHENTICATION_LEASES
+        self.assertNotIn(self.channel.account_id, _AUTHENTICATION_LEASES)
+
+    def test_private_rejection_is_processed_before_next_authentication_grant(self):
+        transitions = []
+        self.service.browser_password.side_effect = lambda **_: transitions.append('grant') or 'ipc-private-fixture'
+        self.service.reject_password.side_effect = lambda: transitions.append('reject')
+        result = self.run_batch('ipc_reject', count=3)
+        self.assertEqual(len(result['pending_orders']), 3)
+        self.assertEqual(transitions, ['grant','reject'] * 3)
+        self.assertNotIn('credential_rejected', self.channel.output.getvalue())
+
+    def test_two_batches_same_account_share_authentication_lease(self):
+        first = PurchaseBatch(self.service, {'fulfillment':'RETAIL','concurrency':1,
+            'fixture_mode':'ipc_auth','fixture_worker_path':str(Path(__file__).resolve().parents[2]/'worker')},
+            worker_command=[sys.executable,str(self.script)])
+        second_dir = self.root/'tasks'/str(uuid.uuid4()); second_dir.mkdir()
+        second_channel = AutoReplyChannel(self.channel.account_id, second_dir.name)
+        from types import SimpleNamespace
+        context = SimpleNamespace(channel=second_channel, root=self.root, task_dir=second_dir,
+            auth=self.root/'auth.json', checkout=self.root/'checkout.json', account=self.service.account,
+            parent_service=self.service, submitted=False)
+        second = PurchaseBatch(context, first.params, worker_command=[sys.executable,str(self.script)], skip_preflight=True)
+        results = []
+        threads = [threading.Thread(target=lambda batch=batch: results.append(batch.run())) for batch in (first,second)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=10)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(len(result['pending_orders']) == 1 for result in results))
+        intervals = []
+        for batch in (first, second):
+            folder = Path(batch.attempts[0]['root'])/'accounts'/self.channel.account_id/'tasks'/batch.attempts[0]['task_id']
+            intervals.append((json.loads((folder/'fixture-auth-start.json').read_text())['time'],
+                              json.loads((folder/'fixture-auth-end.json').read_text())['time']))
+        intervals.sort()
+        self.assertLessEqual(intervals[0][1], intervals[1][0])
+
+    def test_dead_otp_owner_withdraws_prompt_and_next_child_can_prompt(self):
+        self.channel = Channel(self.channel.account_id, self.channel.task_id, output=io.StringIO())
+        self.service.channel = self.channel
+        stopped = threading.Event()
+        def reply_to_live_second_child():
+            replied = set()
+            while not stopped.wait(.01):
+                for raw in self.channel.output.getvalue().splitlines():
+                    event = json.loads(raw)
+                    prompt = event.get('prompt') or {}
+                    if event.get('type') == 'prompt' and '[尝试 2/2]' in prompt.get('label','') and prompt['id'] not in replied:
+                        replied.add(prompt['id'])
+                        self.channel.receive({'type':'reply','account_id':self.channel.account_id,
+                            'task_id':self.channel.task_id,'request_id':prompt['id'],'value':'012345'})
+        thread = threading.Thread(target=reply_to_live_second_child, daemon=True);thread.start()
+        try:
+            result = self.run_batch('ipc_otp_exit_then_valid', count=2)
+        finally:
+            stopped.set();thread.join(timeout=1)
+        self.assertEqual(len(result['pending_orders']), 1)
+        events = [json.loads(raw) for raw in self.channel.output.getvalue().splitlines()]
+        prompts = [event['prompt'] for event in events if event['type'] == 'prompt']
+        self.assertEqual(len(prompts), 2)
+        closed = [event for event in events if event['type'] == 'prompt_closed']
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]['request_id'], prompts[0]['id'])
+
+    def test_wrong_task_and_prompt_private_replies_are_ignored(self):
+        class WrongRepliesBatch(PurchaseBatch):
+            def _send_reply(batch, item, prompt, value):
+                if prompt.get('kind') == '_checkout_authentication':
+                    for task, request in ((str(uuid.uuid4()), prompt['id']), (item['task_id'], 'stale-prompt')):
+                        batch.children[item['id']].stdin.write(json.dumps({'type':'reply',
+                            'account_id':batch.channel.account_id, 'task_id':task,
+                            'request_id':request,'value':{'lease':str(uuid.uuid4()),'password':'wrong-fixture'}})+'\n')
+                    batch.children[item['id']].stdin.flush()
+                return super()._send_reply(item,prompt,value)
+        batch = WrongRepliesBatch(self.service, {'fulfillment':'RETAIL','concurrency':1,
+            'fixture_mode':'ipc_auth','fixture_worker_path':str(Path(__file__).resolve().parents[2]/'worker')},
+            worker_command=[sys.executable,str(self.script)])
+        self.assertEqual(len(batch.run()['pending_orders']), 1)
+
+    def test_cancel_releases_child_authentication_lease(self):
+        batch = PurchaseBatch(self.service, {'fulfillment':'RETAIL','concurrency':1,
+            'fixture_mode':'ipc_cancel','fixture_worker_path':str(Path(__file__).resolve().parents[2]/'worker')},
+            worker_command=[sys.executable,str(self.script)])
+        def cancel():
+            deadline = time.monotonic()+5
+            while time.monotonic() < deadline:
+                if list((self.task_dir/'parallel').glob('*/accounts/*/tasks/*/fixture-auth-start.json')):
+                    self.channel.cancelled.set();return
+                time.sleep(.01)
+        thread = threading.Thread(target=cancel,daemon=True);thread.start()
+        with self.assertRaises(Cancelled): batch.run()
+        thread.join(timeout=1)
+        from parallel_checkout import _AUTHENTICATION_LEASES
+        self.assertNotIn(self.channel.account_id, _AUTHENTICATION_LEASES)
+
+    def test_mismatched_owner_and_invalid_prompt_never_supply_credentials(self):
+        batch = PurchaseBatch(self.service, {'fulfillment':'RETAIL','concurrency':1})
+        item = {'id':'fixture-child','task_id':'fixture-child','terminal':False,'order_submitted':False}
+        batch.children[item['id']] = Mock()
+        with self.assertRaises(ValueError):
+            batch._reply(item, {'id':None,'kind':'_checkout_authentication'})
+        from types import SimpleNamespace
+        batch.credential_owner = SimpleNamespace(account=self.service.account,
+            channel=SimpleNamespace(account_id=str(uuid.uuid4())))
+        with self.assertRaises(ValueError):
+            batch._reply(item, {'id':'request','kind':'_checkout_authentication'})
+        self.service.browser_password.assert_not_called()
+
+    def test_broken_reply_pipe_only_fails_its_own_child(self):
+        batch = PurchaseBatch(self.service, {'fulfillment':'RETAIL','concurrency':1})
+        item = {'id':'ended','task_id':'ended','terminal':False,'order_submitted':False}
+        sibling = {'id':'running','task_id':'running','terminal':False,'order_submitted':False}
+        child = Mock(); child.poll.return_value = 0
+        child.stdin.write.side_effect = BrokenPipeError()
+        batch.children[item['id']] = child
+        self.assertFalse(batch._send_reply(item, {'id':'request'}, '012345'))
+        self.assertTrue(item['terminal'])
+        self.assertFalse(sibling['terminal'])
+        self.assertEqual(item['status'],'failed')
+
+    def test_authentication_failure_stops_configured_retries_without_respawn(self):
+        from purchase_retry import run_purchase
+        self.service.authentication_failed = False
+        self.service.authentication_requested = False
+        self.service.purchase_auth_interaction = False
+        result = run_purchase(self.service, {'retry_count':2},
+            lambda:self.run_batch('ipc_auth_failed',count=1), backoff_seconds=0)
+        self.assertEqual(self.service.browser_password.call_count,1)
+        self.assertEqual(result['retry_summary']['attempts_made'],1)
+        self.assertEqual(result['retry_summary']['stop_reason'],'authentication')
+        self.assertNotIn('checkout_auth_failed',self.channel.output.getvalue())
+
+    def test_successful_authentication_does_not_disable_normal_failure_retries(self):
+        from purchase_retry import run_purchase
+        self.service.authentication_failed = False
+        self.service.authentication_requested = False
+        self.service.purchase_auth_interaction = False
+        result = run_purchase(self.service, {'retry_count':2},
+            lambda:self.run_batch('ipc_plain_failure',count=1), backoff_seconds=0)
+        self.assertEqual(self.service.browser_password.call_count,3)
+        self.assertEqual(result['retry_summary']['attempts_made'],3)
+        self.assertEqual(result['retry_summary']['stop_reason'],'exhausted')
+        self.assertFalse(self.service.authentication_failed)
 
     def test_validation_rejects_bool_and_out_of_bounds_without_starting(self):
         for value in (True, False, 0, 11, '3', 1.5):
@@ -277,8 +491,8 @@ class ParallelPurchaseTests(unittest.TestCase):
         self.assertTrue(result['requires_serial_checkout'])
         self.assertFalse(result['retryable'])
         self.assertEqual(result['error_code'], 'CHECKOUT_REAUTH_REQUIRED')
-        self.assertIn('账户页已登录并不代表结账已授权', result['message'])
-        self.assertIn('并发数 1', result['message'])
+        self.assertIn('本次结账认证', result['message'])
+        self.assertNotIn('并发数 1', result['message'])
         for attempt in result['attempts']:
             self.assertEqual(attempt['error_code'], 'CHECKOUT_REAUTH_REQUIRED')
             self.assertFalse(attempt['retryable'])
@@ -296,7 +510,7 @@ class ParallelPurchaseTests(unittest.TestCase):
         for attempt in result['attempts']:
             self.assertEqual(attempt['error_code'], 'PARALLEL_SESSION_REAUTH_REQUIRED')
             self.assertFalse(attempt['retryable'])
-        self.assertIn('商城会话需要重新认证', result['message'])
+        self.assertIn('尚未完成认证', result['message'])
         self.assertNotIn('账户页已登录', result['message'])
 
     def test_parent_preflight_refresh_is_saved_before_children_are_snapshotted(self):

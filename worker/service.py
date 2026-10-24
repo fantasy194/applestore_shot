@@ -5,6 +5,7 @@ import logging
 import re
 import time
 from pathlib import Path
+from contextlib import contextmanager, nullcontext
 
 import requests
 import interaction
@@ -52,6 +53,7 @@ class Service:
         self.pickup_contact_accepted = False
         self.pickup_contact_review_verified = False
         self._parallel_child = False
+        self._checkout_auth_active = False
         self._purchase_session_owner = None
         self._purchase_session_proof = None
         self.settings_dir = (self.root.parent.parent / 'settings'
@@ -139,20 +141,62 @@ class Service:
             self.remember = value.get('remember') is True
         return self.password
 
+    @contextmanager
+    def checkout_authentication(self):
+        """Authorize credentials only for the current official Checkout flow.
+
+        Isolated children acquire their parent's account-wide lease and receive
+        credentials through private IPC. They never open a browser/profile or
+        create a replacement checkout to recover authentication.
+        """
+        if self._checkout_auth_active:
+            raise ValueError('结账认证不能嵌套执行。')
+        scope = self.channel.checkout_authentication() if self._parallel_child else nullcontext(None)
+        with scope as credential:
+            if self._parallel_child:
+                self.password = (credential.get('password') if isinstance(credential, dict)
+                                 and isinstance(credential.get('password'), str) else None)
+                self.remember = False
+            self._checkout_auth_active = True
+            try:
+                yield
+            except Exception as error:
+                # Rejection must reach the parent while the private lease is
+                # still held, rather than after task cleanup releases it.
+                cause, seen = error, set()
+                for _ in range(8):
+                    if cause is None or id(cause) in seen:
+                        break
+                    seen.add(id(cause))
+                    if getattr(cause, 'status', None) == 401 and '-20101' in (getattr(cause, 'codes', None) or ()):
+                        self.reject_password()
+                        break
+                    cause = getattr(cause, '__cause__', None)
+                raise
+            finally:
+                self._checkout_auth_active = False
+                if self._parallel_child:
+                    self.password = None
+
     def credentials(self, path):
         self.purchase_auth_interaction = True
         if self._parallel_child:
-            raise ValueError('并发会话需要重新登录，请先预热账号后重新发起；本次未自动登录。')
+            if not self._checkout_auth_active:
+                raise ValueError('并发会话需要重新登录，请先预热账号后重新发起；本次未自动登录。')
+            self.authentication_requested = True
+            if not self.password:
+                raise ValueError('当前结账认证缺少已保存密码，未提交认证。')
+            return self.account, self.password
         self.authentication_requested = True
         if not self.password and not self.password_rejected:
             try:
                 self.password = self.vault.get(self.channel.account_id)
             except Exception:
                 self.stage('凭据保险库不可用，请输入本次登录密码')
-        if self.idle_maintenance is True:
+        if self.idle_maintenance is True and not self._checkout_auth_active:
             from browser_login import BrowserSessionError
             raise BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
-                '空闲预热需要重新认证，请使用“官网登录恢复（保留账号）”完成；后台未提交密码或验证码。',
+                '当前后台会话需要通过官网登录恢复认证，未另行提交协议密码。',
                 status='requires_login', requires_login=True)
         if not self.password:
             if getattr(self, 'headless_browser', False) is True:
@@ -173,12 +217,12 @@ class Service:
         kind = 'code' if '验证码' in label else 'text'
         if kind == 'code':
             self.purchase_auth_interaction = True
-        if getattr(self, 'headless_browser', False) is True:
+        if getattr(self, 'headless_browser', False) is True and kind != 'code':
             from browser_login import BrowserSessionError
             raise BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
                 '后台预热需要人工验证，请在账号工作台完成官网登录后继续。',
                 status='requires_login', requires_login=True)
-        if self._parallel_child and kind == 'code':
+        if self._parallel_child and kind == 'code' and not self._checkout_auth_active:
             raise ValueError('并发会话需要验证，请先在账号工作台完成登录，再重新发起。')
         if (self.automatic_checkout or self.prefill_checkout) and kind != 'code':
             raise ValueError('自动结账缺少必要信息：' + label + '。请先完善本地地址和联系方式。')
@@ -325,7 +369,7 @@ class Service:
         self.channel.emit('stage', message=stage, **fields)
 
     def persist_password(self):
-        if self.remember and self.password:
+        if self.remember and self.password and not self._parallel_child:
             try:
                 self.vault.save(self.channel.account_id, self.password)
             except Exception:
@@ -333,10 +377,11 @@ class Service:
 
     def reject_password(self):
         if not self.password_rejected:
-            try:
-                self.vault.invalidate(self.channel.account_id, self.password)
-            except Exception:
-                self.stage('被拒绝的已保存密码未能清除，请检查凭据保险库或手动忘记密码')
+            if not self._parallel_child:
+                try:
+                    self.vault.invalidate(self.channel.account_id, self.password)
+                except Exception:
+                    self.stage('被拒绝的已保存密码未能清除，请检查凭据保险库或手动忘记密码')
             self.channel.emit('credential_rejected')
         self.password_rejected = True
         self.password = None
@@ -441,21 +486,9 @@ class Service:
     def warm_login(self):
         """Refresh idle browser sessions; retain explicit manual preheat behavior."""
         self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')
-        if self.action == 'session_maintain':
-            from apple_login import browser_profile_path
-            from browser_login import BrowserSessionError, login_in_browser
-            if (browser_profile_path(self.auth) / '.authx-541').exists():
-                raise BrowserSessionError('APPLE_SESSION_BLOCKED',
-                    '浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。',
-                    status='blocked', requires_login=True, http_status=541)
-            result = login_in_browser(self, timeout=12, maintenance=True)
-            if (result.get('success') is not True or result.get('logged_in') is not True
-                    or result.get('status') not in (None, 'healthy')):
-                return result
-            refreshed = True
-        else:
-            refreshed = self.warm_start_context()
-            result = self.check_account(enrolling=False)
+        from purchase_session import verify_account_session
+        result = verify_account_session(self, force_browser=True)
+        refreshed = result.get('browser_started') is True
         empty_bag_ready = duo_killer.warm_empty_bag()
         result.update(warm_login=True, browser_context_refreshed=refreshed,
             empty_bag_ready=empty_bag_ready,
@@ -478,24 +511,9 @@ class Service:
             raise ValueError('请先保存当前账号的商品SKU，再进行自提预热。')
         if type(count) is not int or not 1 <= count <= 999:
             raise ValueError('请先保存当前账号的购买数量，再进行自提预热。')
-        from apple_login import browser_profile_path
-        if (browser_profile_path(self.auth) / '.authx-541').exists():
-            from browser_login import BrowserSessionError
-            raise BrowserSessionError('APPLE_SESSION_BLOCKED',
-                '浏览器校验需要处理；账号和浏览器配置已保留，未自动重置。',
-                status='blocked', requires_login=True, http_status=541)
         if self.action == 'session_maintain':
-            from browser_login import BrowserSessionError, login_in_browser
-            checked = login_in_browser(self, timeout=12, maintenance=True, storefront=True)
-            if (checked.get('success') is not True or checked.get('logged_in') is not True
-                    or checked.get('status') not in (None, 'healthy')):
-                raise BrowserSessionError(checked.get('error_code', 'SESSION_CHECK_INCOMPLETE'),
-                    checked.get('message', '官网会话尚未验证，未继续自提准备。'),
-                    status=checked.get('status', 'failed'), requires_login=checked.get('requires_login') is True,
-                    http_status=checked.get('http_status'),
-                    browser_started=checked.get('browser_started') is True,
-                    browser_connected=checked.get('browser_connected') is True)
-            from purchase_session import record_action_session
+            from purchase_session import verify_account_session, record_action_session
+            verify_account_session(self, force_browser=True)
             record_action_session(self)
         self.stage('空闲自提预热：使用当前账号商品和自提偏好，不创建订单')
         previous_owner = self._purchase_session_owner
@@ -622,13 +640,13 @@ class Service:
         if action in ('enroll', 'me'):
             if action == 'enroll' and params.get('browser_login') is True:
                 from browser_login import login_in_browser
-                result = login_in_browser(self)
+                result = login_in_browser(self, automatic=True, recover=True)
             else:
                 result = self.check_account(enrolling=action == 'enroll')
         elif action == 'login':
             if params.get('browser_login') is True:
                 from browser_login import login_in_browser
-                result = login_in_browser(self)
+                result = login_in_browser(self, automatic=True, recover=True)
                 result['message'] = '官网登录与会话核对完成，账号和浏览器资料已保留。'
             elif params.get('warm_only') is True:
                 result = self.warm_login()
@@ -657,18 +675,12 @@ class Service:
                 self.headless_browser = previous_headless
         elif action == 'purchase':
             self.prepare_purchase_session()
+            from purchase_execution import execute_purchase_attempt
             if params.get('prepare_only') is True:
-                if not self.automatic_checkout:
-                    raise ValueError('提前准备需要已启用自动结算配置。')
-                result = duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params), prepare_only=True)
+                result = execute_purchase_attempt(self, params)
             else:
                 from purchase_retry import run_purchase
-                def attempt():
-                    if self.fulfillment_mode == 'RETAIL' and concurrency > 1:
-                        from parallel_checkout import run_parallel_purchase
-                        return run_parallel_purchase(self, params, preflight_complete=True)
-                    return duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params))
-                result = run_purchase(self, params, attempt)
+                result = run_purchase(self, params, lambda: execute_purchase_attempt(self, params))
         elif action == 'add':
             result = duo_killer.add_to_bag(params.get('sku', ''), quantity=quantity(params), set_total=True)
         elif action == 'checkout':

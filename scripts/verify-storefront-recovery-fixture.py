@@ -227,7 +227,9 @@ class Fixture:
                 require(len(self.menu_requests) == len(self.account_requests) == len(self.signin_requests) == 1,
                         'Authenticated-menu read retried')
             else:
-                require(error is None and result.get('logged_in') is True, 'Fixture login did not complete')
+                require(error is None and result.get('logged_in') is True,
+                        'Fixture login did not complete: scenario=' + self.mode +
+                        ' error_code=' + str(getattr(error, 'code', None)))
                 require(len(self.imports) == 1 and len(self.account_requests) == 1, 'Account was not verified exactly once')
                 require(not self.marker.exists() and not self.cooldown.exists(), 'Verified success retained recovery markers')
                 if self.mode in ('manual', 'background_recovery', 'duplicate_menu'):
