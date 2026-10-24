@@ -28,8 +28,46 @@ import {
 const initialConfig = () => ({
   interval_seconds: 1,
   targets: [] as InventoryTarget[],
+  schedule: {
+    enabled: false,
+    mode: "exclude",
+    start: "01:00",
+    end: "05:00",
+    timezone: "Asia/Shanghai",
+  },
   proxy: { enabled: false, pool_size: 10, providers: [] as Data[] },
 });
+const validScheduleTime = (value: string) =>
+  /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+function readConfig(saved: Data) {
+  return {
+    ...initialConfig(),
+    ...saved,
+    targets: (saved.targets || []).map((target: InventoryTarget) => ({
+      ...target,
+      concurrency: target.concurrency ?? 1,
+      retry_count: target.retry_count ?? 0,
+    })),
+    schedule: { ...initialConfig().schedule, ...saved.schedule },
+    proxy: { ...initialConfig().proxy, ...saved.proxy },
+  };
+}
+function beijingTime(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+    return "等待确认";
+  const date = new Date(Number(value));
+  return Number.isFinite(date.getTime())
+    ? new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "Asia/Shanghai",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).format(date)
+    : "等待确认";
+}
 const timeMs = (value: unknown) =>
   typeof value === "number"
     ? value < 1e12
@@ -109,15 +147,24 @@ export function InventoryMonitor({
           : [...keys, key],
     );
   }
-  const invalidConfig = invalidNumbers.some(
-    (key) =>
-      key === "pool" ||
-      key === "interval" ||
-      config.targets.some((target) => key.startsWith(`${target.id}:`)) ||
-      config.proxy.providers.some(
-        (provider) => key === `provider:${provider.id}`,
-      ),
-  );
+  const scheduleError = !config.schedule.enabled
+    ? ""
+    : ![config.schedule.start, config.schedule.end].every(validScheduleTime)
+      ? "请完整填写有效的开始时间和结束时间。"
+      : config.schedule.start === config.schedule.end
+        ? "开始时间和结束时间不能相同；全天检测请关闭每日检测时段。"
+        : "";
+  const invalidConfig =
+    !!scheduleError ||
+    invalidNumbers.some(
+      (key) =>
+        key === "pool" ||
+        key === "interval" ||
+        config.targets.some((target) => key.startsWith(`${target.id}:`)) ||
+        config.proxy.providers.some(
+          (provider) => key === `provider:${provider.id}`,
+        ),
+    );
   const [monitorDetail, setMonitorDetail] = useState<{
     id: string;
     result: Data | null;
@@ -146,6 +193,7 @@ export function InventoryMonitor({
       ? monitorDetail?.result
       : selectedTask?.result;
   const running = !!monitor;
+  const schedulePaused = running && result?.schedule_state?.paused === true;
   useEffect(() => {
     if (!bridge.task) return;
     let disposed = false;
@@ -264,16 +312,7 @@ export function InventoryMonitor({
       .then((result) => {
         if (!disposed) {
           const saved = result.config || initialConfig();
-          setConfig({
-            ...initialConfig(),
-            ...saved,
-            targets: (saved.targets || []).map((target: InventoryTarget) => ({
-              ...target,
-              concurrency: target.concurrency ?? 1,
-              retry_count: target.retry_count ?? 0,
-            })),
-            proxy: { ...initialConfig().proxy, ...saved.proxy },
-          });
+          setConfig(readConfig(saved));
         }
       })
       .catch((error) => {
@@ -325,6 +364,7 @@ export function InventoryMonitor({
     change({ ...config, targets });
   }
   async function save() {
+    if (scheduleError) throw new Error(scheduleError);
     if (invalidConfig) throw new Error("请先填写有效的数量和范围。");
     if (
       config.targets.some(
@@ -338,7 +378,7 @@ export function InventoryMonitor({
     const result = await inventoryCall(bridge, "inventory_settings_save", {
       config,
     });
-    if (result.config) setConfig(result.config);
+    if (result.config) setConfig(readConfig(result.config));
     setDirty(false);
     setNotice("监控配置已保存");
     await refresh();
@@ -367,7 +407,11 @@ export function InventoryMonitor({
           role="status"
         >
           <Activity size={15} />
-          {running ? "监控运行中" : "监控已停止"}
+          {schedulePaused
+            ? "按时段暂停"
+            : running
+              ? "监控运行中"
+              : "监控已停止"}
         </span>
       </header>
       {loading ? (
@@ -395,6 +439,7 @@ export function InventoryMonitor({
                           row.store_id === target.store_id),
                     );
                     return (
+                      !schedulePaused &&
                       sample?.status === "available" &&
                       !!sample.checked_at &&
                       Number.isFinite(timeMs(sample.checked_at)) &&
@@ -430,6 +475,119 @@ export function InventoryMonitor({
           <p className="ui-caption">
             每 1–300 秒检查一次，修改间隔前请先停止监控。
           </p>
+          <section className="ui-panel" aria-label="每日检测时段">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={config.schedule.enabled}
+                disabled={busy || running}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  change({
+                    ...config,
+                    schedule: {
+                      ...config.schedule,
+                      enabled,
+                      start:
+                        !enabled && !validScheduleTime(config.schedule.start)
+                          ? initialConfig().schedule.start
+                          : config.schedule.start,
+                      end:
+                        !enabled && !validScheduleTime(config.schedule.end)
+                          ? initialConfig().schedule.end
+                          : config.schedule.end,
+                    },
+                  });
+                }}
+              />
+              启用每日检测时段
+            </label>
+            {config.schedule.enabled ? (
+              <>
+                <div className="schedule-fields">
+                  <SelectField
+                    label="检测时段规则"
+                    value={config.schedule.mode}
+                    disabled={busy || running}
+                    options={[
+                      { value: "exclude", label: "时段内暂停" },
+                      { value: "include", label: "仅时段内检测" },
+                    ]}
+                    onChange={(mode) =>
+                      change({
+                        ...config,
+                        schedule: { ...config.schedule, mode },
+                      })
+                    }
+                  />
+                  <label>
+                    开始时间（北京时间）
+                    <input
+                      type="time"
+                      required
+                      value={config.schedule.start}
+                      disabled={busy || running}
+                      aria-invalid={!!scheduleError}
+                      onChange={(event) =>
+                        change({
+                          ...config,
+                          schedule: {
+                            ...config.schedule,
+                            start: event.target.value,
+                          },
+                        })
+                      }
+                    />
+                  </label>
+                  <label>
+                    结束时间（北京时间）
+                    <input
+                      type="time"
+                      required
+                      value={config.schedule.end}
+                      disabled={busy || running}
+                      aria-invalid={!!scheduleError}
+                      onChange={(event) =>
+                        change({
+                          ...config,
+                          schedule: {
+                            ...config.schedule,
+                            end: event.target.value,
+                          },
+                        })
+                      }
+                    />
+                  </label>
+                </div>
+                <p className="ui-caption">
+                  每天按北京时间执行，包含开始时刻，不包含结束时刻；支持跨午夜。
+                </p>
+                {scheduleError && (
+                  <p className="error-text" role="alert">
+                    {scheduleError}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="ui-caption">全天检测，不限制每日时段。</p>
+            )}
+            <p className="ui-caption">
+              {running
+                ? "修改时段请先停止监控，保存后重新开始。"
+                : "保存并开始监控后，每天自动暂停与恢复检测。"}
+              时段暂停只暂停库存检测，不会取消已入队或执行中的购买。
+            </p>
+          </section>
+          {schedulePaused && (
+            <p role="status" className="ui-caption">
+              {result?.schedule_state?.reason === "excluded_window"
+                ? "当前处于暂停时段。"
+                : "当前不在检测时段内。"}
+              下次恢复检测：
+              {beijingTime(result?.schedule_state?.next_transition_at_ms)}
+              （北京时间）。监控仍在运行，可随时停止。
+            </p>
+          )}
           <div className="ui-toolbar monitor-controls button-row inventory-actions">
             <button
               className="primary"
@@ -615,13 +773,16 @@ export function InventoryMonitor({
                     now - timeMs(stock.checked_at) > 10_000 ||
                     (!running && result?.monitoring === true));
                 const liveStatus =
-                  stale || !hasSample ? "unknown" : stock?.status || "unknown";
-                const message =
-                  stockMessage(stock?.error, result?.proxy) ||
-                  stock?.pickup_message ||
-                  (result?.checked_at
-                    ? "本次检查未取得有效库存。"
-                    : "等待官网确认实际库存");
+                  schedulePaused || stale || !hasSample
+                    ? "unknown"
+                    : stock?.status || "unknown";
+                const message = schedulePaused
+                  ? "按时段暂停检测，恢复后重新确认库存。"
+                  : stockMessage(stock?.error, result?.proxy) ||
+                    stock?.pickup_message ||
+                    (result?.checked_at
+                      ? "本次检查未取得有效库存。"
+                      : "等待官网确认实际库存");
                 const officialMessage =
                   typeof stock?.pickup_message === "string"
                     ? stock.pickup_message.trim()

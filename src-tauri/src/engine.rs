@@ -1053,7 +1053,7 @@ impl Engine {
                             self.sync_account_identity(&account.id, &event["result"], action == "enroll")?;
                         }
                         if kind=="result" && action=="inventory_settings_save" && event["result"]["success"]==true {
-                            self.queue_inventory_settings_changed(Some(&event["result"]["config"]));
+                            self.queue_inventory_settings_changed(Some(&event["result"]["config"]),event["result"]["targets_changed"]!=false);
                         }
                         if kind == "error" && event["account_invalid"] == true && event["order_submitted"] != true
                             && self.remove_invalid_account(&account.id, &id)? {
@@ -1194,7 +1194,9 @@ pub fn apply_event(task: &mut Task, event: &Value) {
     match event["type"].as_str().unwrap_or("") {
         "inventory" => {
             task.status = "running".into();
-            task.stage = "正在监控门店实时库存".into();
+            task.stage = if event["result"]["schedule_state"]["paused"] == true {
+                "已按每日时段暂停库存检测，等待自动恢复"
+            } else { "正在监控门店实时库存" }.into();
             task.result = Some(event["result"].clone());
         }
         "prompt" => {
@@ -2392,6 +2394,24 @@ else:
             assert_eq!(view["queued_count"],1);
         }
         assert_eq!(engine.snapshot().tasks.len(),1);
+    }
+
+    #[test]
+    fn scheduled_monitor_pause_remains_running_and_resumes_normal_stage() {
+        let mut monitor=task();
+        monitor.action="inventory_monitor".into();
+        apply_event(&mut monitor,&json!({"type":"inventory","result":{
+            "monitoring":true,"schedule_state":{"paused":true,"next_transition_at_ms":1000},
+            "checked_at_ms":null,"targets":[]}}));
+        assert_eq!(monitor.status,"running");
+        assert!(monitor.stage.contains("暂停库存检测"));
+        assert_eq!(monitor.result.as_ref().unwrap()["schedule_state"]["paused"],true);
+        assert!(monitor.result.as_ref().unwrap()["checked_at_ms"].is_null());
+        apply_event(&mut monitor,&json!({"type":"inventory","result":{
+            "monitoring":true,"schedule_state":{"paused":false},"checked_at_ms":2000,"targets":[]}}));
+        assert_eq!(monitor.status,"running");
+        assert_eq!(monitor.stage,"正在监控门店实时库存");
+        assert_eq!(monitor.result.as_ref().unwrap()["checked_at_ms"],2000);
     }
 
     #[test]

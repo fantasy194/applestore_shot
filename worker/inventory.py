@@ -20,6 +20,7 @@ from activity_log import ActivityLog, safe_message
 from inventory_proxy import DynamicProxyPool, ProxyError, public_url
 from inventory_broker import SharedClient, StoreBroker, query_running_monitor, store_query
 from private_state import read_private, write_private
+from monitor_schedule import default_schedule, schedule_state, validate_schedule
 
 PICKUP_URL = 'https://www.apple.com.cn/shop/retail/pickup-message'
 ACTIONS = frozenset(('inventory_settings_read', 'inventory_settings_save', 'store_search', 'inventory_check', 'inventory_monitor'))
@@ -32,7 +33,8 @@ def iso_now(timestamp=None):
 
 
 def default_config():
-    return {'interval_seconds': 1, 'targets': [], 'proxy': {'enabled': False, 'pool_size': 10, 'providers': []}}
+    return {'interval_seconds': 1, 'targets': [], 'proxy': {'enabled': False, 'pool_size': 10, 'providers': []},
+            'schedule': default_schedule()}
 
 
 def sku_part(value):
@@ -137,6 +139,7 @@ def validate_config(config, previous=None):
     if enabled and not any(p['enabled'] for p in safe_providers):
         raise ValueError('请先配置并启用库存代理供应商。')
     return {'interval_seconds': interval, 'targets': normalized,
+            'schedule': validate_schedule(config.get('schedule', previous.get('schedule', default_schedule()))),
             'proxy': {'enabled': enabled, 'pool_size': _number(proxy.get('pool_size'), 10, 1, 200, '代理池容量必须为 1–200。'),
                       'providers': safe_providers}}
 
@@ -347,12 +350,13 @@ class InventoryClient:
                 work.append((anchor, subset, [t for t in group if t['sku'] in subset]))
         return work
 
-    def check(self, targets):
+    def check(self, targets, *, record_if=None):
         started = time.perf_counter()
         self.round += 1
         timings = {}
         if not targets:
-            self._record_round([], started, timings)
+            if record_if is None or record_if():
+                self._record_round([], started, timings)
             return {'success': True, 'monitoring': False, 'checked_at': iso_now(), 'targets': [], 'proxy': self.status()}
         if self.pool:
             self.pool.touch()
@@ -399,7 +403,8 @@ class InventoryClient:
                             break
             results = [results_by_id.get(t['id'], dict(t, status='unknown', checked_at=None, checked_at_ms=None,
                                                      error=failures.get(t['id'], '本轮未能确认该门店库存。'))) for t in targets]
-        self._record_round(results, started, timings)
+        if record_if is None or record_if():
+            self._record_round(results, started, timings)
         return {'success': True, 'monitoring': False, 'checked_at': iso_now(), 'targets': results, 'proxy': self.status()}
 
     def stores(self, sku, location):
@@ -435,9 +440,10 @@ def _run_inventory(action, params, channel, settings_dir, activity):
     if action == 'inventory_settings_read':
         return {'success': True, 'config': public_config(load_config(root))}
     if action == 'inventory_settings_save':
-        config = validate_config(params.get('config'), load_config(root))
+        previous = load_config(root)
+        config = validate_config(params.get('config'), previous)
         write_private(root / 'inventory-settings.enc', config)
-        return {'success': True, 'config': public_config(config)}
+        return {'success': True, 'config': public_config(config), 'targets_changed': previous['targets'] != config['targets']}
     if action == 'store_search':
         params = store_query(params)
     config = load_config(root)
@@ -458,7 +464,14 @@ def _run_owned_inventory(action, params, channel, root, config, activity):
             client.pool.activity = activity
         return client
 
-    client = create(config)
+    def effective(current, state):
+        if action != 'inventory_monitor' or not state['paused']:
+            return current
+        return dict(current, proxy=dict(current['proxy'], enabled=False))
+
+    state = schedule_state(config['schedule'])
+    client_config = effective(config, state)
+    client = create(client_config)
     shared = SharedClient(client)
     broker = None
     try:
@@ -475,17 +488,69 @@ def _run_owned_inventory(action, params, channel, root, config, activity):
             raise ValueError('请先添加至少一个库存监控目标。')
         broker = StoreBroker(root, shared, channel).start()
         last_summary, last_emitted, round_number = None, 0, 0
+        last_schedule_state = None
         while True:
             channel.checkpoint()
             started = time.monotonic()
             latest = load_config(root)
-            if latest['proxy'] != config['proxy']:
-                shared.replace(lambda: create(latest), channel)
+            state = schedule_state(latest['schedule'])
+            desired = effective(latest, state)
+            if desired['proxy'] != client_config['proxy']:
+                shared.replace(lambda: create(desired), channel)
+            client_config = desired
             config = latest
+            # Replacing a client can wait for a manual query or pool shutdown.
+            # Its pre-switch clock/config snapshot cannot authorize a new round.
+            latest = load_config(root)
+            latest_state = schedule_state(latest['schedule'])
+            if (any(latest[key] != config[key] for key in ('schedule', 'targets', 'proxy'))
+                    or latest_state['paused'] != state['paused']):
+                continue
+            state = latest_state
+            transition = (state['paused'], state['reason'])
+            if transition != last_schedule_state:
+                if state['paused']:
+                    channel.emit('log', message='库存监控已按每日时段暂停，恢复后将重新查询库存。')
+                elif last_schedule_state is not None:
+                    channel.emit('log', message='库存监控已恢复，开始新的库存查询。')
+                last_schedule_state = transition
+            if state['paused']:
+                with shared.borrow() as current:
+                    proxy = current.status()
+                summary = ('paused', json.dumps(config['schedule'], sort_keys=True), state['next_transition_at_ms'])
+                if summary != last_summary or time.monotonic() - last_emitted >= 30:
+                    channel.emit('inventory', result={'success': True, 'monitoring': True,
+                                 'interval_seconds': config['interval_seconds'], 'targets': [],
+                                 'checked_at': None, 'checked_at_ms': None, 'proxy': proxy,
+                                 'schedule': config['schedule'], 'schedule_state': state})
+                    last_summary, last_emitted = summary, time.monotonic()
+                # Wall time and settings are re-evaluated after at most one second.
+                channel.checkpoint()
+                time.sleep(.5)
+                continue
             with shared.borrow() as current:
-                result = current.check(config['targets'])
+                # Borrow acquisition and prior work may have crossed a boundary.
+                # Keep this last authorization check immediately before dispatch.
+                candidate = load_config(root)
+                if (schedule_state(candidate['schedule'])['paused']
+                        or any(candidate[key] != config[key] for key in ('schedule', 'targets', 'proxy'))):
+                    continue
+                def still_current():
+                    candidate = load_config(root)
+                    return (not schedule_state(candidate['schedule'])['paused']
+                            and all(candidate[key] == config[key] for key in ('schedule', 'targets', 'proxy')))
+                # A request may finish after the boundary; neither event consumers
+                # nor stock history may treat its response as a fresh observation.
+                result = current.check(config['targets'], record_if=still_current)
+            after = load_config(root)
+            after_state = schedule_state(after['schedule'])
+            if after_state['paused'] or any(after[key] != config[key] for key in ('schedule', 'targets', 'proxy')):
+                # Never publish stock that crossed a paused or changed authorization window.
+                continue
             result['monitoring'] = True
             result['interval_seconds'] = config['interval_seconds']
+            result['schedule'] = config['schedule']
+            result['schedule_state'] = after_state
             round_number += 1
             proxy = result.get('proxy', {})
             summary = (tuple((target.get('id'), target.get('status'), target.get('error')) for target in result['targets']),
@@ -503,6 +568,8 @@ def _run_owned_inventory(action, params, channel, root, config, activity):
             deadline = started + config['interval_seconds']
             while time.monotonic() < deadline:
                 channel.checkpoint()
+                if schedule_state(config['schedule'])['paused'] or load_config(root) != config:
+                    break
                 time.sleep(min(.1, deadline - time.monotonic()))
     finally:
         if broker:

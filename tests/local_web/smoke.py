@@ -128,6 +128,15 @@ def main(package):
             inventory_config = wait(inventory)['result']['config']
             assert inventory_config['targets'] == []
             assert inventory_config['proxy']['enabled'] is False
+            assert inventory_config['schedule']['enabled'] is False
+            monitor_schedule = {'enabled':True, 'mode':'exclude', 'start':'01:00', 'end':'05:00',
+                                'timezone':'Asia/Shanghai'}
+            schedule_save = call('start_task', accountId='00000000-0000-0000-0000-000000000000',
+                                 action='inventory_settings_save',
+                                 params={'config':{**inventory_config, 'schedule':monitor_schedule}})
+            saved_schedule = wait(schedule_save)['result']
+            assert saved_schedule['config']['schedule'] == monitor_schedule
+            assert saved_schedule['targets_changed'] is False
             queue_state = call('queue_command', operation='status', params={})
             assert queue_state['mode'] == 'sequential' and queue_state['max_concurrency'] == 1
             assert queue_state['jobs'] == [] and queue_state['reserved_child_slots'] == 0
@@ -244,6 +253,9 @@ def main(package):
             assert any(entry['event'] == 'operation_end' for entry in logs['entries'])
             assert call('queue_command', operation='status', params={})['mode'] == 'sequential'
             assert call('maintenance_command', operation='status', params={})['interval_minutes'] == 10
+            schedule_read = call('start_task', accountId='00000000-0000-0000-0000-000000000000',
+                                 action='inventory_settings_read', params={})
+            assert wait(schedule_read)['result']['config']['schedule'] == monitor_schedule
             # Remove only synthetic accounts after restart (no worker still closing).
             call('remove_account', accountId=a['id'])
             remaining = call('snapshot')

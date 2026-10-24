@@ -370,7 +370,7 @@ class InventoryTests(unittest.TestCase):
         channel = Channel('account', 'task', output)
         count, active_count = [], []
 
-        def check(client, targets):
+        def check(client, targets, **kwargs):
             active_count.append(threading.active_count())
             count.append(time.monotonic())
             if len(count) == 2:

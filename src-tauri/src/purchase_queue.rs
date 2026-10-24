@@ -610,7 +610,8 @@ impl Engine {
         changed
     }
 
-    pub(super) fn queue_inventory_settings_changed(&self,config:Option<&Value>) {
+    pub(super) fn queue_inventory_settings_changed(&self,config:Option<&Value>,targets_changed:bool) {
+        if !targets_changed {return;}
         let mut queue=self.purchase_queue.lock().unwrap();
         if let Some(targets)=config.and_then(|config|config["targets"].as_array()) {
             for (key,group) in &mut queue.purchase_groups {
@@ -687,6 +688,9 @@ impl Engine {
     }
 
     pub(super) fn queue_inventory(self: &Arc<Self>, host:&TaskHost, result:&Value) -> Vec<Value> {
+        // A scheduled pause is not a new stock/authorization observation.
+        // Existing accepted jobs keep their independent dispatch lifecycle.
+        if result["schedule_state"]["paused"] == true { return vec![]; }
         let Some(targets)=result["targets"].as_array() else {return vec![]};
         let current=now_ms();
         let mut queue=self.purchase_queue.lock().unwrap();
@@ -1076,6 +1080,51 @@ mod tests {
     fn negative(mut row:Value)->Value {row["status"]=json!("unavailable");row}
 
     #[tokio::test]
+    async fn schedule_only_settings_save_preserves_pending_purchase_signals() {
+        let (_root,engine,host,account)=fixture();
+        let signal=target(&account,"R001",now_ms());
+        observe(&engine,&host,vec![signal.clone()]);
+        let before=serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap();
+        engine.queue_inventory_settings_changed(Some(&json!({"targets":[signal],
+            "schedule":{"enabled":true,"mode":"exclude","start":"01:00","end":"05:00"}})),false);
+        assert_eq!(serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap(),before);
+        engine.queue_inventory_settings_changed(None,true);
+        assert!(!jobs(&engine)[0].signal_confirmed);
+        assert_eq!(jobs(&engine)[0].status,"waiting_stock");
+    }
+
+    #[tokio::test]
+    async fn scheduled_monitor_pause_keeps_accepted_jobs_authorized_and_executable() {
+        for priority_pool in [false,true] {
+            let (root,engine,host,account)=fixture();
+            if priority_pool {save_policy(root.path(),&account,priority(&["R001","R002"]));}
+            observe(&engine,&host,vec![target(&account,"R001",now_ms())]);
+            let previous=serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap();
+            let disk=fs::read(root.path().join("settings/purchase_queue.json")).unwrap();
+            assert!(engine.inventory_dispatch(&host,&json!({"monitoring":true,
+                "schedule_state":{"paused":true,"reason":"excluded_window"},"targets":[]})).is_empty());
+            assert_eq!(serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap(),previous);
+            assert_eq!(fs::read(root.path().join("settings/purchase_queue.json")).unwrap(),disk);
+            engine.queue_pump_once();
+            let current=jobs(&engine);
+            assert_eq!(current.len(),1);
+            assert_eq!(current[0].status,"dispatched");
+            assert!(current[0].authorization_confirmed);
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_monitor_pause_cannot_enqueue_targets_even_with_available_payload() {
+        let (_root,engine,host,account)=fixture();
+        assert!(engine.inventory_dispatch(&host,&json!({"monitoring":true,
+            "schedule_state":{"paused":true,"reason":"outside_window"},
+            "targets":[target(&account,"R001",now_ms())]})).is_empty());
+        assert!(jobs(&engine).is_empty());
+        observe(&engine,&host,vec![target(&account,"R001",now_ms())]);
+        assert_eq!(jobs(&engine).len(),1);
+    }
+
+    #[tokio::test]
     async fn priority_stores_enqueue_separately_with_shared_group_and_frozen_single_store() {
         let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R002","R001","R003"]));
         let at=now_ms();let mut waiting=target(&account,"R003",at);waiting["status"]=json!("unknown");waiting["checked_at_ms"]=Value::Null;
@@ -1107,11 +1156,11 @@ mod tests {
         let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001"]));
         let active=target(&account,"R001",now_ms());observe(&engine,&host,vec![active.clone()]);engine.queue_pump_once();let first=jobs(&engine)[0].clone();ready(&engine,&first);
         ack(&engine,&first,"queue_finished",json!({"status":"pending_payment","success":true,"order_submitted":true,"order_number":"W111111"}));
-        let same=json!({"targets":[active.clone()]});engine.queue_inventory_settings_changed(Some(&same));
+        let same=json!({"targets":[active.clone()]});engine.queue_inventory_settings_changed(Some(&same),true);
         observe(&engine,&host,vec![active.clone()]);assert_eq!(jobs(&engine).len(),1);
         let mut disabled=active.clone();disabled["auto_purchase"]=json!(false);
-        engine.queue_inventory_settings_changed(Some(&json!({"targets":[disabled]})));
-        engine.queue_inventory_settings_changed(Some(&same));
+        engine.queue_inventory_settings_changed(Some(&json!({"targets":[disabled]})),true);
+        engine.queue_inventory_settings_changed(Some(&same),true);
         let loaded=QueueState::load(root.path(),&HashMap::new()).unwrap();assert!(!loaded.purchase_groups[&priority_key(&account,&first.sku,1)].authorization_active);
         observe(&engine,&host,vec![active]);let after=jobs(&engine);assert_eq!(after.len(),2);assert_ne!(after[1].purchase_group_id,first.purchase_group_id);
         assert_eq!(after[0].status,"succeeded");
@@ -1156,7 +1205,7 @@ mod tests {
         assert!(jobs(&engine).iter().all(|job|job.concurrency==1&&job.requested_concurrency==Some(3)&&job.retry_count==2));
         assert_ne!(jobs(&engine)[0].episode_key,jobs(&engine)[1].episode_key);
         assert_eq!(jobs(&engine)[0].payload()["retry_count"],2);
-        engine.queue_inventory_settings_changed(None);assert!(jobs(&engine).iter().all(|job|job.status=="waiting_stock"&&job.checked_at_ms==0));
+        engine.queue_inventory_settings_changed(None,true);assert!(jobs(&engine).iter().all(|job|job.status=="waiting_stock"&&job.checked_at_ms==0));
     }
 
     #[tokio::test]
