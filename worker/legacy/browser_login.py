@@ -474,7 +474,7 @@ def seed_missing_session(context, service):
         context.add_cookies(selected)
 
 
-def login_in_browser(service, timeout=300, *, maintenance=False, recover=False):
+def login_in_browser(service, timeout=300, *, maintenance=False, recover=False, storefront=False):
     from browser_cdp import BrowserConnectError, connect_browser
     from playwright.sync_api import sync_playwright, Error as BrowserError, TimeoutError as BrowserTimeout
     from apple_login import HOME, browser_profile_path
@@ -538,7 +538,7 @@ def login_in_browser(service, timeout=300, *, maintenance=False, recover=False):
                 from browser_remote import remote_context
                 with (nullcontext(None) if headless else remote_context(service, port)) as remote:
                     account_url = None
-                    if (maintenance or headless) and not recover:
+                    if (maintenance or headless) and not recover and not storefront:
                         seed_missing_session(browser.contexts[0], service)
                         context = browser.contexts[0]
                         page = context.pages[-1] if context.pages else context.new_page()

@@ -14,7 +14,6 @@ const RESTORE_FIXED_MODE: &str = "下单方式已变更，任务暂停。恢复�
 
 fn default_mode() -> String { "sequential".into() }
 fn default_limit() -> u32 { 1 }
-fn default_check_inventory_freshness() -> bool { true }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct QueueJob {
@@ -43,7 +42,7 @@ pub(super) struct QueueJob {
     pub stock_status: String,
     pub checked_at_ms: u64,
     #[serde(default)]
-    pub sample_rejected_as_stale: bool,
+    pub signal_confirmed: bool,
     pub task_id: Option<String>,
     pub message: String,
     pub result: Option<Value>,
@@ -66,12 +65,10 @@ impl QueueJob {
     fn terminal(&self) -> bool { !self.pending() && !self.inflight() }
     fn wait_for_confirmation(&mut self,message:&str) {
         self.status="waiting_stock".into();self.stock_status="unknown".into();self.checked_at_ms=0;
-        self.authorization_confirmed=false;self.authorized_stores.clear();self.message=message.into();
+        self.authorization_confirmed=false;self.signal_confirmed=false;self.authorized_stores.clear();self.message=message.into();
     }
-    fn eligible(&self, current: u64, check_age:bool) -> bool {
-        self.authorization_confirmed && self.stock_status == "available" && self.checked_at_ms > 0
-            && self.checked_at_ms <= current.saturating_add(1000)
-            && (!check_age || !self.sample_rejected_as_stale && current.saturating_sub(self.checked_at_ms) <= FRESH_MS)
+    fn eligible(&self) -> bool {
+        self.authorization_confirmed && self.signal_confirmed
     }
     fn payload(&self) -> Value {
         let mut payload=json!({"queue_job_id":self.id,"sku":self.sku,"quantity":self.quantity,"fulfillment":"RETAIL",
@@ -100,8 +97,6 @@ pub(super) struct QueueState {
     mode: String,
     #[serde(default = "default_limit")]
     max_concurrency: u32,
-    #[serde(default = "default_check_inventory_freshness")]
-    check_inventory_freshness: bool,
     #[serde(default)]
     paused: bool,
     #[serde(default)]
@@ -125,7 +120,7 @@ struct PolicyRejection {account_id:String,sku:String,quantity:u32,message:String
 
 impl Default for QueueState {
     fn default() -> Self {
-        Self {mode:default_mode(),max_concurrency:1,check_inventory_freshness:true,paused:false,resume_after_restart:Some(true),next_sequence:0,jobs:vec![],episodes:HashMap::new(),blocked_accounts:HashMap::new(),priority_migrated:HashSet::new(),policy_rejections:HashMap::new()}
+        Self {mode:default_mode(),max_concurrency:1,paused:false,resume_after_restart:Some(true),next_sequence:0,jobs:vec![],episodes:HashMap::new(),blocked_accounts:HashMap::new(),priority_migrated:HashSet::new(),policy_rejections:HashMap::new()}
     }
 }
 
@@ -183,7 +178,7 @@ impl QueueState {
                 state.blocked_accounts.insert(job.account_id.clone(),"submission_unknown".into());
                 recovered=true;
             } else if job.pending() {
-                job.authorization_confirmed=false;job.authorized_stores.clear();
+                job.authorization_confirmed=false;job.signal_confirmed=false;job.authorized_stores.clear();
                 job.stock_status="unknown".into(); job.checked_at_ms=0; job.status="waiting_stock".into();
                 job.message="服务已重启，等待新的监控库存确认；暂停的队列需手动继续".into(); recovered=true;
             }
@@ -207,7 +202,7 @@ impl QueueState {
         private_json(&root.join("settings/purchase_queue.json"),&disk)
     }
     fn view(&self) -> Value {
-        json!({"mode":self.mode,"max_concurrency":self.max_concurrency,"check_inventory_freshness":self.check_inventory_freshness,"paused":self.paused,"capacity":CAPACITY,
+        json!({"mode":self.mode,"max_concurrency":self.max_concurrency,"paused":self.paused,"capacity":CAPACITY,
             "running_count":self.active(),"queued_count":self.jobs.iter().filter(|job| job.pending()).count(),
             "child_capacity":CHILD_SLOTS,"reserved_child_slots":self.active_child_slots(),
             "blocked_accounts":self.blocked_accounts.iter().map(|(account,reason)|json!({"account_id":account,"reason":reason})).collect::<Vec<_>>(),
@@ -376,7 +371,7 @@ impl Engine {
                 Ok(Some(policy))=>policy,
                 Ok(None)=>{
                     for job in queue.jobs.iter_mut().filter(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_some()) {
-                        job.status="waiting_stock".into();job.authorization_confirmed=false;job.checked_at_ms=0;job.message=RESTORE_PRIORITY_MODE.into();
+                        job.status="waiting_stock".into();job.authorization_confirmed=false;job.signal_confirmed=false;job.checked_at_ms=0;job.message=RESTORE_PRIORITY_MODE.into();
                     }
                     queue.priority_migrated.remove(&key);
                     if queue.jobs.iter().any(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_some()) {
@@ -418,7 +413,7 @@ impl Engine {
                     || authorized.iter().any(|store|queue.episodes.get(&format!("{account}|{}|{}",rows[0]["sku"].as_str().unwrap_or(&sku),store["store_id"].as_str().unwrap())).is_some_and(|value|value=="legacy-attempt"));
                 if fixed_attempt {queue.episodes.entry(key.clone()).or_insert_with(||"mode-transition-existing-attempt".into());}
                 for job in queue.jobs.iter_mut().filter(|job|same_group(job)&&job.pickup_policy.is_none()&&job.pending()) {
-                    job.status="waiting_stock".into();job.authorization_confirmed=false;job.checked_at_ms=0;job.message=RESTORE_FIXED_MODE.into();
+                    job.status="waiting_stock".into();job.authorization_confirmed=false;job.signal_confirmed=false;job.checked_at_ms=0;job.message=RESTORE_FIXED_MODE.into();
                 }
             }
             if queue.jobs.iter().any(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_none()) {
@@ -431,12 +426,13 @@ impl Engine {
                 continue;
             }
             let old=queue.jobs.iter().find(|job|same_group(job)&&job.pending()&&job.pickup_policy.is_some()).and_then(|job|job.pickup_policy.clone());
-            let check_candidate_age=queue.check_inventory_freshness || old.is_none();
             let frozen=old.unwrap_or_else(||{let mut initial=base.clone();initial["stores"]=json!(authorized);initial});
             let existing=frozen["stores"].as_array().cloned().unwrap_or_default();
             let candidates:Vec<_>=existing.into_iter().filter(|store|authorized.iter().any(|allowed|allowed["store_id"]==store["store_id"])).collect();
-            let anchor=candidates.iter().find_map(|store|rows.iter().find(|row|row["auto_purchase"]==true&&row["store_id"]==store["store_id"]&&row["status"]=="available"&&sample_eligible(row,current,check_candidate_age)).map(|row|(store.clone(),row["checked_at_ms"].as_u64().unwrap_or(0))));
-            let default_store=candidates.first().or_else(||configured_stores.first()).unwrap();
+            let anchor=candidates.iter().find_map(|store|rows.iter().find(|row|row["auto_purchase"]==true&&row["store_id"]==store["store_id"]&&row["status"]=="available"&&sample_eligible(row,current,true)).map(|row|(store.clone(),row["checked_at_ms"].as_u64().unwrap_or(0))));
+            let retained_store=queue.jobs.iter().find(|job|same_group(job)&&job.pending()&&job.signal_confirmed)
+                .and_then(|job|candidates.iter().find(|store|store["store_id"]==job.store_id));
+            let default_store=retained_store.or_else(||candidates.first()).or_else(||configured_stores.first()).unwrap();
             let mut merged=rows[0].clone();merged["id"]=json!(format!("priority-{sku}-{quantity}"));merged["_queue_episode_key"]=json!(key);
             merged["auto_purchase"]=json!(!candidates.is_empty());merged["concurrency"]=json!(execution.map(|value|value.0).unwrap_or(1));merged["retry_count"]=json!(execution.map(|value|value.1).unwrap_or(0));
             merged["_queue_authorized_stores"]=json!(candidates.iter().filter_map(|store|store["store_id"].as_str()).collect::<Vec<_>>());
@@ -447,11 +443,11 @@ impl Engine {
                 else {(default_store.clone(),0,"unknown")};
             merged["store_id"]=selected["store_id"].clone();merged["store_name"]=selected["store_name"].clone();merged["location"]=selected["search"].clone();
             merged["checked_at_ms"]=json!(checked);merged["status"]=json!(status);
-            if let Some(message)=conflict {if !all_unavailable {merged["_queue_reject"]=json!(message);}}
+            if let Some(message)=conflict {merged["_queue_reject"]=json!(message);}
             output.push(merged);
         }
         for job in queue.jobs.iter_mut().filter(|job|job.pending()&&job.pickup_policy.is_some()&&!observed_groups.contains(&job.episode_key)) {
-            job.status="waiting_stock".into();job.authorization_confirmed=false;job.checked_at_ms=0;job.message="该候选池已移出监控，保留原排队位置，等待授权与库存恢复".into();
+            job.status="waiting_stock".into();job.authorization_confirmed=false;job.signal_confirmed=false;job.checked_at_ms=0;job.message="该候选池已移出监控，保留原排队位置，等待授权与库存恢复".into();
         }
         output
     }
@@ -497,13 +493,12 @@ impl Engine {
             "configure"=>{
                 let mode=params["mode"].as_str().ok_or("请选择顺序或固定并发模式")?;
                 let limit=params["max_concurrency"].as_u64().filter(|value|(1..=10).contains(value)).ok_or("队列并发数必须为 1–10 的整数")?;
-                let check_age=match params.get("check_inventory_freshness") {None=>queue.check_inventory_freshness,Some(value)=>value.as_bool().ok_or("库存样本时效检查开关必须为布尔值")?};
                 if !matches!(mode,"sequential"|"parallel") {return Err("队列模式无效".into())}
-                if (queue.mode!=mode || queue.max_concurrency!=limit as u32 || queue.check_inventory_freshness!=check_age)
+                if (queue.mode!=mode || queue.max_concurrency!=limit as u32)
                     && (queue.active()>0 || !self.queue_runtime.lock().unwrap().coordinators.is_empty()) {
                     return Err("请先暂停队列并等待正在执行的任务结束，再修改执行策略；排队任务仍保留".into());
                 }
-                queue.mode=mode.into();queue.max_concurrency=limit as u32;queue.check_inventory_freshness=check_age;
+                queue.mode=mode.into();queue.max_concurrency=limit as u32;
             },
             "pause"=>{queue.paused=true;queue.resume_after_restart=Some(false);},
             "resume"=>{
@@ -548,36 +543,33 @@ impl Engine {
         let mut queue=self.purchase_queue.lock().unwrap();
         let previous=queue.clone();
         let mut outcomes=vec![];
-        // Every monitor result is a full authorization snapshot. Missing targets
-        // lose dispatch eligibility, but retain their original durable queue intent.
-        for job in queue.jobs.iter_mut().filter(|job|job.pending()) {
-            job.wait_for_confirmation("目标已移出监控或等待本轮确认，保留排队位置，等待授权与库存恢复");
-        }
+        // A monitor result refreshes authorization, not an already accepted signal.
+        // Missing targets invalidate authorization after the complete snapshot is read.
         let targets=self.policy_inventory_targets(&mut queue,targets,current);
+        let mut observed=HashSet::new();
         for target in &targets {
             let (account,sku,store,quantity)=match target_key(target) {Ok(value)=>value,Err(message)=>{
                 if target["auto_purchase"]==true {outcomes.push(json!({"target_id":target["id"],"status":"blocked","message":message}));} continue;
             }};
             let key=target["_queue_episode_key"].as_str().map(str::to_owned).unwrap_or_else(||format!("{account}|{sku}|{store}"));
             let fresh=sample_eligible(target,current,true);
-            let usable=sample_eligible(target,current,queue.check_inventory_freshness);
+            observed.insert((key.clone(),quantity));
             let stock=target["status"].as_str().unwrap_or("unknown");
             for job in queue.jobs.iter_mut().filter(|job|job.episode_key==key && job.quantity==quantity && job.pending()) {
                 job.stock_status=stock.into();
-                job.checked_at_ms=target["checked_at_ms"].as_u64().unwrap_or(0);
-                job.sample_rejected_as_stale=false;
                 job.authorization_confirmed=target["auto_purchase"]==true;
                 job.authorized_stores=target["_queue_authorized_stores"].as_array().map(|rows|rows.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
                 if let Some(policy)=target.get("pickup_policy") {
                     job.pickup_policy=Some(policy.clone());
                     job.store_id=store.clone();job.store_name=target["store_name"].as_str().unwrap_or("").into();job.location=target["location"].as_str().unwrap_or("").into();
                 }
-                if target["auto_purchase"]!=true || fresh && stock=="unavailable" {
-                    job.status="waiting_stock".into();job.message=if target["auto_purchase"]!=true {
-                        "监控授权已关闭，保留排队位置，等待授权与库存恢复"
-                    }else {"官网明确无货，保留排队位置，等待新的有货确认"}.into();
-                } else if usable && stock=="available" {job.status="queued".into();job.message="等待按库存发现顺序执行".into();}
-                else {job.status="waiting_stock".into();job.message="库存未知或样本过时，等待新的有货确认".into();}
+                if !job.authorization_confirmed {
+                    job.wait_for_confirmation("监控授权已关闭，保留排队位置，等待授权与库存恢复");
+                } else {
+                    if fresh && stock=="available" {job.signal_confirmed=true;job.checked_at_ms=target["checked_at_ms"].as_u64().unwrap_or(0);}
+                    if job.signal_confirmed {job.status="queued".into();job.message="已收到有货信号，等待按发现顺序执行".into();}
+                    else {job.status="waiting_stock".into();job.message="等待当前授权目标的新有货信号".into();}
+                }
             }
             if let Some(message)=target["_queue_reject"].as_str() {
                 for job in queue.jobs.iter_mut().filter(|job|job.episode_key==key&&job.pending()) {
@@ -612,11 +604,14 @@ impl Engine {
                 started_at_ms:None,order_confirmed_at_ms:None,account_id:account,target_id:target["id"].as_str().unwrap_or("").chars().take(100).collect(),sku,quantity,
                 store_id:store,store_name:target["store_name"].as_str().unwrap_or("").chars().take(160).collect(),
                 location:target["location"].as_str().unwrap_or("").chars().take(160).collect(),concurrency,retry_count:retries,
-                status:"queued".into(),stock_status:"available".into(),checked_at_ms:target["checked_at_ms"].as_u64().unwrap_or(0),sample_rejected_as_stale:false,
+                status:"queued".into(),stock_status:"available".into(),checked_at_ms:target["checked_at_ms"].as_u64().unwrap_or(0),signal_confirmed:true,
                 task_id:None,message:"库存已确认，等待按发现时间执行；账号忙时保留排队".into(),result:None,order_submitted:false,assignment:0,pickup_policy:target.get("pickup_policy").cloned(),
                 authorization_confirmed:true,authorized_stores:target["_queue_authorized_stores"].as_array().map(|rows|rows.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),episode_key:key.clone()});
             queue.episodes.insert(key,id.clone());
             outcomes.push(json!({"target_id":target["id"],"status":"queued","queue_job_id":id,"sequence":sequence}));
+        }
+        for job in queue.jobs.iter_mut().filter(|job|job.pending()&&!observed.contains(&(job.episode_key.clone(),job.quantity))) {
+            job.wait_for_confirmation("目标已移出监控，保留排队位置，等待授权与库存恢复");
         }
         queue.prune();queue.jobs.sort_by_key(|job|(job.enqueued_at_ms,job.sequence));
         if let Err(error)=queue.save(&self.root) {*queue=previous;return vec![json!({"status":"blocked","message":format!("无法保存下单队列，未分配购买：{error}")})]}
@@ -636,7 +631,7 @@ impl Engine {
                 if let Some(job)=queue.jobs.iter().find(|job|Some(job.id.as_str())==outcome["queue_job_id"].as_str()) {self.append_event("queue_enqueued",&job.context());}
             }
         }
-        let priority_accounts:HashSet<_>=if !queue.paused {queue.jobs.iter().filter(|job|job.pending()&&job.eligible(current,queue.check_inventory_freshness)&&!queue.blocked_accounts.contains_key(&job.account_id))
+        let priority_accounts:HashSet<_>=if !queue.paused {queue.jobs.iter().filter(|job|job.pending()&&job.eligible()&&!queue.blocked_accounts.contains_key(&job.account_id))
             .map(|job|job.account_id.clone()).collect()}else{HashSet::new()};
         drop(queue);
         if !priority_accounts.is_empty() {
@@ -694,11 +689,6 @@ impl Engine {
         let mut runtime=self.queue_runtime.lock().unwrap();
         let Some(host)=runtime.host.clone() else{return};
         let mut changed=self.revalidate_pending_pickup_policies(&mut queue);
-        let current=now_ms();
-        let check_inventory_freshness=queue.check_inventory_freshness;
-        for job in queue.jobs.iter_mut().filter(|job|job.pending()) {
-            if !job.eligible(current,check_inventory_freshness) && job.status!="waiting_stock" {job.status="waiting_stock".into();job.message="库存样本超过 10 秒，等待新的确认，不使用旧库存下单".into();changed=true;}
-        }
         if !queue.paused {
             let mut remaining=queue.limit().saturating_sub(queue.active());
             let mut child_remaining=CHILD_SLOTS.saturating_sub(queue.active_child_slots());
@@ -706,7 +696,7 @@ impl Engine {
             for index in 0..queue.jobs.len() {
                 if remaining==0 {break}
                 let job=&queue.jobs[index];
-                if !job.pending() || !job.eligible(current,check_inventory_freshness) {continue}
+                if !job.pending() || !job.eligible() {continue}
                 let account=job.account_id.clone();
                 let waiting=if let Some(reason)=queue.blocked_accounts.get(&account) {Some(match reason.as_str() {
                     "submission_unknown"=>"该账号存在未知提交，未重放任务",
@@ -731,9 +721,7 @@ impl Engine {
             for (account,indices) in groups {
                 let previous=queue.clone();
                 for &index in &indices {queue.jobs[index].status="dispatched".into();queue.jobs[index].assignment=queue.jobs[index].assignment.saturating_add(1);queue.jobs[index].message="已持久化分配，等待执行".into();}
-                let targets:Vec<_>=indices.iter().map(|&index|{
-                    let mut payload=queue.jobs[index].payload();payload["check_inventory_freshness"]=json!(queue.check_inventory_freshness);payload
-                }).collect();
+                let targets:Vec<_>=indices.iter().map(|&index|queue.jobs[index].payload()).collect();
                 if queue.save(&self.root).is_err() {*queue=previous;queue.paused=true;break}
                 if let Some(coordinator)=runtime.coordinators.get_mut(&account) {
                     for &index in &indices {queue.jobs[index].task_id=Some(coordinator.task_id.clone());}
@@ -810,7 +798,8 @@ impl Engine {
                         if queue.jobs[index].order_confirmed_at_ms.is_none() {
                             queue.jobs[index].order_confirmed_at_ms=queue_order_confirmation_at(&result,queue.jobs[index].enqueued_at_ms,now_ms());
                         }
-                        let unknown=contains_unknown(&result);
+                        let unknown=contains_unknown(&result) || (result["status"]=="paused" && result["started"]==false
+                            && (queue.jobs[index].order_submitted || result["order_submitted"]==true || event["order_submitted"]==true));
                         if result["order_submitted"]==true || event["order_submitted"]==true {queue.jobs[index].order_submitted=true;}
                         if kind=="queue_finished" {
                             let status=result["status"].as_str().unwrap_or("");
@@ -820,8 +809,8 @@ impl Engine {
                             } else if status=="paused" && result["started"]==false {
                                 queue.jobs[index].task_id=None;
                                 if result["pause_reason"]=="inventory_stale" {
-                                    queue.jobs[index].status="waiting_stock".into();queue.jobs[index].sample_rejected_as_stale=true;
-                                    queue.jobs[index].message="执行前库存样本已过时，保留位置并等待新确认".into();
+                                    queue.jobs[index].status="queued".into();
+                                    queue.jobs[index].message="已收到有货信号，继续按原排队位置执行".into();
                                 } else {
                                     queue.jobs[index].status="queued".into();
                                     queue.jobs[index].message=result["message"].as_str().unwrap_or("账号准备未完成，任务保留原排队位置，请核实后继续").chars().take(2000).collect();
@@ -964,6 +953,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn priority_execution_conflict_still_blocks_an_accepted_signal_during_negative_stock() {
+        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
+        observe(&engine,&host,vec![target(&account,"R001",now_ms()),target(&account,"R002",now_ms())]);
+        let a=negative(target(&account,"R001",now_ms()));let mut b=negative(target(&account,"R002",now_ms()));b["retry_count"]=json!(2);
+        let outcomes=observe(&engine,&host,vec![a,b]);assert_eq!(outcomes[0]["status"],"blocked");
+        engine.queue_pump_once();assert!(engine.snapshot().tasks.is_empty());assert!(!jobs(&engine)[0].eligible());
+        assert!(jobs(&engine)[0].message.contains("不一致"));
+    }
+
+    #[tokio::test]
     async fn priority_groups_distinct_quantities_and_preserves_explicit_execution_values() {
         let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
         let mut targets=vec![];
@@ -1086,7 +1085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_age_check_priority_new_intents_and_rearming_still_need_fresh_stock() {
+    async fn priority_new_intents_and_rearming_still_need_fresh_stock() {
         let (root,engine,host,account)=fixture();let at=now_ms();
         save_policy(root.path(),&account,priority(&["R001","R002"]));
         engine.queue_command(host.clone(),"configure",&json!({"mode":"sequential","max_concurrency":1,"check_inventory_freshness":false})).unwrap();
@@ -1099,7 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_age_check_does_not_rearm_or_enqueue_from_old_stock() {
+    async fn old_stock_does_not_rearm_or_enqueue_new_intents() {
         let (_root,engine,host,account)=fixture();let at=now_ms();
         engine.queue_command(host.clone(),"configure",&json!({"mode":"sequential","max_concurrency":1,"check_inventory_freshness":false})).unwrap();
         observe(&engine,&host,vec![target(&account,"R001",at)]);
@@ -1115,51 +1114,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_head_retains_fifo_and_does_not_block_a_fresh_later_job() {
+    async fn accepted_signal_keeps_fifo_when_older_than_ten_seconds() {
         let (_root,engine,host,account)=fixture();let at=now_ms();
         observe(&engine,&host,vec![target(&account,"R001",at),target(&account,"R002",at+1)]);
         let before=jobs(&engine);
         engine.purchase_queue.lock().unwrap().jobs[0].checked_at_ms=at-20_000;
         engine.queue_pump_once();let after=jobs(&engine);
-        assert_eq!(after[0].status,"waiting_stock");assert_eq!(after[0].id,before[0].id);
-        assert_eq!(after[0].sequence,before[0].sequence);assert_eq!(after[1].status,"dispatched");
+        assert_eq!(after[0].status,"dispatched");assert_eq!(after[0].id,before[0].id);
+        assert_eq!(after[0].sequence,before[0].sequence);assert_eq!(after[1].status,"queued");
     }
 
     #[tokio::test]
-    async fn freshness_switch_defaults_on_persists_and_only_skips_age() {
-        let (root,engine,host,account)=fixture();let at=now_ms();
-        assert_eq!(engine.queue_command(host.clone(),"status",&json!({})).unwrap()["check_inventory_freshness"],true);
-        observe(&engine,&host,vec![target(&account,"R001",at)]);
-        engine.purchase_queue.lock().unwrap().jobs[0].checked_at_ms=at-20_000;
-        engine.queue_pump_once();assert_eq!(jobs(&engine)[0].status,"waiting_stock");
-        let view=engine.queue_command(host.clone(),"configure",&json!({"mode":"sequential","max_concurrency":1,"check_inventory_freshness":false})).unwrap();
-        assert_eq!(view["check_inventory_freshness"],false);
-        let persisted:Value=serde_json::from_slice(&fs::read(root.path().join("settings/purchase_queue.json")).unwrap()).unwrap();
-        assert_eq!(persisted["check_inventory_freshness"],false);
-        let job=jobs(&engine)[0].clone();assert!(job.eligible(at,false));assert!(!job.eligible(at,true));
-        let mut rejected=job.clone();rejected.checked_at_ms=at;rejected.sample_rejected_as_stale=true;
-        assert!(!rejected.eligible(at,true));assert!(rejected.eligible(at,false));
-        let mut invalid=job.clone();invalid.authorization_confirmed=false;assert!(!invalid.eligible(at,false));
-        for status in ["unknown","unavailable"] {let mut invalid=job.clone();invalid.stock_status=status.into();assert!(!invalid.eligible(at,false));}
-        for checked in [0,at+2000] {let mut invalid=job.clone();invalid.checked_at_ms=checked;assert!(!invalid.eligible(at,false));}
-        engine.queue_pump_once();assert_eq!(jobs(&engine)[0].status,"dispatched");
-        // Old persisted files lacking the switch retain the safe default.
-        let mut old=persisted;old.as_object_mut().unwrap().remove("check_inventory_freshness");
-        let migrated:QueueState=serde_json::from_value(old).unwrap();assert!(migrated.check_inventory_freshness);
+    async fn legacy_freshness_configuration_is_ignored_and_removed_from_persistence() {
+        let (root,engine,host,_account)=fixture();
+        for legacy in [json!(true),json!(false),json!("obsolete")] {
+            let view=engine.queue_command(host.clone(),"configure",&json!({"mode":"sequential","max_concurrency":1,"check_inventory_freshness":legacy})).unwrap();
+            assert!(view.get("check_inventory_freshness").is_none());
+        }
+        let mut persisted:Value=serde_json::from_slice(&fs::read(root.path().join("settings/purchase_queue.json")).unwrap()).unwrap();
+        assert!(persisted.get("check_inventory_freshness").is_none());
+        persisted["check_inventory_freshness"]=json!(true);
+        let legacy:QueueState=serde_json::from_value(persisted).unwrap();
+        assert!(serde_json::to_value(legacy).unwrap().get("check_inventory_freshness").is_none());
     }
 
     #[tokio::test]
-    async fn stale_or_unknown_inventory_and_fresh_negative_retain_the_same_waiting_intent() {
-        let (_root,engine,host,account)=fixture();let at=now_ms();
-        observe(&engine,&host,vec![target(&account,"R390",at)]);
-        {engine.purchase_queue.lock().unwrap().jobs[0].checked_at_ms=at-20_000;}
-        engine.queue_pump_once();assert_eq!(jobs(&engine)[0].status,"waiting_stock");assert!(engine.snapshot().tasks.is_empty());
-        let mut unknown=target(&account,"R390",now_ms());unknown["status"]=json!("unknown");unknown["checked_at_ms"]=Value::Null;
-        observe(&engine,&host,vec![unknown]);engine.queue_pump_once();assert!(engine.snapshot().tasks.is_empty());
-        let mut negative=target(&account,"R390",now_ms());negative["status"]=json!("unavailable");
-        let before=jobs(&engine)[0].clone();observe(&engine,&host,vec![negative]);assert_eq!(jobs(&engine)[0].status,"waiting_stock");
-        let outcomes=observe(&engine,&host,vec![target(&account,"R390",now_ms())]);
-        assert_eq!(outcomes[0]["status"],"already_queued");assert_eq!(jobs(&engine).len(),1);assert_eq!(jobs(&engine)[0].id,before.id);assert_eq!(jobs(&engine)[0].sequence,before.sequence);
+    async fn subsequent_negative_unknown_and_stale_samples_do_not_gate_fixed_or_priority_intents() {
+        for pool in [false,true] {for status in ["unavailable","unknown","available"] {
+            let (root,engine,host,account)=fixture();
+            if pool {save_policy(root.path(),&account,priority(&["R390","R391"]));}
+            let mut signal=target(&account,"R390",now_ms());signal["retry_count"]=json!(2);
+            observe(&engine,&host,vec![signal]);let initial=jobs(&engine)[0].clone();
+            let mut next=target(&account,"R390",if status=="available" {now_ms()-20_000}else {now_ms()});next["status"]=json!(status);
+            if status=="unknown" {next["checked_at_ms"]=Value::Null;}
+            observe(&engine,&host,vec![next]);
+            let pending=jobs(&engine)[0].clone();assert_eq!(pending.status,"queued");assert!(pending.eligible());
+            assert_eq!(pending.id,initial.id);assert_eq!(pending.sequence,initial.sequence);
+            assert_eq!(pending.checked_at_ms,initial.checked_at_ms);assert_eq!(pending.store_id,initial.store_id);
+            if status=="unavailable" {
+                let mut unknown=target(&account,"R390",now_ms());unknown["status"]=json!("unknown");unknown["checked_at_ms"]=Value::Null;
+                observe(&engine,&host,vec![unknown]);assert!(jobs(&engine)[0].eligible());assert_eq!(jobs(&engine)[0].id,initial.id);
+            }
+            engine.queue_pump_once();let dispatched=jobs(&engine)[0].clone();assert_eq!(dispatched.status,"dispatched");
+            assert_eq!(dispatched.payload()["retry_count"],2);assert!(dispatched.payload().get("check_inventory_freshness").is_none());
+            ready(&engine,&dispatched);
+            ack(&engine,&dispatched,"queue_finished",json!({"status":"failed","success":false,"order_submitted":false,"message":"官网结账：所选门店已无货","retry_summary":{"attempts":3,"retry_count":2}}));
+            let failed=jobs(&engine)[0].clone();assert_eq!(failed.status,"failed");assert_eq!(failed.message,"官网结账：所选门店已无货");
+            assert_eq!(failed.result.as_ref().unwrap()["retry_summary"]["attempts"],3);
+            let mut renewed=target(&account,"R390",now_ms());renewed["retry_count"]=json!(2);
+            observe(&engine,&host,vec![renewed.clone()]);assert_eq!(jobs(&engine).len(),1);
+            observe(&engine,&host,vec![negative(target(&account,"R390",now_ms()))]);
+            observe(&engine,&host,vec![renewed]);assert_eq!(jobs(&engine).len(),2);
+            assert_eq!(jobs(&engine)[0].message,"官网结账：所选门店已无货");
+        }}
     }
 
     #[tokio::test]
@@ -1234,7 +1241,7 @@ mod tests {
         engine.queue_pump_once();assert!(!*engine.controls.lock().unwrap()[&maintenance].cancel.borrow());
         // Restore via the queue state to exercise pump preemption independently
         // of the inventory-triggered preemption pathway.
-        {let mut queue=engine.purchase_queue.lock().unwrap();let job=&mut queue.jobs[0];job.authorization_confirmed=true;job.stock_status="available".into();job.checked_at_ms=now_ms();job.status="queued".into();}
+        {let mut queue=engine.purchase_queue.lock().unwrap();let job=&mut queue.jobs[0];job.authorization_confirmed=true;job.signal_confirmed=true;job.stock_status="available".into();job.checked_at_ms=now_ms();job.status="queued".into();}
         engine.queue_pump_once();assert!(*engine.controls.lock().unwrap()[&maintenance].cancel.borrow());
         assert_eq!(jobs(&engine)[0].status,"queued");assert!(jobs(&engine)[0].message.contains("空闲会话预热"));
     }
@@ -1271,11 +1278,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_pending_intent_requires_new_positive_signal_before_dispatch() {
+        for pool in [false,true] {
+            let (root,engine,host,account)=fixture();
+            if pool {save_policy(root.path(),&account,priority(&["R390"]));}
+            observe(&engine,&host,vec![target(&account,"R390",now_ms())]);let original=jobs(&engine)[0].clone();
+            let restored=Engine::new(root.path().into()).unwrap();restored.queue_stopping.store(true,Ordering::SeqCst);
+            restored.accounts.lock().unwrap()[0].pending=false;
+            restored.queue_command(host.clone(),"resume",&json!({})).unwrap();
+            observe(&restored,&host,vec![negative(target(&account,"R390",now_ms()))]);restored.queue_pump_once();
+            assert!(!jobs(&restored)[0].signal_confirmed);assert_eq!(jobs(&restored)[0].status,"waiting_stock");assert!(restored.snapshot().tasks.is_empty());
+            let mut unknown=target(&account,"R390",now_ms());unknown["status"]=json!("unknown");
+            observe(&restored,&host,vec![unknown]);restored.queue_pump_once();assert!(restored.snapshot().tasks.is_empty());
+            observe(&restored,&host,vec![target(&account,"R390",now_ms()-20_000)]);restored.queue_pump_once();assert!(restored.snapshot().tasks.is_empty());
+            observe(&restored,&host,vec![target(&account,"R390",now_ms())]);restored.queue_pump_once();
+            let dispatched=jobs(&restored)[0].clone();assert_eq!(dispatched.id,original.id);assert_eq!(dispatched.sequence,original.sequence);assert_eq!(dispatched.status,"dispatched");
+        }
+    }
+
+    #[tokio::test]
+    async fn unstarted_legacy_age_ack_cannot_requeue_a_previous_unknown_submission() {
+        let (_root,engine,host,account)=fixture();observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();
+        let job=jobs(&engine)[0].clone();ready(&engine,&job);
+        ack(&engine,&job,"queue_progress",json!({"status":"submission_unknown","order_submitted":true}));
+        ack(&engine,&job,"queue_finished",json!({"status":"paused","started":false,"order_submitted":false,"pause_reason":"inventory_stale"}));
+        assert_eq!(jobs(&engine)[0].status,"submission_unknown");
+        assert_eq!(engine.purchase_queue.lock().unwrap().blocked_accounts.get(&account).map(String::as_str),Some("submission_unknown"));
+        observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();
+        assert_eq!(jobs(&engine).len(),1);assert_eq!(jobs(&engine)[0].assignment,1);
+    }
+
+    #[tokio::test]
+    async fn legacy_age_ack_with_current_event_submission_evidence_cannot_requeue() {
+        let (_root,engine,host,account)=fixture();observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();
+        let job=jobs(&engine)[0].clone();ready(&engine,&job);
+        engine.queue_worker_event(&account,job.task_id.as_deref().unwrap(),&json!({"type":"queue_finished","queue_job_id":job.id,
+            "queue_assignment":job.assignment,"order_submitted":true,"result":{"status":"paused","started":false,"order_submitted":false,"pause_reason":"inventory_stale"}}));
+        assert_eq!(jobs(&engine)[0].status,"submission_unknown");assert!(jobs(&engine)[0].order_submitted);
+        assert_eq!(engine.purchase_queue.lock().unwrap().blocked_accounts.get(&account).map(String::as_str),Some("submission_unknown"));
+    }
+
+    #[tokio::test]
     async fn assignment_generation_rejects_late_ack_after_stale_unstarted_requeue() {
         let (_root,engine,host,account)=fixture();let at=now_ms();observe(&engine,&host,vec![target(&account,"R390",at)]);engine.queue_pump_once();
         let old=jobs(&engine)[0].clone();ready(&engine,&old);
         ack(&engine,&old,"queue_finished",json!({"status":"paused","started":false,"order_submitted":false,"pause_reason":"inventory_stale"}));
-        assert_eq!(jobs(&engine)[0].status,"waiting_stock");assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.is_empty());
+        assert_eq!(jobs(&engine)[0].status,"queued");assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.is_empty());
         observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();
         let assigned=jobs(&engine)[0].clone();assert_eq!(assigned.assignment,2);assert_eq!(assigned.task_id,old.task_id);
         ack(&engine,&old,"queue_finished",json!({"success":true,"status":"succeeded"}));assert_eq!(jobs(&engine)[0].status,"dispatched");
@@ -1300,7 +1348,7 @@ mod tests {
             assert_eq!(new.id,old.id);assert_eq!(new.sequence,old.sequence);assert_eq!(new.enqueued_at_ms,old.enqueued_at_ms);
             assert_eq!(new.stock_detected_at_ms,old.stock_detected_at_ms);assert_eq!(new.queued_at_ms,old.queued_at_ms);
         }
-        assert!(after[0].sequence<after[1].sequence);assert_eq!(after[1].status,"waiting_stock");
+        assert!(after[0].sequence<after[1].sequence);assert_eq!(after[1].status,"queued");
         let restored=QueueState::load(root.path(),&HashMap::new()).unwrap();
         assert_eq!(restored.jobs[0].stock_detected_at_ms,Some(detected));assert_eq!(restored.jobs[0].queued_at_ms,before[0].queued_at_ms);
         assert_eq!(restored.jobs[0].checked_at_ms,0);
@@ -1400,10 +1448,10 @@ mod tests {
         observe(&engine,&host,vec![target(&account,"R390",now_ms()),target(&account,"R391",now_ms())]);
         let queued=jobs(&engine)[1].clone();engine.queue_command(host.clone(),"cancel",&json!({"job_id":queued.id})).unwrap();
         engine.queue_pump_once();let job=jobs(&engine)[0].clone();ready(&engine,&job);
-        ack(&engine,&job,"queue_progress",json!({"status":"submission_unknown","order_submitted":true}));
+        ack(&engine,&job,"queue_progress",json!({"status":"running","order_submitted":false}));
         assert!(jobs(&engine).iter().all(|job|job.started_at_ms.is_none()&&job.order_confirmed_at_ms.is_none()));
         ack(&engine,&job,"queue_finished",json!({"status":"paused","started":false,"pause_reason":"inventory_stale"}));
-        assert_eq!(jobs(&engine)[0].status,"waiting_stock");
+        assert_eq!(jobs(&engine)[0].status,"queued");
         assert!(jobs(&engine).iter().all(|job|job.started_at_ms.is_none()&&job.order_confirmed_at_ms.is_none()));
         observe(&engine,&host,vec![target(&account,"R390",now_ms())]);engine.queue_pump_once();let reassigned=jobs(&engine)[0].clone();
         ack(&engine,&job,"queue_started",Value::Null);

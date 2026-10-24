@@ -16,6 +16,9 @@ from test_checkout_options import CONFIG
 
 class MonitorCheckoutTests(TestCase):
     def setUp(self):
+        preparation = patch('service.Service.prepare_purchase_session')
+        preparation.start()
+        self.addCleanup(preparation.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

@@ -193,6 +193,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
                     'order_ready': False, 'review_verified': False}
 
         with patch('browser_login.login_in_browser', side_effect=browser), \
+                patch.object(service, 'prepare_purchase_session'), \
                 patch('duo_killer.purchase_sku', side_effect=prepare), \
                 patch('requests.Session.request', side_effect=AssertionError('HTTP forbidden')):
             result = service.run('session_maintain', {'warm_only': True,

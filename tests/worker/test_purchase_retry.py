@@ -256,6 +256,9 @@ class PurchaseRetryTests(unittest.TestCase):
 
 class PurchaseRetryServiceTests(unittest.TestCase):
     def setUp(self):
+        preparation = patch('service.Service.prepare_purchase_session')
+        preparation.start()
+        self.addCleanup(preparation.stop)
         import interaction
         import duo_killer
         import alipay_qr
@@ -291,7 +294,8 @@ class PurchaseRetryServiceTests(unittest.TestCase):
     def test_service_retries_whole_parallel_round_after_callable_cleanup(self):
         sequence = []
 
-        def batch(_service, _params):
+        def batch(_service, _params, *, preflight_complete):
+            self.assertTrue(preflight_complete)
             number = len(sequence) // 2 + 1
             sequence.append('start' + str(number))
             try:

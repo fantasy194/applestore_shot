@@ -13,7 +13,7 @@ import { QueueEnqueuePolicy } from "./QueueEnqueuePolicy";
 
 const states: Record<string, string> = {
   queued: "等待执行",
-  waiting_stock: "等待确认库存",
+  waiting_stock: "等待恢复确认",
   dispatched: "准备执行",
   running: "执行中",
   cancelling: "正在取消",
@@ -136,7 +136,6 @@ export function PurchaseQueue({
   const [state, setState] = useState<Data | null>(null);
   const [mode, setMode] = useState("sequential");
   const [maximum, setMaximum] = useState(1);
-  const [checkFreshness, setCheckFreshness] = useState(true);
   const [maximumValid, setMaximumValid] = useState(true);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState("");
@@ -160,7 +159,6 @@ export function PurchaseQueue({
             if (!initialized.current) {
               setMode(result.mode || "sequential");
               setMaximum(result.max_concurrency ?? 1);
-              setCheckFreshness(result.check_inventory_freshness !== false);
               initialized.current = true;
             }
           }
@@ -278,7 +276,6 @@ export function PurchaseQueue({
                   await command("configure", {
                     mode,
                     max_concurrency: maximum,
-                    check_inventory_freshness: checkFreshness,
                   })
                 )
                   setDirty(false);
@@ -312,22 +309,9 @@ export function PurchaseQueue({
                   }}
                 />
               </div>
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={checkFreshness}
-                  disabled={busy}
-                  onChange={(event) => {
-                    setCheckFreshness(event.target.checked);
-                    setDirty(true);
-                  }}
-                />
-                下单前检查库存样本时效
-              </label>
               <p className="muted">
-                默认开启：超过 10
-                秒则保留位置并等待新确认，后续符合条件的任务继续执行。
-                关闭后允许使用最近一次有货确认，官网结账仍重新核对；未知库存、无货及授权限制继续生效。
+                有货信号触发入队，后续监控显示无货、未知或样本过期不会阻止排队执行。
+                下单失败记录实际原因，并按目标设置的次数重试；提交结果未知或需要重新登录时停止重试。
               </p>
               <p className="muted">
                 默认逐个执行，可同时执行 1–10
@@ -452,8 +436,8 @@ export function PurchaseQueue({
               const modeMessage = !hasAccount
                 ? "原账号已移除，任务无法继续。请取消此任务，再使用现有账号配置抢购。"
                 : priority
-                  ? "当前配置与入队时的「预选多店」不一致。恢复该模式和自动抢购授权后，有货时继续；改用固定单店请取消此任务。"
-                  : "当前配置与入队时的「固定单店」不一致。恢复该模式和自动抢购授权后，有货时继续；改用预选多店请取消此任务。";
+                  ? "当前配置与入队时的「预选多店」不一致。恢复该模式和自动抢购授权，重新确认有货后继续排队；改用固定单店请取消此任务。"
+                  : "当前配置与入队时的「固定单店」不一致。恢复该模式和自动抢购授权，重新确认有货后继续排队；改用预选多店请取消此任务。";
               const store =
                 job.result?.pickup_store ||
                 (job.pickup_policy?.selection_mode === "priority"

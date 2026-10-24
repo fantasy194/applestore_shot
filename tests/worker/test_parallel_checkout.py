@@ -198,6 +198,7 @@ class ParallelPurchaseTests(unittest.TestCase):
                 patch('interaction.handler'), \
                 patch('pickup_options.validate_preset', return_value={}), \
                 patch('checkout_options.read_config', return_value={}), \
+                patch('service.Service.prepare_purchase_session'), \
                 patch('parallel_checkout._worker_command',
                       return_value=[sys.executable, str(self.script)]):
             service = Service(self.channel, self.root, self.task_dir,

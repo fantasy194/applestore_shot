@@ -52,6 +52,8 @@ class Service:
         self.pickup_contact_accepted = False
         self.pickup_contact_review_verified = False
         self._parallel_child = False
+        self._purchase_session_owner = None
+        self._purchase_session_proof = None
         self.settings_dir = (self.root.parent.parent / 'settings'
                              if self.root.parent.name == 'accounts' else
                              self.root if self.root.name == 'settings' else self.root / 'settings')
@@ -462,6 +464,14 @@ class Service:
                     + '未加购、未下单；结算仍可能要求认证。')
         return result
 
+    def prepare_purchase_session(self):
+        from purchase_session import ensure_purchase_session
+        return ensure_purchase_session(self)
+
+    def purchase_session_ready(self):
+        from purchase_session import session_ready
+        return session_ready(self)
+
     def warm_pickup_prepare(self, sku, count):
         """Use the same saved pickup policy and hard prepare-only boundary as manual preparation."""
         if not isinstance(sku, str) or not re.fullmatch(r'[A-Za-z0-9]{1,30}(?:/A)?', sku):
@@ -476,7 +486,7 @@ class Service:
                 status='blocked', requires_login=True, http_status=541)
         if self.action == 'session_maintain':
             from browser_login import BrowserSessionError, login_in_browser
-            checked = login_in_browser(self, timeout=12, maintenance=True)
+            checked = login_in_browser(self, timeout=12, maintenance=True, storefront=True)
             if (checked.get('success') is not True or checked.get('logged_in') is not True
                     or checked.get('status') not in (None, 'healthy')):
                 raise BrowserSessionError(checked.get('error_code', 'SESSION_CHECK_INCOMPLETE'),
@@ -485,17 +495,25 @@ class Service:
                     http_status=checked.get('http_status'),
                     browser_started=checked.get('browser_started') is True,
                     browser_connected=checked.get('browser_connected') is True)
+            from purchase_session import record_action_session
+            record_action_session(self)
         self.stage('空闲自提预热：使用当前账号商品和自提偏好，不创建订单')
+        previous_owner = self._purchase_session_owner
+        if self.action == 'session_maintain':
+            self._purchase_session_owner = self
         try:
             return self.run('purchase', {'sku': sku, 'quantity': count, 'fulfillment': 'RETAIL',
                                         'prepare_only': True, 'keep_ready': False, 'concurrency': 1,
                                         'retry_count': 0})
         finally:
             # Engine ownership and purchase priority remain session-maintenance scoped.
+            self._purchase_session_owner = previous_owner
             self.action = 'session_maintain'
 
     def run(self, action, params):
         self._parallel_child = params.get('_parallel_child') is True
+        if action == 'purchase' and self._purchase_session_owner is None:
+            self._purchase_session_proof = None
         self.pickup_policy_override = None
         self.pickup_slot_selected = None
         self.pickup_contact_proof = None
@@ -638,6 +656,7 @@ class Service:
                 # and any later use of this service retain their original policy.
                 self.headless_browser = previous_headless
         elif action == 'purchase':
+            self.prepare_purchase_session()
             if params.get('prepare_only') is True:
                 if not self.automatic_checkout:
                     raise ValueError('提前准备需要已启用自动结算配置。')
@@ -647,7 +666,7 @@ class Service:
                 def attempt():
                     if self.fulfillment_mode == 'RETAIL' and concurrency > 1:
                         from parallel_checkout import run_parallel_purchase
-                        return run_parallel_purchase(self, params)
+                        return run_parallel_purchase(self, params, preflight_complete=True)
                     return duo_killer.purchase_sku(params.get('sku', 'MK2M4CH'), quantity=quantity(params))
                 result = run_purchase(self, params, attempt)
         elif action == 'add':

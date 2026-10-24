@@ -110,6 +110,8 @@ def checked_account(owner, *, enrolling=False):
 
 
 service.Service.check_account = checked_account
+service.Service.prepare_purchase_session = lambda owner: checked_account(owner)
+service.Service.purchase_session_ready = lambda owner: True
 actual_run_queued = queued_checkout.run_queued_purchase
 
 

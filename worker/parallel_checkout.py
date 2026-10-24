@@ -502,9 +502,11 @@ class PurchaseBatch:
             self.persist()
 
 
-def run_parallel_purchase(service, params, *, worker_command=None):
+def run_parallel_purchase(service, params, *, worker_command=None, preflight_complete=False):
     if params.get('fulfillment', 'HOME') != 'RETAIL' or params.get('prepare_only') is True:
         raise ValueError('并发下单仅适用于正式自提购买。')
     if params.get('_parallel_child') is True:
         raise ValueError('并发子任务不能再次创建并发批次。')
-    return PurchaseBatch(service, params, worker_command=worker_command).run()
+    # This keyword is an internal caller contract, never read from JSON params.
+    return PurchaseBatch(service, params, worker_command=worker_command,
+                         skip_preflight=preflight_complete).run()

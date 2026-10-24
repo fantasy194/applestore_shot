@@ -43,8 +43,7 @@ def validate_target(value):
     target = {key: child for key, child in value.items() if key in (
         'queue_job_id', 'id', 'queue_assignment', 'sku', 'quantity', 'fulfillment',
         'pickup_store_id', 'pickup_store_name', 'pickup_location', 'concurrency',
-        'retry_count', 'checked_at_ms', 'inventory_trigger', 'target_id', 'pickup_policy',
-        'check_inventory_freshness')}
+        'retry_count', 'checked_at_ms', 'inventory_trigger', 'target_id', 'pickup_policy')}
     identity = target.get('queue_job_id', target.get('id'))
     if not isinstance(identity, str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,100}', identity):
         raise ValueError('队列任务标识无效。')
@@ -67,16 +66,35 @@ def validate_target(value):
         if not isinstance(text, str) or not text.strip() or len(text) > 200:
             raise ValueError('队列门店名称或城市邮编无效。')
         target[key] = text.strip()
-    check_age = target.get('check_inventory_freshness', True)
-    if type(check_age) is not bool:
-        raise ValueError('库存样本时效检查开关必须为布尔值。')
-    target['check_inventory_freshness'] = check_age
     target['fulfillment'] = 'RETAIL'
     target['concurrency'] = concurrency(target)
     target['retry_count'] = retry_count(target)
     if 'pickup_policy' in target:
         target['pickup_policy'] = normalize_queue_pickup_policy(target['pickup_policy'])
     return target
+
+
+def _child_failure_message(result):
+    """Promote only existing child diagnostics, never private result objects."""
+    messages = []
+    attempts = result.get('attempts')
+    for item in (attempts[-10:] if isinstance(attempts, list) else []):
+        if not isinstance(item, dict) or item.get('status') != 'failed':
+            continue
+        nested = item.get('result')
+        nested = nested if isinstance(nested, dict) else {}
+        reason = next((text.strip() for text in (item.get('error'), nested.get('message'), nested.get('error'))
+                       if isinstance(text, str) and text.strip()), None)
+        if reason:
+            from activity_log import safe_message
+            reason = safe_message(reason)
+            # Child network errors normally arrive sanitized by main.py. Keep
+            # accidental URLs/contact values out of the promoted queue summary.
+            reason = re.sub(r'https?://[^\s<>]+', '[链接已隐藏]', reason[:2000])
+            reason = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[邮箱已隐藏]', reason)
+            reason = re.sub(r'(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)', '[电话已隐藏]', reason)
+            messages.append(reason[:190])
+    return '；'.join(messages)[:2000]
 
 
 class ProcessSlots:
@@ -196,6 +214,7 @@ def run_parent_serial(context, target):
         nested = Service(context.channel, context.root, context.task_dir, context.account,
                          vault=context.parent_service.vault)
         parent = context.parent_service
+        nested._purchase_session_owner = parent
         password = getattr(parent, 'password', None)
         nested.password = password if isinstance(password, str) else None
         nested.remember = getattr(parent, 'remember', False) is True
@@ -263,6 +282,7 @@ class QueuedCheckout:
         self.prompt_lock = threading.Lock()
         self.closing = False
         self.paused = None
+        self.pause_message = None
         self.idle_sent = False
         self.last_progress = 0
 
@@ -317,6 +337,7 @@ class QueuedCheckout:
             if self.paused or self.closing or len(self.waiting) >= MAX_BUFFERED:
                 self._finish(identity, {'status': 'paused', 'success': False,
                                        'started': False, 'order_submitted': False,
+                                       'message': self.pause_message or '账号队列已暂停，尚未开始购买。',
                                        'pause_reason': self.paused or ('closing' if self.closing else 'capacity')})
             else:
                 self.waiting.append(identity)
@@ -401,6 +422,10 @@ class QueuedCheckout:
             if result.get('status') == 'parallel_complete':
                 unknown = any(item.get('status') == 'submission_unknown' for item in result.get('attempts', []))
                 result['status'] = 'submission_unknown' if unknown else 'succeeded' if result.get('success') else 'failed'
+            if result.get('status') == 'failed' and not (isinstance(result.get('message'), str) and result['message'].strip()):
+                message = _child_failure_message(result)
+                if message:
+                    result['message'] = message
             if result.get('status') == 'pending_payment' and result.get('order_number'):
                 order = {**result, 'task_id': context.channel.task_id}
                 result['pending_orders'] = [order]
@@ -425,14 +450,9 @@ class QueuedCheckout:
 
     def _launch(self, identity):
         job = self.jobs[identity]
-        checked = job['target'].get('checked_at_ms')
-        age = int(time.time() * 1000) - checked if type(checked) is int else None
-        if (age is None or checked <= 0 or age < -1000
-                or job['target']['check_inventory_freshness'] and age > 10_000):
-            self._finish(identity, {'status': 'paused', 'success': False, 'started': False,
-                                    'order_submitted': False, 'pause_reason': 'inventory_stale',
-                                    'retryable': False})
-            return
+        # Rust already accepted the authorized arrival signal. Queue wait time
+        # and later anonymous stock samples cannot revoke that purchase intent;
+        # the checkout itself reports whether the authorized store can fulfill it.
         context = self._context(identity)
         context.parent_serial = self.limit == 1 and job['target']['concurrency'] == 1
         job.update(started=True, status='running', parent_serial=context.parent_serial)
@@ -497,16 +517,16 @@ class QueuedCheckout:
         self._add(self.initial)
         try:
             try:
-                state = self.service.check_account(enrolling=False)
-                if not isinstance(state, dict) or state.get('logged_in') is not True:
-                    raise ValueError('队列下单前未确认有效登录；未开始下单。')
+                self.service.prepare_purchase_session()
             except Exception as error:
                 import requests
                 authentication = (not isinstance(error, requests.RequestException)
-                                  and (getattr(self.service, 'authentication_requested', False) is True
+                                  and (getattr(error, 'requires_login', False) is True
+                                       or getattr(self.service, 'authentication_requested', False) is True
                                        or getattr(self.service, 'authentication_failed', False) is True
                                        or bool(re.search(r'登录|认证|验证码', str(error)))))
                 self.paused = 'authentication' if authentication else 'preflight_failed'
+                self.pause_message = self._preparation_error(error)
                 self.channel.emit('stage', message='账号预检未通过，尚未启动下单任务，请处理后手动恢复队列。')
             else:
                 self.channel.emit('queue_ready')
@@ -522,9 +542,19 @@ class QueuedCheckout:
                         identity = self.waiting.popleft()
                         self._finish(identity, {'status': 'paused', 'success': False,
                                                 'started': False, 'order_submitted': False,
+                                                'message': self.pause_message or '账号队列已暂停，尚未开始购买。',
                                                 'pause_reason': self.paused, 'retryable': False})
                 while (self.waiting and len(self.running) < self.limit and not self.paused
                        and not any(self.jobs[identity].get('parent_serial') for identity in self.running)):
+                    try:
+                        if not self.service.purchase_session_ready():
+                            if self.running:
+                                break  # Drain current checkout before refreshing shared auth.
+                            self.service.prepare_purchase_session()
+                    except Exception as error:
+                        self.paused = 'authentication' if getattr(error, 'requires_login', False) is True else 'preflight_failed'
+                        self.pause_message = self._preparation_error(error)
+                        break
                     self._launch(self.waiting.popleft())
                 if not self.running and not self.waiting:
                     if self.closing:
@@ -548,6 +578,14 @@ class QueuedCheckout:
                     self._finish(identity, {'status': 'submission_unknown' if job['started'] else 'cancelled',
                                             'success': False, 'started': job['started'],
                                             'order_submitted': job['started'], 'retryable': False})
+
+    @staticmethod
+    def _preparation_error(error):
+        import requests
+        from activity_log import safe_message
+        if isinstance(error, requests.RequestException):
+            return '购买前会话核验的网络请求未完成；未开始加购或下单。'
+        return safe_message(str(error)) if isinstance(error, (ValueError, OSError)) else '购买前会话核验未完成；未开始加购或下单。'
 
 
 def run_queued_purchase(service, params, **options):

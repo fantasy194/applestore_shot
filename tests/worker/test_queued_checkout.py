@@ -103,6 +103,9 @@ class QueueTests(unittest.TestCase):
                 validate_target(target('pool',pickup_policy={**self.policy(),'time_slot_rule':rule}))
 
     def setUp(self):
+        preparation = patch('service.Service.prepare_purchase_session')
+        preparation.start()
+        self.addCleanup(preparation.stop)
         self.temp = tempfile.TemporaryDirectory(prefix='duo-queue-fixture-')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -117,6 +120,8 @@ class QueueTests(unittest.TestCase):
                             account='fixture@example.test', channel=self.channel,
                             submitted=False, vault=Mock())
         self.service.check_account.return_value = {'logged_in':True}
+        self.service.prepare_purchase_session = Mock()
+        self.service.purchase_session_ready = Mock(return_value=True)
         self.script = self.root / 'child.py'
         self.script.write_text(CHILD)
 
@@ -144,7 +149,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([x['queue_job_id'] for x in self.finished()],['first','second'])
         self.assertEqual(result['status'],'queue_complete')
         self.assertEqual(len(result['queue_jobs']),2)
-        self.service.check_account.assert_called_once_with(enrolling=False)
+        self.service.check_account.assert_not_called()
 
     def test_normal_serial_executor_can_prompt_and_restores_legacy_globals(self):
         import duo_killer as shop
@@ -219,16 +224,94 @@ class QueueTests(unittest.TestCase):
         def executor(context,item):
             called.append(item['queue_job_id'])
             context.submitted=True
-            return {'success':False,'status':'submission_unknown','order_submitted':True}
-        result,_=self.execute([target('a',retry_count=3),target('b','R002')],executor)
+            return {'success':False,'status':'submission_unknown','order_submitted':True,
+                    'message':'提交响应未确认，请核对官网订单'}
+        result,_=self.execute([target('a',retry_count=3,checked_at_ms=int(time.time()*1000)-60_000),
+                              target('b','R002')],executor)
         self.assertEqual(called,['a'])
         events=self.finished()
         self.assertEqual(events[0]['result']['status'],'submission_unknown')
+        self.assertEqual(events[0]['result']['message'],'提交响应未确认，请核对官网订单')
+        self.assertEqual(events[0]['result']['retry_summary']['attempts_made'],1)
+        self.assertEqual(events[0]['result']['retry_summary']['stop_reason'],'submitted')
         self.assertTrue(events[0]['order_submitted'])
         self.assertEqual(events[1]['result']['status'],'paused')
         self.assertFalse(events[1]['result']['started'])
         self.assertFalse(events[1]['order_submitted'])
         self.assertEqual(result['pause_reason'],'submission_unknown')
+
+    def test_parallel_failure_promotes_final_round_actual_child_reasons_after_retries(self):
+        called=[]
+        class Batch:
+            def __init__(inner,context,item,**options):
+                inner.context=context
+            def run(inner):
+                called.append(len(called)+1)
+                return {'success':False,'status':'parallel_complete','attempts':[
+                    {'status':'failed','error':f'官网门店无货，第 {called[-1]} 轮'},
+                    {'status':'failed','result':{'message':'官网所选自提时段已不可用'}}]}
+        result,_=self.execute([target('parallel',concurrency=2,retry_count=2,
+                              checked_at_ms=int(time.time()*1000)-60_000)],
+                              Mock(side_effect=AssertionError('must use isolated batch')),batch_factory=Batch)
+        self.assertEqual(called,[1,2,3])
+        failure=result['queue_jobs'][0]['result']
+        self.assertEqual(failure['status'],'failed')
+        self.assertEqual(failure['message'],'官网门店无货，第 3 轮；官网所选自提时段已不可用')
+        self.assertEqual(failure['retry_summary']['attempts_made'],3)
+        self.assertEqual(failure['retry_summary']['stop_reason'],'exhausted')
+        self.assertEqual(self.finished()[0]['result']['message'],failure['message'])
+
+    def test_promoted_child_failure_is_bounded_and_excludes_private_values(self):
+        class Batch:
+            def __init__(inner,*args,**options):pass
+            def run(inner):
+                return {'success':False,'status':'parallel_complete','attempts':[
+                    {'status':'failed','error':'官网门店无货 https://example.test/private?token=secret '
+                     'private@example.test 13800000000 '+('错'*3000),
+                     'result':{'contact':{'lastName':'private-contact'},'payment_url':'private-payment',
+                               'qr_data':'private-qr'}}]}
+        result,_=self.execute([target('parallel',concurrency=2)],Mock(),batch_factory=Batch)
+        message=result['queue_jobs'][0]['result']['message']
+        self.assertEqual(message,'私有认证字段已省略。')
+        self.assertLessEqual(len(message),2000)
+        for private in ('https://','secret','private@example.test','13800000000',
+                        'private-contact','private-payment','private-qr'):
+            self.assertNotIn(private,message)
+
+    def test_promoted_failure_uses_existing_private_auth_and_contact_redaction(self):
+        from queued_checkout import _child_failure_message
+        for reason in ('cookie=synthetic-cookie','password=synthetic-password',
+                       '取货联系人：synthetic-name','request body synthetic-body'):
+            message=_child_failure_message({'attempts':[{'status':'failed','error':reason}]})
+            self.assertNotIn('synthetic',message)
+
+    def test_parallel_failure_retains_existing_top_level_message(self):
+        class Batch:
+            def __init__(inner,*args,**options):pass
+            def run(inner):
+                return {'success':False,'status':'parallel_complete','message':'官网明确返回的失败原因',
+                        'attempts':[{'status':'failed','error':'较早的子路失败原因'}]}
+        result,_=self.execute([target('parallel',concurrency=2)],Mock(),batch_factory=Batch)
+        self.assertEqual(result['queue_jobs'][0]['result']['message'],'官网明确返回的失败原因')
+
+    def test_parallel_unknown_submission_keeps_guard_and_does_not_promote_other_failure(self):
+        calls=[]
+        class Batch:
+            def __init__(inner,*args,**options):pass
+            def run(inner):
+                calls.append(True)
+                return {'success':False,'status':'parallel_complete','attempts':[
+                    {'status':'failed','error':'另一子路门店无货'},
+                    {'status':'submission_unknown','order_submitted':True}]}
+        result,_=self.execute([target('parallel',concurrency=2,retry_count=3),target('later','R002')],
+                              Mock(),batch_factory=Batch)
+        self.assertEqual(calls,[True])
+        unknown=result['queue_jobs'][0]['result']
+        self.assertEqual(unknown['status'],'submission_unknown')
+        self.assertNotIn('message',unknown)
+        self.assertEqual(unknown['retry_summary']['stop_reason'],'submitted')
+        self.assertEqual(result['pause_reason'],'submission_unknown')
+        self.assertEqual(result['queue_jobs'][1]['status'],'paused')
 
     def test_authentication_pauses_without_nested_login_or_retry(self):
         called=[]
@@ -274,7 +357,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(slots.active,0)
         self.assertEqual(len(result['pending_orders']),6)
         self.assertEqual({x['pickup_store_id'] for x in result['pending_orders']},{'R001','R002'})
-        self.service.check_account.assert_called_once_with(enrolling=False)
+        self.service.check_account.assert_not_called()
         self.assertNotIn('never-copy',self.channel.output.getvalue())
 
     def test_hot_increase_waits_until_normal_serial_job_finishes(self):
@@ -303,74 +386,81 @@ class QueueTests(unittest.TestCase):
             with self.assertRaises(ValueError):validate_target(item)
         self.service.check_account.assert_not_called()
 
-    def test_stale_inventory_never_starts_and_fresh_generation_resumes_once(self):
+    def test_old_signal_executes_fifo_and_late_generation_cancel_does_not_stop_it(self):
         called=[]
-        def callback(kind,payload):
-            if (kind=='queue_finished' and payload['result'].get('pause_reason')=='inventory_stale'):
-                self.channel.send('queue_add',queue_targets=[target('a',queue_assignment=2),
-                                                            target('a',queue_assignment=2)])
-        self.channel.callback=callback
         def executor(context,item):
             called.append(item['queue_assignment'])
-            # A late cancellation of the previous allocation cannot stop this one.
+            self.channel.send('queue_add',queue_targets=[dict(item),dict(item)])
+            # A late cancellation of an older allocation cannot stop this one.
             self.channel.send('queue_cancel',queue_job_id='a',queue_assignment=1)
             time.sleep(.04)
             context.channel.checkpoint()
             return {'success':False,'status':'failed'}
-        result,_=self.execute([target('a',queue_assignment=1,checked_at_ms=int(time.time()*1000)-11_000)],executor)
+        result,_=self.execute([target('a',queue_assignment=2,checked_at_ms=int(time.time()*1000)-60_000)],executor)
         self.assertEqual(called,[2])
         events=self.finished()
-        self.assertEqual([x['queue_assignment'] for x in events],[1,2])
-        self.assertFalse(events[0]['result']['started'])
-        self.assertEqual(events[0]['result']['pause_reason'],'inventory_stale')
-        self.assertTrue(events[1]['result']['started'])
+        self.assertEqual([x['queue_assignment'] for x in events],[2])
+        self.assertTrue(events[0]['result']['started'])
         self.assertEqual(result['queue_jobs'][0]['queue_assignment'],2)
 
-    def test_stale_head_ack_keeps_same_account_fresh_later_target_running(self):
+    def test_old_head_executes_before_fresh_later_target(self):
         called=[]
         def executor(context,item):
             called.append(item['queue_job_id'])
             return {'success':False,'status':'failed'}
         self.execute([target('old',queue_assignment=3,checked_at_ms=int(time.time()*1000)-20_000),
                       target('fresh','R002',queue_assignment=4)],executor)
-        self.assertEqual(called,['fresh'])
+        self.assertEqual(called,['old','fresh'])
         finished=self.finished()
         self.assertEqual([row['queue_job_id'] for row in finished],['old','fresh'])
-        self.assertEqual(finished[0]['result']['pause_reason'],'inventory_stale')
-        self.assertFalse(finished[0]['result']['started'])
-        self.assertTrue(finished[1]['result']['started'])
-        self.assertEqual(finished[1]['queue_assignment'],4)
+        self.assertTrue(all(row['result']['started'] for row in finished))
+        self.assertEqual([row['queue_assignment'] for row in finished],[3,4])
 
-    def test_disabled_freshness_starts_old_confirmation_and_acknowledges_assignment(self):
-        called=[]
-        def executor(context,item):
-            called.append(item['queue_assignment'])
-            self.assertFalse(item['check_inventory_freshness'])
-            return {'success':False,'status':'failed'}
-        result,_=self.execute([target('a',queue_assignment=7,
-            checked_at_ms=int(time.time()*1000)-60_000,check_inventory_freshness=False)],executor)
-        self.assertEqual(called,[7])
-        finished=self.finished()
-        self.assertEqual(len(finished),1)
-        self.assertEqual(finished[0]['queue_assignment'],7)
-        self.assertTrue(finished[0]['result']['started'])
-        self.assertFalse(finished[0]['result']['order_submitted'])
-
-    def test_disabled_freshness_still_rejects_missing_and_future_samples(self):
+    def test_dispatched_jobs_ignore_sample_metadata_and_legacy_freshness_setting(self):
         called=[]
         def executor(context,item):
             called.append(item['queue_job_id'])
+            self.assertNotIn('check_inventory_freshness',item)
             return {'success':False,'status':'failed'}
-        self.execute([target('missing',checked_at_ms=None,check_inventory_freshness=False),
-                      target('future','R002',checked_at_ms=int(time.time()*1000)+60_000,
+        missing=target('missing')
+        missing.pop('checked_at_ms')
+        self.execute([missing,
+                      target('old','R002',checked_at_ms=int(time.time()*1000)-60_000,
+                             check_inventory_freshness=True),
+                      target('future','R003',checked_at_ms=int(time.time()*1000)+60_000,
                              check_inventory_freshness=False),
-                      target('fresh','R003')],executor)
-        self.assertEqual(called,['fresh'])
-        self.assertEqual([row['result']['started'] for row in self.finished()],[False,False,True])
-        self.assertTrue(validate_target(target('default'))['check_inventory_freshness'])
-        for invalid in (None,0,1,'false'):
-            with self.assertRaises(ValueError):
-                validate_target(target('invalid',check_inventory_freshness=invalid))
+                      target('none',checked_at_ms=None)],executor)
+        self.assertEqual(called,['missing','old','future','none'])
+        self.assertTrue(all(row['result']['started'] for row in self.finished()))
+        self.assertTrue(all(row['result']['status']=='failed' for row in self.finished()))
+        self.assertNotIn('check_inventory_freshness',validate_target(target('default')))
+
+    def test_old_signal_records_real_checkout_failure_after_configured_retries(self):
+        called=[]
+        reasons=['官网自提门店暂不可用（第 1 次）','官网自提门店暂不可用（第 2 次）',
+                 '官网自提门店无货，无法继续结账（第 3 次）']
+        def executor(context,item):
+            called.append(item['queue_job_id'])
+            if item['queue_job_id']=='stale':
+                raise ValueError(reasons[len(called)-1])
+            return {'success':False,'status':'failed','message':'后续目标的真实结账失败'}
+        result,instance=self.execute([
+            target('stale',queue_assignment=7,checked_at_ms=int(time.time()*1000)-60_000,retry_count=2),
+            target('next','R002')],executor)
+        self.assertEqual(called,['stale','stale','stale','next'])
+        failed=self.finished()[0]['result']
+        self.assertEqual(failed['status'],'failed')
+        self.assertTrue(failed['started'])
+        self.assertFalse(failed['order_submitted'])
+        self.assertEqual(failed['message'],reasons[-1])
+        self.assertEqual(failed['retry_summary'],{'retry_count':2,'attempts_made':3,
+                                               'retries_used':2,'stop_reason':'exhausted'})
+        self.assertNotIn('pause_reason',failed)
+        self.assertIsNone(result['pause_reason'])
+        task_id=instance.jobs['stale']['task_id']
+        saved=json.loads((self.root/'tasks'/task_id/'task.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['status'],'failed')
+        self.assertEqual(saved['result']['message'],reasons[-1])
 
     def test_cancel_running_prompt_finishes_target_without_waiting_for_user(self):
         self.channel.auto_reply=False
@@ -416,7 +506,7 @@ class QueueTests(unittest.TestCase):
 
     def test_parent_preflight_network_failure_acknowledges_all_as_unstarted(self):
         import requests
-        self.service.check_account.side_effect=requests.Timeout('private-url-token')
+        self.service.prepare_purchase_session.side_effect=requests.Timeout('private-url-token')
         executor=Mock(side_effect=AssertionError('no target may start'))
         result,_=self.execute([target('a'),target('b','R002')],executor)
         executor.assert_not_called()
@@ -431,7 +521,9 @@ class QueueTests(unittest.TestCase):
         self.assertFalse(any(event['type']=='queue_started' for event in self.channel.events))
 
     def test_parent_preflight_authentication_failure_pauses_for_manual_resume(self):
-        self.service.check_account.return_value={'logged_in':False}
+        from browser_login import BrowserSessionError
+        self.service.prepare_purchase_session.side_effect=BrowserSessionError('OFFICIAL_SIGNIN_REQUIRED',
+            '官网登录需要人工验证',status='requires_login',requires_login=True)
         executor=Mock(side_effect=AssertionError('no target may start'))
         result,_=self.execute([target('a')],executor)
         executor.assert_not_called()

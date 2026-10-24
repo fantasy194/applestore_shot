@@ -1295,7 +1295,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.7</span>
+          <span>DUO Killer · 0.1.8</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (

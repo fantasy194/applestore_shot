@@ -323,12 +323,13 @@ class SessionMaintenanceTests(unittest.TestCase):
                 return {'success': True, 'status': 'waiting_stock', 'preparation_stage': 'fulfillment',
                         'order_ready': False, 'review_verified': False}
             with patch('duo_killer.purchase_sku', side_effect=offline_prepare) as purchase, \
+                    patch.object(service, 'prepare_purchase_session'), \
                     patch('browser_login.login_in_browser', return_value={
                         'success': True, 'logged_in': True, 'status': 'healthy'}) as browser, \
                     patch('requests.Session.request', side_effect=AssertionError('network forbidden')):
                 result = service.run('session_maintain', {'warm_only': True,
                     'preheat_flow': 'pickup_prepare', 'sku': 'MK2P4CH', 'quantity': 2})
-            browser.assert_called_once_with(service, timeout=12, maintenance=True)
+            browser.assert_called_once_with(service, timeout=12, maintenance=True, storefront=True)
             purchase.assert_called_once()
             self.assertEqual(result['status'], 'waiting_stock')
             self.assertEqual(result['browser_mode'], 'headless')
