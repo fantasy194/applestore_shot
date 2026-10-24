@@ -482,11 +482,14 @@ class LoginTests(unittest.TestCase):
 
 class BrowserInitializationTests(unittest.TestCase):
     def test_authx_541_marks_context_without_retry_or_overwriting_auth(self):
-        for status in (541, 401, 500):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
+        for status, marked in ((541, False), (541, True), (401, False), (500, False)):
+            with self.subTest(status=status, marked=marked), tempfile.TemporaryDirectory() as temp:
                 path = Path(temp) / "auth.json"
                 path.write_text('{"account":"test@example.invalid"}')
                 client = AppleStoreLogin(auth_path=path)
+                if marked:
+                    client.browser_profile.mkdir(parents=True)
+                    (client.browser_profile / ".authx-541").touch()
                 client.store_page = "https://secure9.www.apple.com.cn/shop/signIn?ssi=current"
                 client.callback = "https://secure9.www.apple.com.cn/shop/signIn/idms/authx?ssi=current"
                 client.store_headers = {"x-aos-stk": "current"}
@@ -931,26 +934,31 @@ class CheckoutAuthenticationTests(unittest.TestCase):
             client.bootstrap(entry, signin_response=self.page(model, entry + '-wrong'))
         request.assert_not_called()
 
-    def test_cookie_refresh_invalidates_cached_signin_page(self):
+    def test_only_current_cookie_refresh_invalidates_cached_signin_page_not_old_marker(self):
         for refresh in (False, True):
-            with self.subTest(refresh=refresh), tempfile.TemporaryDirectory() as temp:
-                client = AppleStoreLogin(auth_path=Path(temp) / 'auth.json')
-                if not refresh:
-                    client.session.cookies.set('shld_bt_ck', 'valid', domain='.apple.com.cn', path='/')
-                entry = 'https://secure8.www.apple.com.cn/shop/signIn/account?ssi=original'
-                cached = self.page({'signIn': {}}, entry)
-                with patch.object(client, 'restore_trust'), patch.object(client, 'discard_failed_login'), \
-                        patch.object(client, 'initialize_browser_context') as browser, \
-                        patch.object(client, 'bootstrap') as bootstrap, \
-                        patch.object(client, 'auth', side_effect=LoginError('stop before credentials')), \
-                        self.assertRaisesRegex(LoginError, 'stop before credentials'):
-                    client.login('test@example.invalid', 'secret', signin_url=entry, signin_response=cached)
-                if refresh:
-                    browser.assert_called_once()
-                    bootstrap.assert_called_once_with(entry)
-                else:
-                    browser.assert_not_called()
-                    bootstrap.assert_called_once_with(entry, signin_response=cached)
+            for marked in (False, True):
+                for route in ('/shop/signIn', '/shop/signIn/account', '/shop/signIn/orders'):
+                    with self.subTest(refresh=refresh, marked=marked, route=route), tempfile.TemporaryDirectory() as temp:
+                        client = AppleStoreLogin(auth_path=Path(temp) / 'auth.json')
+                        if not refresh:
+                            client.session.cookies.set('shld_bt_ck', 'valid', domain='.apple.com.cn', path='/')
+                        if marked:
+                            client.browser_profile.mkdir(parents=True)
+                            (client.browser_profile / '.authx-541').touch()
+                        entry = 'https://secure8.www.apple.com.cn' + route + '?ssi=original'
+                        cached = self.page({'signIn': {}}, entry)
+                        with patch.object(client, 'restore_trust'), patch.object(client, 'discard_failed_login'), \
+                                patch.object(client, 'initialize_browser_context') as browser, \
+                                patch.object(client, 'bootstrap') as bootstrap, \
+                                patch.object(client, 'auth', side_effect=LoginError('stop before credentials')), \
+                                self.assertRaisesRegex(LoginError, 'stop before credentials'):
+                            client.login('test@example.invalid', 'secret', signin_url=entry, signin_response=cached)
+                        if refresh:
+                            browser.assert_called_once()
+                            bootstrap.assert_called_once_with(entry)
+                        else:
+                            browser.assert_not_called()
+                            bootstrap.assert_called_once_with(entry, signin_response=cached)
 
     def test_account_read_reauthenticates_exact_entry_in_same_session(self):
         session = requests.Session()
@@ -1119,19 +1127,17 @@ class StrongLoginTests(unittest.TestCase):
                 self.assertFalse(duo_killer.ensure_strong_login(session))
                 login.assert_not_called()
 
-    def test_541_marker_requires_verified_recovery_not_profile_preparation(self):
+    def test_old_541_marker_is_diagnostic_when_current_cookies_are_sendable(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(duo_killer, "AUTH_PATH", Path(temp) / "auth.json"), requests.Session() as session:
             duo_killer.AUTH_PATH.write_text(json.dumps(self.config()))
             duo_killer.load_auth(session, self.config())
             client = AppleStoreLogin(auth_path=duo_killer.AUTH_PATH)
             client.mark_rejected_browser_context()
-            with patch.object(duo_killer, "login", side_effect=lambda **kwargs: client.prepare_browser_profile()) as login:
-                with self.assertRaisesRegex(ValueError, '仍缺少有效会话'):
-                    duo_killer.ensure_strong_login(session)
-                login.assert_called_once_with(sms=False)
-                (client.browser_profile / '.authx-541').unlink()  # A verified browser recovery clears it.
+            with patch.object(duo_killer, "login") as login:
                 self.assertFalse(duo_killer.ensure_strong_login(session))
+                login.assert_not_called()
+            self.assertTrue((client.browser_profile / '.authx-541').exists())
 
     def test_wrong_cookie_scope_triggers_full_login_and_forwards_sms(self):
         for domain, path in ((".example.invalid", "/"), (".apple.com.cn", "/unrelated")):

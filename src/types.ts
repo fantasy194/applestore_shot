@@ -56,6 +56,8 @@ export interface Task {
   id: string;
   account_id: string;
   action: Action;
+  /** Explicit login preheat may yield to a purchase; ordinary login may not. */
+  warm_only?: boolean;
   status: string;
   stage: string;
   created_at: number;

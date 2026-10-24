@@ -80,6 +80,10 @@ class Frame:
         self.page, self.url = page, url
         self.fields, self.body, self.alerts = [], '', []
         self.detached = False
+        self.visible = True
+
+    def frame_element(self):
+        return SimpleNamespace(is_visible=lambda:self.visible, dispose=lambda:None)
 
     def is_detached(self):
         return self.detached
@@ -333,6 +337,169 @@ class BrowserSigninTests(unittest.TestCase):
             self.assistant.step(self.page, self.network)
         self.assertEqual(error.exception.code, 'BROWSER_LOGIN_SECURITY_CHALLENGE')
         self.service.channel.prompt.assert_not_called()
+
+    def test_official_account_page_can_continue_its_visible_official_auth_iframe(self):
+        self.page.url = 'https://secure8.www.apple.com.cn/shop/account/home'
+        account, button = self.form(account=self.service.account, password=True)
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.assertEqual(button.clicks,1)
+        self.service.browser_password.assert_called_once()
+
+    def test_account_page_hidden_or_external_iframe_never_receives_credentials(self):
+        for state in ('hidden','external','detached'):
+            with self.subTest(state=state):
+                self.setUp()
+                self.page.url = 'https://secure8.www.apple.com.cn/shop/account/home'
+                self.form(account=self.service.account,password=True)
+                if state == 'hidden': self.page.auth.visible = False
+                if state == 'external': self.page.auth.url = 'https://example.test/appleauth/auth'
+                if state == 'detached': self.page.auth.frame_element = Mock(side_effect=RuntimeError('detached'))
+                self.assertEqual(self.assistant.step(self.page,self.network),'unrecognized')
+                self.service.browser_password.assert_not_called()
+                self.assertEqual(self.page.events,[])
+
+    def test_embedded_auth_still_rejects_another_account_before_password(self):
+        self.page.url = 'https://secure8.www.apple.com.cn/shop/account/home'
+        self.form(account='other@example.test',password=True)
+        with self.assertRaises(BrowserSessionError) as error:
+            self.assistant.step(self.page,self.network)
+        self.assertEqual(error.exception.code,'BROWSER_LOGIN_ACCOUNT_MISMATCH')
+        self.service.browser_password.assert_not_called()
+
+    def test_hidden_old_challenge_cannot_interrupt_new_visible_login(self):
+        for path in ('/shop/signIn','/shop/signIn/account','/shop/signIn/orders'):
+            with self.subTest(path=path):
+                self.setUp()
+                self.page.url='https://secure8.www.apple.com.cn'+path
+                _,button=self.form(account=self.service.account,password=True)
+                hidden=Frame(self.page,'https://idmsa.apple.com.cn/appleauth/auth/authorize?old=1')
+                hidden.visible=False
+                hidden.body='Captcha: verify you are human'
+                hidden.fields=[Field(hidden,'account','other@example.test'),Field(hidden,'password')]
+                self.page.frames.insert(1,hidden)
+                self.assistant=BrowserSigninAssistant(self.service,headless=True,automatic=True)
+                self.assertEqual(self.assistant.step(self.page,self.network),'acted')
+                self.assertEqual(button.clicks,1)
+                self.service.browser_password.assert_called_once()
+                self.assertEqual(hidden.fields[-1].value,'')
+
+    def test_hidden_matching_account_cannot_authorize_visible_other_account(self):
+        self.form(account='other@example.test',password=True)
+        hidden=Frame(self.page,'https://idmsa.apple.com.cn/appleauth/auth/authorize?old=1')
+        hidden.visible=False
+        hidden.fields=[Field(hidden,'account',self.service.account),Field(hidden,'password')]
+        self.page.frames.insert(1,hidden)
+        with self.assertRaises(BrowserSessionError) as error:
+            self.assistant.step(self.page,self.network)
+        self.assertEqual(error.exception.code,'BROWSER_LOGIN_ACCOUNT_MISMATCH')
+        self.service.browser_password.assert_not_called()
+        self.assertEqual(self.page.events,[])
+
+    def test_official_main_auth_document_is_preserved_without_child_visibility_probe(self):
+        self.page.url='https://idmsa.apple.com.cn/appleauth/auth/authorize'
+        self.page.main_frame.url=self.page.url
+        self.page.frames=[self.page.main_frame]
+        self.page.main_frame.frame_element=Mock(side_effect=AssertionError('main document has no iframe'))
+        self.page.main_frame.fields=[Field(self.page.main_frame,'account',self.service.account),
+            Field(self.page.main_frame,'password'),Field(self.page.main_frame,'button',name='Continue')]
+        self.assertEqual(self.assistant.step(self.page,self.network),'acted')
+        self.service.browser_password.assert_called_once()
+        self.page.main_frame.frame_element.assert_not_called()
+
+    def test_visible_iframe_body_read_timeout_waits_without_interrupting_or_typing(self):
+        from playwright.sync_api import TimeoutError as BrowserTimeout
+        for headless in (True,False):
+            with self.subTest(headless=headless):
+                self.setUp()
+                self.form(account=self.service.account,password=True)
+                original=self.page.auth.locator
+                delayed=[True]
+                def locator(selector):
+                    result=original(selector)
+                    if selector == 'body' and delayed[0]:
+                        result.inner_text=Mock(side_effect=BrowserTimeout('synthetic body not ready'))
+                    return result
+                self.page.auth.locator=locator
+                self.assistant=BrowserSigninAssistant(self.service,headless=headless,automatic=True)
+                for _ in range(3):
+                    self.assertEqual(self.assistant.step(self.page,self.network),'unrecognized')
+                    self.assertFalse(self.assistant.interrupted)
+                    self.assertEqual(self.page.events,[])
+                    self.service.browser_password.assert_not_called()
+                delayed[0]=False
+                self.assertEqual(self.assistant.step(self.page,self.network),'acted')
+                self.service.browser_password.assert_called_once()
+
+    def test_navigation_during_read_only_alert_scan_waits_for_both_browser_modes(self):
+        from playwright.sync_api import Error as BrowserError
+        for headless in (True,False):
+            with self.subTest(headless=headless):
+                self.setUp()
+                self.form(account=self.service.account,password=True)
+                original=self.page.auth.get_by_role
+                delayed=[True]
+                def role(kind,**kwargs):
+                    result=original(kind,**kwargs)
+                    if kind == 'alert' and delayed[0]:
+                        result.all_inner_texts=Mock(side_effect=BrowserError(
+                            'Locator.all_inner_texts: Execution context was destroyed, most likely because of a navigation'))
+                    return result
+                self.page.auth.get_by_role=role
+                self.assistant=BrowserSigninAssistant(self.service,headless=headless,automatic=True)
+                self.assertEqual(self.assistant.step(self.page,self.network),'unrecognized')
+                self.assertFalse(self.assistant.interrupted)
+                self.assertEqual(self.page.events,[])
+                self.service.browser_password.assert_not_called()
+                delayed[0]=False
+                self.assertEqual(self.assistant.step(self.page,self.network),'acted')
+                self.service.browser_password.assert_called_once()
+
+    def test_alert_scan_navigation_preserves_already_submitted_password(self):
+        from playwright.sync_api import Error as BrowserError
+        self.form(account=self.service.account,password=True)
+        self.assistant.submitted.add('password')
+        original=self.page.auth.get_by_role
+        def role(kind,**kwargs):
+            result=original(kind,**kwargs)
+            if kind == 'alert':
+                result.all_inner_texts=Mock(side_effect=BrowserError('Execution context was destroyed'))
+            return result
+        self.page.auth.get_by_role=role
+        self.assertEqual(self.assistant.step(self.page,self.network),'unrecognized')
+        self.assertEqual(self.assistant.submitted,{'password'})
+        self.assertFalse(self.assistant.interrupted)
+        self.page.auth.get_by_role=original
+        self.assertEqual(self.assistant.step(self.page,self.network),'waiting')
+        self.service.browser_password.assert_not_called()
+
+    def test_unrelated_alert_scan_browser_error_is_still_terminal(self):
+        from playwright.sync_api import Error as BrowserError
+        self.form(account=self.service.account,password=True)
+        original=self.page.auth.get_by_role
+        def role(kind,**kwargs):
+            result=original(kind,**kwargs)
+            if kind == 'alert':
+                result.all_inner_texts=Mock(side_effect=BrowserError('Unexpected JavaScript evaluation failure'))
+            return result
+        self.page.auth.get_by_role=role
+        with self.assertRaises(BrowserSessionError) as error:
+            self.assistant.step(self.page,self.network)
+        self.assertEqual(error.exception.code,'BROWSER_LOGIN_INPUT_INTERRUPTED')
+        self.assertTrue(self.assistant.interrupted)
+        self.service.browser_password.assert_not_called()
+
+    def test_navigation_error_during_actual_submit_remains_reserved_and_stops(self):
+        from playwright.sync_api import Error as BrowserError
+        _,button=self.form(account=self.service.account,password=True)
+        button.on_click=Mock(side_effect=BrowserError('Execution context was destroyed'))
+        with self.assertRaises(BrowserSessionError) as error:
+            self.assistant.step(self.page,self.network)
+        self.assertEqual(error.exception.code,'BROWSER_LOGIN_INPUT_INTERRUPTED')
+        self.assertTrue(self.assistant.interrupted)
+        self.assertIn('password',self.assistant.submitted)
+        with self.assertRaises(BrowserSessionError):
+            self.assistant.step(self.page,self.network)
+        self.assertEqual(button.clicks,1)
 
     def test_account_first_step_types_and_clicks_only_once(self):
         account, button = self.form()

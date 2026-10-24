@@ -193,6 +193,8 @@ pub struct Task {
     pub id: String,
     pub account_id: String,
     pub action: String,
+    #[serde(default)]
+    pub warm_only: bool,
     pub status: String,
     pub stage: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +212,15 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue_job_ids: Vec<String>,
 }
+pub(crate) fn is_preemptible_preheat(task:&Task)->bool {
+    !task.order_submitted && (task.action=="session_maintain" || task.action=="login" && task.warm_only)
+}
+
+pub(crate) fn ready_purchase(task:&Task)->bool {
+    matches!(task.action.as_str(),"purchase"|"checkout") && !terminal(&task.status)
+        && task.schedule.as_ref().is_none_or(|schedule|schedule.triggered_at_ms.is_some() || schedule.at_ms<=now_ms())
+}
+
 #[derive(Serialize)]
 pub struct Snapshot {
     pub accounts: Vec<Account>,
@@ -737,21 +748,23 @@ impl Engine {
         }
         if action == "session_maintain" && (
             tasks.values().any(|task|task.account_id==account_id && (matches!(task.status.as_str(), "running" | "waiting")
-                || task.action=="session_maintain" && !terminal(&task.status)
-                || task_has_unknown_submission(task)))
+                || is_preemptible_preheat(task) && !terminal(&task.status)
+                || ready_purchase(task) || task_has_unknown_submission(task)))
             || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock|lock.available_permits()==0)) {
             return Err("账号有进行中的任务，本轮登录维护已跳过，不排队占用账号".into());
         }
-        let purchase_priority=matches!(action.as_str(), "purchase" | "checkout") && params["prepare_only"]!=true && schedule.is_none();
+        let purchase_admission=matches!(action.as_str(), "purchase" | "checkout") && params["prepare_only"]!=true;
+        let purchase_priority=purchase_admission && schedule.is_none();
         if purchase_priority {
             let controls=self.controls.lock().unwrap();
-            for maintenance in tasks.values().filter(|task|task.account_id==account_id && task.action=="session_maintain" && !terminal(&task.status)) {
+            for maintenance in tasks.values().filter(|task|task.account_id==account_id && is_preemptible_preheat(task) && !terminal(&task.status)) {
                 if let Some(control)=controls.get(&maintenance.id) {let _=control.cancel.send(true);}
             }
         }
         if params["inventory_trigger"] == true && (
-            tasks.values().any(|task| task.account_id == account_id && (!terminal(&task.status) || unresolved_submission(task, &tasks)))
-            || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock| lock.available_permits() == 0)) {
+            tasks.values().any(|task| task.account_id == account_id && ((!terminal(&task.status) && !(purchase_priority && is_preemptible_preheat(task))) || unresolved_submission(task, &tasks)))
+            || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock| lock.available_permits() == 0)
+                && !tasks.values().any(|task|task.account_id==account_id && !terminal(&task.status) && purchase_priority && is_preemptible_preheat(task))) {
             return Err("库存已变化但账号正忙或已有待核实订单，未排队自动下单".into());
         }
         if action == "inventory_monitor" {
@@ -773,7 +786,7 @@ impl Engine {
                 return Ok(existing.id.clone());
             }
         }
-        if tasks.values().any(|t| t.account_id == account_id && t.status == "waiting" && !(purchase_priority && t.action=="session_maintain")) {
+        if tasks.values().any(|t| t.account_id == account_id && t.status == "waiting" && !(purchase_admission && is_preemptible_preheat(t))) {
             return Err("该账号正在等待输入或订单确认，请从顶部进行中的任务继续操作，或先取消该任务".into());
         }
         if tasks
@@ -794,6 +807,7 @@ impl Engine {
                 id: id.clone(),
                 account_id: account_id.clone(),
                 action: action.clone(),
+                warm_only: action=="login" && params["warm_only"]==true,
                 status: if schedule.is_some() { "scheduled" } else { "queued" }.into(),
                 stage: if schedule.is_some() { "等待定时触发；电脑须保持唤醒，本地服务须保持运行" } else { "等待执行" }.into(),
                 created_at: now(),
@@ -924,22 +938,25 @@ impl Engine {
                 // Anonymous monitoring has its own transport and must not block local settings/discovery.
                 if *cancel.borrow() { return Err("cancelled".into()) }
                 None
-            } else if action == "session_maintain" {
+            } else if action == "session_maintain" || action == "login" && params["warm_only"]==true {
                 // A snapshot may become stale before this future is polled.
-                // Background preheat must skip instead of waiting behind an order.
+                // Automatic and explicit preheat both yield to queued purchases.
                 if *cancel.borrow() { return Err("cancelled".into()) }
+                if self.tasks.lock().unwrap().values().any(|task|task.account_id==account.id && task.id!=id && ready_purchase(task)) {
+                    return Err("账号已有排队购买，登录预热已跳过".into());
+                }
                 Some(lock.try_acquire_owned().map_err(|_| "账号正在执行任务，登录预热已跳过；未排队占用账号")?)
             } else if let Some(s) = &schedule {
                 {
                     let tasks = self.tasks.lock().unwrap();
                     let controls = self.controls.lock().unwrap();
                     for maintenance in tasks.values().filter(|t| t.account_id == account.id
-                        && t.id != id && t.action == "session_maintain" && !terminal(&t.status)) {
+                        && t.id != id && is_preemptible_preheat(t) && !terminal(&t.status)) {
                         if let Some(control) = controls.get(&maintenance.id) { let _ = control.cancel.send(true); }
                     }
                 }
                 if self.tasks.lock().unwrap().values().any(|t| t.account_id == account.id && t.id != id
-                    && t.action != "session_maintain" && !terminal(&t.status)) {
+                    && !is_preemptible_preheat(t) && !terminal(&t.status)) {
                     return Err("定时时间已到，但该账号仍有未完成任务；未延迟排队下单，请处理后重新设定".into());
                 }
                 // Only the preempted background preheat may need a brief shutdown.
@@ -1267,6 +1284,7 @@ mod tests {
             id: "t".into(),
             account_id: "a".into(),
             action: "login".into(),
+            warm_only: false,
             status: "waiting".into(),
             stage: "".into(),
             created_at: 0,
@@ -1375,6 +1393,54 @@ mod tests {
         apply_event(&mut other,&json!({"type":"result","result":declined}));
         assert_eq!(other.status,"succeeded"); assert_eq!(other.stage,"已完成");
         assert_eq!(other.result.unwrap(),declined);
+    }
+
+    #[tokio::test]
+    async fn purchase_priority_preempts_explicit_preheat_but_schedule_admission_waits_until_due() {
+        for mode in ["immediate","inventory","scheduled"] {
+            let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
+            let account=engine.add_account("preheat-priority@example.test".into()).unwrap();engine.accounts.lock().unwrap()[0].pending=false;
+            let host=TaskHost {worker:root.path().join("missing"),script:None,on_update:Arc::new(|_|{})};
+            let warm=engine.start(host.clone(),account.id.clone(),"login".into(),json!({"warm_only":true})).unwrap();
+            engine.tasks.lock().unwrap().get_mut(&warm).unwrap().status="waiting".into();
+            // Simulate the running preheat owning the account during an OTP wait.
+            let lock=engine.locks.lock().unwrap()[&account.id].clone();let _held=lock.acquire().await.unwrap();
+            let mut params=json!({"sku":"MLH74FE","quantity":1,"fulfillment":"RETAIL"});
+            if mode=="inventory" {params["inventory_trigger"]=json!(true);}
+            if mode=="scheduled" {params["scheduled_at"]=json!(now_ms()+60_000);}
+            let purchase=engine.start(host,account.id.clone(),"purchase".into(),params).unwrap();
+            assert_eq!(*engine.controls.lock().unwrap()[&warm].cancel.borrow(),mode!="scheduled");
+            assert!(engine.tasks.lock().unwrap()[&warm].warm_only);
+            assert_eq!(engine.tasks.lock().unwrap()[&purchase].status,if mode=="scheduled" {"scheduled"} else {"queued"});
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_manual_login_waiting_keeps_its_input_while_preheat_yields() {
+        let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
+        let account=engine.add_account("manual-login-priority@example.test".into()).unwrap();engine.accounts.lock().unwrap()[0].pending=false;
+        let host=TaskHost {worker:root.path().join("missing"),script:None,on_update:Arc::new(|_|{})};
+        let login=engine.start(host.clone(),account.id.clone(),"login".into(),json!({})).unwrap();
+        engine.tasks.lock().unwrap().get_mut(&login).unwrap().status="waiting".into();
+        for scheduled in [false,true] {
+            let mut params=json!({"sku":"MLH74FE","quantity":1});
+            if scheduled {params["scheduled_at"]=json!(now_ms()+60_000);}
+            assert!(engine.start(host.clone(),account.id.clone(),"purchase".into(),params).is_err());
+            assert!(!*engine.controls.lock().unwrap()[&login].cancel.borrow());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_immediate_purchase_blocks_new_maintenance_but_future_schedule_does_not() {
+        for future in [false,true] {
+            let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
+            let account=engine.add_account("queued-priority@example.test".into()).unwrap();engine.accounts.lock().unwrap()[0].pending=false;
+            let host=TaskHost {worker:root.path().join("missing"),script:None,on_update:Arc::new(|_|{})};
+            let mut params=json!({"sku":"MLH74FE","quantity":1});
+            if future {params["scheduled_at"]=json!(now_ms()+60_000);}
+            engine.start(host.clone(),account.id.clone(),"purchase".into(),params).unwrap();
+            assert_eq!(engine.start(host,account.id,"session_maintain".into(),json!({})).is_ok(),future);
+        }
     }
 
     #[tokio::test]
@@ -2103,6 +2169,45 @@ else:
         let at=now_ms()+1500;
         let scheduled=engine.start(host.clone(),account.id.clone(),"purchase".into(),scheduled_params(at)).unwrap();
         let warm=engine.start(host,account.id.clone(),"session_maintain".into(),json!({"warm_only":true})).unwrap();
+        for _ in 0..600 {
+            if terminal(&engine.tasks.lock().unwrap()[&scheduled].status) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let tasks=engine.tasks.lock().unwrap();
+        assert_eq!(tasks[&warm].status,"cancelled");
+        assert_eq!(tasks[&scheduled].status,"succeeded","{}",tasks[&scheduled].stage);
+        let triggered=tasks[&scheduled].schedule.as_ref().unwrap().triggered_at_ms.unwrap();
+        assert!(triggered>=at && triggered-at<=3000);
+        assert!(tasks[&scheduled].execution_started_at_ms.is_some());
+        assert!(!tasks[&scheduled].order_submitted);
+    }
+
+    #[tokio::test]
+    async fn scheduled_deadline_preempts_explicit_login_preheat_without_extending_lateness() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine=Engine::new(temp.path().into()).unwrap();
+        let account=engine.add_account("scheduled-warm@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending=false;
+        let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python=project.join(if cfg!(windows) {".venv/Scripts/python.exe"} else {".venv/bin/python"});
+        let script=temp.path().join("scheduled-warm-fixture.py");
+        fs::write(&script, r#"import json,sys
+r=json.loads(sys.stdin.readline())
+def emit(kind, **data):
+ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type=kind,**data)),flush=True)
+if r['action']=='login':
+ emit('stage',message='Offline fixture preheat waiting')
+ for line in sys.stdin:
+  if json.loads(line).get('type')=='cancel':
+   emit('cancelled'); break
+else:
+ assert r['action']=='purchase'
+ emit('result',result={'success':True,'status':'fixture_completed','order_submitted':False})
+"#).unwrap();
+        let host=TaskHost {worker:python,script:Some(script),on_update:Arc::new(|_|{})};
+        let at=now_ms()+1500;
+        let scheduled=engine.start(host.clone(),account.id.clone(),"purchase".into(),scheduled_params(at)).unwrap();
+        let warm=engine.start(host,account.id.clone(),"login".into(),json!({"warm_only":true})).unwrap();
         for _ in 0..600 {
             if terminal(&engine.tasks.lock().unwrap()[&scheduled].status) { break; }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

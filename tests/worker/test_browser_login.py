@@ -7,6 +7,7 @@ import browser_login
 class BrowserLoginTests(unittest.TestCase):
     def test_background_trust_detection_never_clicks_the_official_choice(self):
         frame = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        frame.frame_element.return_value.is_visible.return_value = True
         frame.locator.return_value.inner_text.return_value = '是否信任此浏览器？'
         frame.get_by_role.return_value.count.return_value = 1
         frame.get_by_role.return_value.is_visible.return_value = True
@@ -87,6 +88,7 @@ class BrowserLoginTests(unittest.TestCase):
 
     def test_trust_question_in_official_frame_is_accepted_but_not_other_pages(self):
         frame = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        frame.frame_element.return_value.is_visible.return_value = True
         frame.locator.return_value.inner_text.return_value = '是否信任此浏览器？'
         button = frame.get_by_role.return_value
         button.count.return_value = 1

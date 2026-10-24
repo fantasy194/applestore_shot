@@ -684,7 +684,7 @@ impl Engine {
         drop(queue);
         if !priority_accounts.is_empty() {
             let tasks=self.tasks.lock().unwrap();let controls=self.controls.lock().unwrap();
-            for maintenance in tasks.values().filter(|task|priority_accounts.contains(&task.account_id)&&task.action=="session_maintain"&&!terminal(&task.status)) {
+            for maintenance in tasks.values().filter(|task|priority_accounts.contains(&task.account_id)&&is_preemptible_preheat(task)&&!terminal(&task.status)) {
                 if let Some(control)=controls.get(&maintenance.id) {let _=control.cancel.send(true);}
             }
         }
@@ -719,7 +719,7 @@ impl Engine {
         for task in tasks.values().filter(|task|task.account_id==account) {
             if coordinator.is_some_and(|current|current.task_id==task.id) {continue}
             if !terminal(&task.status) {
-                if task.action=="session_maintain" {
+                if is_preemptible_preheat(task) {
                     if let Some(control)=self.controls.lock().unwrap().get(&task.id) {let _=control.cancel.send(true);}
                     return Some("已请求停止空闲会话预热，保留队列位置等待账号释放".into());
                 }
@@ -1836,6 +1836,16 @@ mod tests {
         assert_eq!(engine.purchase_queue.lock().unwrap().blocked_accounts[&account],"submission_unknown");
         engine.queue_pump_once();let after=jobs(&engine);assert!(after[1].pending());assert!(after[2].inflight());
         assert_eq!(after[0].assignment,first.assignment);
+    }
+
+    #[tokio::test]
+    async fn queue_target_preempts_explicit_login_preheat_but_preserves_real_login() {
+        let (_root,engine,host,account)=fixture();
+        let warm=engine.start(host.clone(),account.clone(),"login".into(),json!({"warm_only":true})).unwrap();
+        let login=engine.start(host.clone(),account.clone(),"login".into(),json!({})).unwrap();
+        observe(&engine,&host,vec![target(&account,"R390",now_ms())]);
+        let controls=engine.controls.lock().unwrap();assert!(*controls[&warm].cancel.borrow());assert!(!*controls[&login].cancel.borrow());drop(controls);
+        engine.queue_pump_once();assert_eq!(jobs(&engine)[0].status,"queued");
     }
 
     #[tokio::test]

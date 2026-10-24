@@ -18,6 +18,32 @@ CHALLENGE_TEXT = re.compile(r'验证码|安全码|双重认证|双重验证|图�
 PASSWORD_ERROR = re.compile(r'密码.{0,12}(?:错误|不正确|无效)|(?:账号|账户|Apple ID).{0,18}(?:密码|被锁定|被停用)|(?:incorrect|invalid).{0,20}(?:password|Apple ID)|password.{0,20}(?:incorrect|invalid)|account.{0,16}(?:locked|disabled)', re.I)
 
 
+class _SigninDomNotReady(Exception):
+    pass
+
+
+def _body_text(frame):
+    from playwright.sync_api import TimeoutError as BrowserTimeout
+    try:
+        return frame.locator('body').inner_text(timeout=500)
+    except BrowserTimeout:
+        # Recognition has not entered a keyboard/navigation guard. A newly
+        # attached official iframe can exist before its body is rendered.
+        raise _SigninDomNotReady() from None
+
+
+def _alert_texts(frame):
+    from playwright.sync_api import Error as BrowserError
+    try:
+        return frame.get_by_role('alert').all_inner_texts()
+    except BrowserError as error:
+        if 'Execution context was destroyed' in error.message:
+            # An auth callback may navigate while this read-only scan is in
+            # flight. No input or submission is performed by this operation.
+            raise _SigninDomNotReady() from None
+        raise
+
+
 def _error(code, message):
     from browser_login import BrowserSessionError
     return BrowserSessionError(code, message, status='requires_login', requires_login=True,
@@ -29,12 +55,38 @@ def _auth_frame(frame):
     return parsed.scheme == 'https' and parsed.hostname in ('idmsa.apple.com.cn', 'idmsa.apple.com', 'appleid.apple.com') and '/auth' in parsed.path
 
 
+def _visible_child_frame(frame):
+    element = None
+    try:
+        element = frame.frame_element()
+        return element.is_visible() is True
+    except Exception:
+        return False  # Detached/replaced frames are observed on the next pump.
+    finally:
+        if element is not None:
+            try:
+                element.dispose()
+            except Exception:
+                pass
+
+
+def _account_auth_frames(page):
+    """A hidden, retained auth document is not an active login challenge."""
+    try:
+        return [frame for frame in page.frames if frame != page.main_frame
+                and _auth_frame(frame) and _visible_child_frame(frame)]
+    except TypeError:
+        return []
+
+
 def _login_page(page):
     parsed = urlsplit(page.url)
     if parsed.scheme != 'https':
         return False
-    return (_auth_frame(page) or bool(re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn', parsed.hostname or ''))
-            and parsed.path in ('/shop/signIn', '/shop/signIn/account', '/shop/signIn/orders'))
+    storefront = bool(re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn', parsed.hostname or ''))
+    return (_auth_frame(page) or storefront and (
+        parsed.path in ('/shop/signIn', '/shop/signIn/account', '/shop/signIn/orders')
+        or parsed.path == '/shop/account/home' and bool(_account_auth_frames(page))))
 
 
 def _visible(locator):
@@ -135,7 +187,7 @@ class BrowserSigninAssistant:
             return True
         if _visible(frame.locator('iframe[src*="captcha" i], iframe[title*="captcha" i]')):
             return True
-        body = frame.locator('body').inner_text(timeout=500)
+        body = _body_text(frame)
         return isinstance(body, str) and bool(CHALLENGE_TEXT.search(body[:16000]))
 
     def _verification_step(self, page, frame):
@@ -144,7 +196,7 @@ class BrowserSigninAssistant:
             return 'verification'
         if _visible(frame.locator('iframe[src*="captcha" i], iframe[title*="captcha" i]')):
             raise _error('BROWSER_LOGIN_SECURITY_CHALLENGE', '官网要求安全验证，自动认证无法继续。')
-        body = frame.locator('body').inner_text(timeout=500)
+        body = _body_text(frame)
         if isinstance(body, str) and re.search(r'captcha|图形验证|人机验证|verify you are human', body[:16000], re.I):
             raise _error('BROWSER_LOGIN_SECURITY_CHALLENGE', '官网要求安全验证，自动认证无法继续。')
         split_fields = _visible(frame.locator('input[id^="char"][maxlength="1"], input[inputmode="numeric"][maxlength="1"], input[autocomplete="one-time-code"][maxlength="1"]'))
@@ -298,14 +350,14 @@ class BrowserSigninAssistant:
         try:
             if not _login_page(page):
                 return 'unrecognized'
-            frames = [frame for frame in page.frames if _auth_frame(frame)]
+            frames = _account_auth_frames(page)
             # Some official storefronts render login controls in the main document.
-            if page.main_frame not in frames:
+            if page.main_frame not in frames and urlsplit(page.url).path != '/shop/account/home':
                 frames.append(page.main_frame)
             for frame in frames:
                 if self._verification(frame):
                     return self._verification_step(page, frame)
-                alert = frame.get_by_role('alert').all_inner_texts()
+                alert = _alert_texts(frame)
                 if any(PASSWORD_ERROR.search(value[:4000]) for value in alert):
                     self.service.reject_password()
                     raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网提示认证失败，请在官网检查；未自动重试。')
@@ -347,6 +399,8 @@ class BrowserSigninAssistant:
                     self.submitted.add('account')
                     click_control(button)
                     return 'acted'
+            return 'unrecognized'
+        except _SigninDomNotReady:
             return 'unrecognized'
         except BrowserInputInterrupted:
             self.interrupted = True

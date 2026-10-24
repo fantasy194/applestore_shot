@@ -159,17 +159,25 @@ function resolvedTask(task: Task, tasks: Task[]) {
   );
 }
 
-function describe(task: Task, tasks: Task[]) {
+export function hasUnknownSubmission(task: Task, tasks: Task[]) {
   const result = evidence(task.result, (number) =>
     resolvedNumber(tasks, task, number),
   );
-  const unknown =
+  return (
     result.unknown ||
     task.status === "submission_unknown" ||
     (!active(task) &&
       task.order_submitted &&
       !result.pending &&
-      !resolvedTask(task, tasks));
+      !resolvedTask(task, tasks))
+  );
+}
+
+function describe(task: Task, tasks: Task[]) {
+  const result = evidence(task.result, (number) =>
+    resolvedNumber(tasks, task, number),
+  );
+  const unknown = hasUnknownSubmission(task, tasks);
   const tracePhase = task.purchase_progress?.current;
   const phase =
     tracePhase && phaseIds.has(tracePhase)

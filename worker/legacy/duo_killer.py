@@ -328,18 +328,15 @@ def ensure_strong_login(session, sms=False):
         return [name for name in ("as_ltn_cn", "shld_bt_ck") if not cookies.get(name)]
 
     invalid = missing()
-    from apple_login import browser_profile_path
-    rejected = browser_profile_path(AUTH_PATH) / ".authx-541"
-    if not invalid and not rejected.exists():
+    # Old browser failures are diagnostic history, not current session evidence.
+    # A fresh official response still decides whether this purchase can proceed.
+    if not invalid:
         return False
-    if rejected.exists():
-        print("登录预检：上次商城回调返回 541，先重建浏览器上下文并执行完整登录。")
-    else:
-        print("登录预检：" + "、".join(invalid) + " 已过期、缺失或不可发送，先执行完整登录。")
+    print("登录预检：" + "、".join(invalid) + " 已过期、缺失或不可发送，先执行完整登录。")
     login(sms=sms)
     # 完整登录用独立 Session，必须重新加载，不能让旧会话覆盖新 Cookie。
     load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
-    if missing() or rejected.exists():
+    if missing():
         interaction.report_stage("完整登录后仍无有效会话", authentication_failed=True)
         raise ValueError("完整登录后仍缺少有效会话，已停止后续操作；未重复尝试登录。")
     return True

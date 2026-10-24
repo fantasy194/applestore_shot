@@ -109,7 +109,7 @@ fn summary(task: &Task) -> Value {
         }
         Value::Object(reduced)
     });
-    json!({"id":task.id,"account_id":task.account_id,"action":task.action,"status":task.status,
+    json!({"id":task.id,"account_id":task.account_id,"action":task.action,"warm_only":task.warm_only,"status":task.status,
         "stage":task.stage,"purchase_progress":task.purchase_progress.as_ref().map(|progress|progress.sanitized()),
         "created_at":task.created_at,"updated_at":task.updated_at,
         "execution_started_at_ms":task.execution_started_at_ms,"prompt":task.prompt,"result":result,

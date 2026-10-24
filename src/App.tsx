@@ -1,6 +1,6 @@
 import { usePurchaseDraft } from "./usePurchaseDraft";
 import { DisclosureSummary } from "./DisclosureSummary";
-import { OrderProgressBar } from "./OrderProgressBar";
+import { OrderProgressBar, hasUnknownSubmission } from "./OrderProgressBar";
 import { formatTaskStage } from "./taskStage";
 import {
   useEffect,
@@ -247,6 +247,21 @@ function WorkspaceApp() {
     .sort((a, b) => b.created_at - a.created_at || b.updated_at - a.updated_at);
   const busy =
     tasks.some((t) => active(t) && t.status !== "scheduled") || dispatching;
+  // Real purchases take priority over preheat only. Keep ordinary account
+  // actions serialized, and retain the same unknown-order evidence as progress.
+  const purchaseBusy =
+    dispatching ||
+    tasks.some(
+      (task) =>
+        hasUnknownSubmission(task, tasks) ||
+        (active(task) &&
+          task.status !== "scheduled" &&
+          !(
+            !task.order_submitted &&
+            (task.action === "session_maintain" ||
+              (task.action === "login" && task.warm_only === true))
+          )),
+    );
   const scheduledTask = tasks.find((t) => t.status === "scheduled");
   const waiting = tasks.find((t) => t.status === "waiting");
   const task =
@@ -325,6 +340,14 @@ function WorkspaceApp() {
   });
   async function start(action: Action, params: Data = {}) {
     if (!bridge || !account) return;
+    if (
+      ["purchase", "checkout"].includes(action) &&
+      params.prepare_only !== true &&
+      purchaseBusy
+    ) {
+      setError("请先完成当前账号任务或核实订单结果，再开始下单。");
+      return;
+    }
     setError("");
     setTaskTarget(null);
     setDispatching(true);
@@ -884,7 +907,7 @@ function WorkspaceApp() {
                               min={1}
                               max={10}
                               required
-                              disabled={busy}
+                              disabled={purchaseBusy}
                               value={concurrency}
                               onChange={setConcurrency}
                               onValidityChange={(valid) =>
@@ -906,7 +929,7 @@ function WorkspaceApp() {
                               min={0}
                               max={10}
                               required
-                              disabled={busy}
+                              disabled={purchaseBusy}
                               value={retryCount}
                               onChange={setRetryCount}
                               onValidityChange={(valid) =>
@@ -933,7 +956,7 @@ function WorkspaceApp() {
                               className="primary"
                               type="submit"
                               disabled={
-                                busy ||
+                                purchaseBusy ||
                                 !!scheduledTask ||
                                 !presetProducts.some(
                                   (p) => p.sku === sku.replace(/\/A$/i, ""),
@@ -950,7 +973,7 @@ function WorkspaceApp() {
                               type="submit"
                               data-fulfillment="RETAIL"
                               disabled={
-                                busy ||
+                                purchaseBusy ||
                                 !!scheduledTask ||
                                 !presetProducts.some(
                                   (p) => p.sku === sku.replace(/\/A$/i, ""),
@@ -969,7 +992,7 @@ function WorkspaceApp() {
                         key={account.id}
                         sku={sku}
                         quantity={quantity}
-                        busy={busy || !purchaseNumbersValid}
+                        busy={purchaseBusy || !purchaseNumbersValid}
                         concurrency={concurrency}
                         retryCount={retryCount}
                         task={scheduledTask}
@@ -1012,7 +1035,7 @@ function WorkspaceApp() {
                       <div className="button-row">
                         <button
                           className="primary"
-                          disabled={busy || !!scheduledTask}
+                          disabled={purchaseBusy || !!scheduledTask}
                           onClick={() => start("checkout")}
                         >
                           结算购物袋
@@ -1295,7 +1318,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.10</span>
+          <span>DUO Killer · 0.1.11</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (

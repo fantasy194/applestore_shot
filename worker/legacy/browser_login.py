@@ -42,6 +42,11 @@ class _ReadOnlyStorefrontAccount(str):
     read_only = True
 
 
+class _OpenedStorefrontAccount(str):
+    """The account GET already ran; automatic authentication remains allowed."""
+    account_visited = True
+
+
 def signin_page(url):
     parsed = urlsplit(url)
     host = parsed.hostname or ''
@@ -54,7 +59,7 @@ def signin_page(url):
 
 def observe_login_network(context, service):
     state = {'pending': {}, 'error': None, 'last_activity': time.monotonic(), 'blocked_status': None,
-             'authentication_failed': False, 'credential_rejected': False}
+             'authentication_failed': False, 'credential_rejected': False, 'authentication_completed': False}
 
     def phase(request):
         parsed = urlsplit(request.url)
@@ -88,6 +93,11 @@ def observe_login_network(context, service):
                 state['error'] = f'官网浏览器的{name}未通过；本次未自动重新提交。'
             elif response.status < 400 and state.get('blocked_status') not in (403, 429, 541):
                 state['error'], state['blocked_status'] = None, None
+                path = urlsplit(response.request.url).path
+                if (not state['authentication_failed']
+                        and (path == '/shop/signIn/idms/authx' and response.status == 200
+                             or path == '/appleauth/auth/2sv/trust' and response.status in (200, 204))):
+                    state['authentication_completed'] = True
         elif response.status == 200 and getattr(service, 'headless_browser', False) is not True:
             parsed = urlsplit(response.request.url)
             if (parsed.scheme == 'https' and parsed.path == '/shop/account/home'
@@ -122,22 +132,31 @@ _TRUST_SENT = weakref.WeakKeyDictionary()
 
 def pending_auth_page(page):
     from browser_remote import official_page
+    from browser_signin import _account_auth_frames
     if not isinstance(getattr(page, 'url', None), str) or not official_page(page):
         return False
     parsed = urlsplit(page.url)
-    return ('/shop/signIn' in parsed.path or parsed.hostname in ('idmsa.apple.com.cn', 'appleid.apple.com')
-            and '/auth' in parsed.path)
+    if ('/shop/signIn' in parsed.path or parsed.hostname in ('idmsa.apple.com.cn', 'appleid.apple.com')
+            and '/auth' in parsed.path):
+        return True
+    if (parsed.path == '/shop/account/home'
+            and re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn', parsed.hostname or '')):
+        return bool(_account_auth_frames(page))
+    return False
 
 
 def trust_browser_if_offered(page, *, accept=True, remote=None):
     """Accept only the explicit official trust-browser choice authorized by user."""
     from browser_remote import official_page
+    from browser_signin import _visible_child_frame
     try:
         frames = list(page.frames)
     except TypeError:
         return False
     for frame in frames:
         if not official_page(frame):
+            continue
+        if frame is not page and frame != page.main_frame and not _visible_child_frame(frame):
             continue
         try:
             body = frame.locator('body').inner_text(timeout=250)
@@ -229,8 +248,10 @@ def open_storefront_login(context, service, *, automatic=False):
             # once; never synthesize a login URL or authenticate on this branch.
             account_url = storefront_menu_entry(page.url, links, 'account', '/shop/account/home')
             navigate(account_url, referer=HOME)
-            if automatic and (pending_auth_page(page) or trust_browser_if_offered(page, accept=False)):
-                return account_url
+            if automatic:
+                # domcontentloaded may precede the cookie refresh, login iframe
+                # or client redirect. The shared wait loop owns these states.
+                return _OpenedStorefrontAccount(account_url)
             if (pending_auth_page(page) or trust_browser_if_offered(page, accept=False)
                     or urlsplit(page.url).path != '/shop/account/home'
                     or not valid_store_session(context.cookies())):
@@ -257,10 +278,11 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                           headless=False, account_url=None, assistant=None, account_read_only=False, automatic=False):
     deadline = time.monotonic() + timeout
     ready_since = None
-    account_requested = account_read_only
+    account_visited = getattr(account_url, 'account_visited', False) is True
+    account_requested = account_read_only or account_visited
+    post_auth_account_requested = False
     reported_541 = False
     authentication_seen = False
-    unrecognized_since = None
     reported_verification = False
     while time.monotonic() < deadline:
         service.channel.checkpoint()
@@ -338,19 +360,11 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                         if not reported_verification:
                             service.stage('请在官网窗口完成 Apple 验证码或安全验证，其他登录步骤会自动继续')
                             reported_verification = True
-                    if outcome == 'unrecognized' and not network['pending']:
-                        unrecognized_since = (unrecognized_since if unrecognized_since is not None
-                                              else time.monotonic())
-                    else:
-                        unrecognized_since = None
                     break
         trust_pending = any(trust_browser_if_offered(page, accept=False) if account_read_only or (headless and assistant is None)
                             else trust_browser_if_offered(page, remote=remote) for page in pages)
         auth_pending = any(pending_auth_page(page) for page in pages)
         if headless and assistant is None and (trust_pending or auth_pending):
-            raise headless_auth_required()
-        if (headless and not trust_pending and unrecognized_since is not None
-                and time.monotonic() - unrecognized_since >= 10):
             raise headless_auth_required()
         if trust_pending or auth_pending:
             ready_since = None
@@ -376,7 +390,9 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                             return cookies, page.evaluate('navigator.userAgent')
         # General storefront login returns to the homepage, not account/home.
         # Read the identity only after the official auth/trust exchange settles.
-        if account_url and not account_requested:
+        post_auth_probe = (account_visited and not post_auth_account_requested
+                           and network.get('authentication_completed') is True)
+        if account_url and (not account_requested or post_auth_probe):
             if trust_pending or auth_pending or network['pending'] or network['error']:
                 ready_since = None
             else:
@@ -387,12 +403,16 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                                   if urlsplit(page.url).scheme == 'https'
                                   and re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn',
                                                    urlsplit(page.url).hostname or '')]
+                    if post_auth_probe:
+                        candidates = [page for page in candidates if urlsplit(page.url).path == '/']
                     if not candidates:
                         continue
                     ready_since = ready_since if ready_since is not None else time.monotonic()
                     last = max(ready_since, network.get('last_activity', ready_since))
                     if time.monotonic() - last >= settle_seconds:
                         account_requested = True
+                        if post_auth_probe:
+                            post_auth_account_requested = True
                         service.stage('商城登录已完成，正在读取官网账号信息')
                         page = candidates[-1]
                         reply = page.goto(account_url, referer=page.url,

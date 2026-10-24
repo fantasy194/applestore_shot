@@ -793,7 +793,7 @@ class AppleStoreLogin:
             apple_url(signin_url)
             prepared = self.session.prepare_request(requests.Request("GET", signin_url))
             context_cookie = re.search(r"(?:^|;\s*)shld_bt_ck=([^;]+)", prepared.headers.get("Cookie", ""))
-            if not context_cookie or (self.browser_profile / ".authx-541").exists():
+            if not context_cookie:
                 print("重新认证所需的浏览器上下文不可用，先刷新后继续原登录入口。")
                 self.initialize_browser_context()
                 signin_response = None  # 浏览器刷新过 Cookie，旧页面的 SSI/STK 不再复用。

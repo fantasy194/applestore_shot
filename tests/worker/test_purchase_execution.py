@@ -133,6 +133,74 @@ class CurrentCheckoutAuthenticationTests(unittest.TestCase):
         self.assertEqual(result['retry_summary']['stop_reason'],'authentication')
         self.assertTrue(self.service.authentication_failed)
 
+    def test_successful_current_checkout_auth_does_not_block_configured_stock_failure_retries(self):
+        from purchase_retry import run_purchase
+        for child in (False,True):
+            for otp in (False,True):
+                with self.subTest(child=child,otp=otp):
+                    service=self.service
+                    service._parallel_child=child
+                    service.authentication_requested=service.purchase_auth_interaction=False
+                    service.authentication_failed=False
+                    service.password='synthetic-password'
+                    calls=[]
+                    def attempt():
+                        calls.append(True)
+                        with service.checkout_authentication():
+                            service.credentials(service.auth)
+                            if otp:
+                                self.channel.prompt.return_value='123456'
+                                self.assertEqual(service.text('输入验证码'),'123456')
+                        return {'success':False,'status':'failed','message':'官网无符合规则的取货时段'}
+                    with patch('purchase_retry._wait'):
+                        result=run_purchase(service,{'retry_count':1},attempt)
+                    self.assertEqual(len(calls),2)
+                    self.assertEqual(result['retry_summary']['stop_reason'],'exhausted')
+                    self.assertFalse(service.authentication_requested)
+                    self.assertFalse(service.purchase_auth_interaction)
+
+    def test_failed_current_checkout_auth_retains_attention_and_stops_retry(self):
+        from purchase_retry import run_purchase
+        service=self.service;service._parallel_child=False;service.password='synthetic-password'
+        calls=[]
+        def attempt():
+            calls.append(True)
+            with service.checkout_authentication():
+                service.credentials(service.auth)
+                raise ValueError('本次官网结账认证未完成')
+        with patch('purchase_retry._wait'), self.assertRaises(ValueError) as raised:
+            run_purchase(service,{'retry_count':3},attempt)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(raised.exception.retry_summary['stop_reason'],'authentication')
+        self.assertTrue(service.authentication_requested)
+        self.assertTrue(service.purchase_auth_interaction)
+
+    def test_checkout_scope_preserves_prior_auth_attention_and_actual_failure(self):
+        service=self.service;service._parallel_child=False;service.password='synthetic-password'
+        service.authentication_requested=service.purchase_auth_interaction=True
+        with service.checkout_authentication():
+            service.credentials(service.auth)
+        self.assertTrue(service.authentication_requested);self.assertTrue(service.purchase_auth_interaction)
+        service.authentication_requested=service.purchase_auth_interaction=False
+        with service.checkout_authentication():
+            service.credentials(service.auth)
+            service.authentication_failed=True
+        self.assertTrue(service.authentication_failed)
+
+    def test_successful_checkout_auth_cannot_enable_retry_after_unknown_submission(self):
+        from purchase_retry import run_purchase
+        service=self.service;service._parallel_child=False;service.password='synthetic-password'
+        calls=[]
+        def attempt():
+            calls.append(True)
+            with service.checkout_authentication():service.credentials(service.auth)
+            service.submitted=True
+            return {'success':False,'status':'failed','message':'提交响应未知'}
+        with patch('purchase_retry._wait'):
+            result=run_purchase(service,{'retry_count':3},attempt)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(result['retry_summary']['stop_reason'],'submitted')
+
     def test_idle_prepare_authentication_only_continues_inside_current_checkout_scope(self):
         service=self.service
         service._parallel_child=False

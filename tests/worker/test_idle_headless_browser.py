@@ -51,6 +51,7 @@ class IdleHeadlessBrowserPolicyTests(unittest.TestCase):
 
     def test_headless_trust_detection_does_not_click_or_reserve_a_trust_choice(self):
         frame = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        frame.frame_element.return_value.is_visible.return_value = True
         frame.locator.return_value.inner_text.return_value = '是否信任此浏览器？'
         button = frame.get_by_role.return_value
         button.count.return_value = 1

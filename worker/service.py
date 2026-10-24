@@ -151,6 +151,8 @@ class Service:
         """
         if self._checkout_auth_active:
             raise ValueError('结账认证不能嵌套执行。')
+        previous_requested = self.authentication_requested
+        previous_interaction = self.purchase_auth_interaction
         scope = self.channel.checkout_authentication() if self._parallel_child else nullcontext(None)
         with scope as credential:
             if self._parallel_child:
@@ -173,6 +175,12 @@ class Service:
                         break
                     cause = getattr(cause, '__cause__', None)
                 raise
+            else:
+                # A completed checkout authentication is no longer an obstacle
+                # to retrying a later positively unsubmitted stock/slot failure.
+                # Earlier attention and actual authentication_failed stay sticky.
+                self.authentication_requested = previous_requested
+                self.purchase_auth_interaction = previous_interaction
             finally:
                 self._checkout_auth_active = False
                 if self._parallel_child:

@@ -112,6 +112,20 @@ class StorefrontRecoveryTests(unittest.TestCase):
         self.assertEqual(page.url, ENTRY)
         self.assertEqual(page.goto.call_count, 4)
 
+    def test_automatic_authenticated_menu_defers_missing_cookie_and_redirect_readiness(self):
+        for destination in (ACCOUNT, HOME, ENTRY):
+            with self.subTest(destination=destination):
+                context,page=self.context([{'type':'signOut'},{'type':'account','url':ACCOUNT}])
+                def goto(url,**kwargs):
+                    page.url=destination if url == ACCOUNT else url
+                    return Mock(status=200)
+                page.goto.side_effect=goto
+                result=browser_login.open_storefront_login(context,Mock(),automatic=True)
+                self.assertEqual(result,ACCOUNT)
+                self.assertTrue(result.account_visited)
+                self.assertFalse(getattr(result,'read_only',False))
+                self.assertEqual(page.goto.call_count,4)
+
     def test_authenticated_menu_can_refresh_cookie_without_new_login(self):
         links = [{'type': 'signOut', 'url': '/shop/signOut'},
                  {'type': 'account', 'url': ACCOUNT}]
@@ -257,6 +271,130 @@ class StorefrontRecoveryTests(unittest.TestCase):
         self.assertEqual(result, ([COOKIE], 'fixture-user-agent'))
         page.goto.assert_not_called()
         signin.assert_not_called()
+
+    def test_automatic_visited_account_waits_for_delayed_cookie_without_second_get(self):
+        def ready(now,page,state):
+            if now >= 1:
+                context.cookies.return_value=[COOKIE]
+        clock,context,page,process,state,timeout=self.waiting(cookie=None,hook=ready)
+        page.url=ACCOUNT
+        with patch('browser_login.time.monotonic',side_effect=lambda:clock[0]):
+            result=browser_login.wait_for_account_page(Mock(contexts=[context]),process,Mock(),timeout,state,
+                account_url=browser_login._OpenedStorefrontAccount(ACCOUNT),automatic=True,headless=True)
+        self.assertEqual(result,([COOKIE],'fixture-user-agent'))
+        page.goto.assert_not_called()
+        self.assertGreaterEqual(clock[0],3)
+
+    def test_late_authentication_fields_after_ten_seconds_continue_and_read_identity_once(self):
+        def redirect(now,page,state):
+            if now == .5: page.url=ENTRY
+        clock,context,page,process,state,timeout=self.waiting(timeout=25,hook=redirect)
+        page.url=ACCOUNT
+        assistant=Mock(interrupted=False,otp_wait_seconds=0)
+        def signin(*args):
+            if clock[0] < 12: return 'unrecognized'
+            state['authentication_completed']=True
+            state['last_activity']=clock[0]
+            page.url=HOME
+            return 'acted'
+        with patch('browser_login.time.monotonic',side_effect=lambda:clock[0]), \
+                patch('browser_signin.step_browser_signin',side_effect=signin):
+            result=browser_login.wait_for_account_page(Mock(contexts=[context]),process,Mock(),timeout,state,
+                account_url=browser_login._OpenedStorefrontAccount(ACCOUNT),automatic=True,headless=True,
+                assistant=assistant)
+        self.assertEqual(result,([COOKIE],'fixture-user-agent'))
+        self.assertGreaterEqual(clock[0],16)
+        self.assertEqual(page.goto.call_count,1)
+
+    def test_trust_only_success_on_this_browser_allows_one_home_identity_probe(self):
+        for status in (200,204):
+            with self.subTest(status=status):
+                clock,context,page,process,state,timeout=self.waiting()
+                with patch('browser_login.time.monotonic',side_effect=lambda:clock[0]):
+                    state=browser_login.observe_login_network(context,Mock(headless_browser=True))
+                    callbacks={call.args[0]:call.args[1] for call in context.on.call_args_list}
+                    request=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/2sv/trust')
+                    callbacks['response'](Mock(request=request,status=status))
+                    result=browser_login.wait_for_account_page(Mock(contexts=[context]),process,Mock(),timeout,state,
+                        account_url=browser_login._OpenedStorefrontAccount(ACCOUNT),automatic=True,headless=True)
+                self.assertEqual(result,([COOKIE],'fixture-user-agent'))
+                self.assertEqual(page.goto.call_count,1)
+
+    def test_missing_or_failed_current_trust_never_issues_post_auth_probe(self):
+        for status in (None,400,403,541):
+            with self.subTest(status=status):
+                clock,context,page,process,state,timeout=self.waiting(timeout=4)
+                with patch('browser_login.time.monotonic',side_effect=lambda:clock[0]):
+                    state=browser_login.observe_login_network(context,Mock(headless_browser=True))
+                    if status is not None:
+                        callbacks={call.args[0]:call.args[1] for call in context.on.call_args_list}
+                        request=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/2sv/trust')
+                        callbacks['response'](Mock(request=request,status=status))
+                    with self.assertRaises(ValueError):
+                        browser_login.wait_for_account_page(Mock(contexts=[context]),process,Mock(),timeout,state,
+                            account_url=browser_login._OpenedStorefrontAccount(ACCOUNT),automatic=True,headless=True)
+                self.assertFalse(state['authentication_completed'])
+                page.goto.assert_not_called()
+
+    def test_successful_trust_cannot_override_current_authx_rejection(self):
+        for status in (400,401,403,429,541):
+            with self.subTest(status=status):
+                context=Mock()
+                state=browser_login.observe_login_network(context,Mock(headless_browser=True))
+                callbacks={call.args[0]:call.args[1] for call in context.on.call_args_list}
+                callbacks['response'](Mock(request=Mock(url='https://secure8.www.apple.com.cn/shop/signIn/idms/authx'),status=status))
+                callbacks['response'](Mock(request=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/2sv/trust'),status=204))
+                self.assertFalse(state['authentication_completed'])
+                self.assertTrue(state['authentication_failed'] or state['blocked_status'] in (403,429,541))
+
+    def test_visited_account_does_not_repeat_probe_after_another_auth_redirect(self):
+        clock,context,page,process,state,timeout=self.waiting(timeout=8)
+        state['authentication_completed']=True
+        def redirected_probe(url,**kwargs):
+            page.url=ENTRY
+            return Mock(status=200)
+        page.goto.side_effect=redirected_probe
+        with patch('browser_login.time.monotonic',side_effect=lambda:clock[0]):
+            with self.assertRaises(ValueError):
+                browser_login.wait_for_account_page(Mock(contexts=[context]),process,Mock(),timeout,state,
+                    account_url=browser_login._OpenedStorefrontAccount(ACCOUNT),automatic=True,headless=True)
+        self.assertEqual(page.goto.call_count,1)
+
+    def test_account_pending_auth_only_counts_visible_official_iframe(self):
+        for state in ('visible','hidden','external','detached'):
+            with self.subTest(state=state):
+                frame=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+                frame.frame_element.return_value.is_visible.return_value=state != 'hidden'
+                if state == 'external': frame.url='https://example.test/appleauth/auth'
+                if state == 'detached': frame.frame_element.side_effect=RuntimeError('detached')
+                page=Mock(url=ACCOUNT,frames=[frame])
+                self.assertEqual(browser_login.pending_auth_page(page),state == 'visible')
+
+    def test_hidden_or_detached_trust_iframe_does_not_block_account(self):
+        for hidden in (True,False):
+            with self.subTest(hidden=hidden):
+                frame=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+                frame.frame_element.return_value.is_visible.return_value=False
+                if not hidden: frame.frame_element.side_effect=RuntimeError('detached')
+                frame.locator.return_value.inner_text.return_value='Trust this browser?'
+                page=Mock(url=ACCOUNT,frames=[frame])
+                self.assertFalse(browser_login.trust_browser_if_offered(page))
+                frame.locator.assert_not_called()
+                frame.get_by_role.assert_not_called()
+
+    def test_hidden_auth_iframe_does_not_block_settled_account(self):
+        clock,context,page,process,state,timeout=self.waiting()
+        page.url=ACCOUNT
+        frame=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/authorize')
+        frame.frame_element.return_value.is_visible.return_value=False
+        page.frames=[frame]
+        with patch('browser_login.time.monotonic',side_effect=lambda:clock[0]), \
+                patch('browser_signin.step_browser_signin') as signin:
+            result=browser_login.wait_for_account_page(Mock(contexts=[context]),process,Mock(),timeout,state,
+                account_url=browser_login._OpenedStorefrontAccount(ACCOUNT),automatic=True,headless=True)
+        self.assertEqual(result,([COOKIE],'fixture-user-agent'))
+        signin.assert_not_called()
+        page.goto.assert_not_called()
 
     def test_login_return_to_home_gets_one_settled_account_verification(self):
         clock, context, page, process, state, timeout = self.waiting()

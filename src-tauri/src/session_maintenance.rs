@@ -1,5 +1,5 @@
 //! Per-account idle preheat. Login or pickup preparation; orders are never submitted.
-use crate::{activity, engine::{Engine, Snapshot, TaskHost, task_has_unknown_submission}};
+use crate::{activity, engine::{Engine, Snapshot, TaskHost, task_has_unknown_submission, ready_purchase}};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::{Path, PathBuf},
@@ -131,7 +131,7 @@ fn last_order_activity(snapshot: &Snapshot, account: &str) -> u64 {
 fn blocked_reason(snapshot: &Snapshot, account: &str) -> Option<&'static str> {
     if snapshot.tasks.iter().any(|task| task.account_id == account
         && (matches!(task.status.as_str(), "running" | "waiting")
-            || task.action == "session_maintain" && active(&task.status))) {
+            || task.action == "session_maintain" && active(&task.status) || ready_purchase(task))) {
         return Some("account_busy");
     }
     if snapshot.tasks.iter().any(|task| task.account_id == account
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn unstarted_schedule_and_queue_do_not_reset_or_block_preheat() {
+    fn unstarted_schedule_does_not_reset_preheat_but_ready_queued_purchase_has_priority() {
         let temporary = tempfile::tempdir().unwrap();
         let (engine, account) = fixture_engine(temporary.path());
         let service = fixture_service(temporary.path(), 1000);
@@ -482,8 +482,12 @@ mod tests {
         for status in ["scheduled", "queued", "cancelled"] {
             let mut task = fixture_task(&account, "purchase", status, 1000);
             task.execution_started_at_ms = None;
+            if status=="scheduled" {
+                task.schedule=Some(serde_json::from_value(json!({"at_ms":now_ms()+60_000,
+                    "sku":"MK2P4CH","quantity":1,"fulfillment":"RETAIL"})).unwrap());
+            }
             snapshot.tasks = vec![task];
-            assert_eq!(blocked_reason(&snapshot, &account), None);
+            assert_eq!(blocked_reason(&snapshot, &account), if status=="queued" {Some("account_busy")} else {None});
             assert_eq!(last_order_activity(&snapshot, &account), 0);
             assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 601_000);
         }
