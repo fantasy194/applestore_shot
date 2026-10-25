@@ -521,7 +521,8 @@ class PurchaseBatch:
                 if not isinstance(password, str) or not password:
                     password = None
                 self._send_reply(item, prompt, {'lease': lease, 'password': password,
-                                              'remember': getattr(self.credential_owner, 'remember', False) is True})
+                                              'remember': getattr(self.credential_owner, 'remember', False) is True,
+                                              'verified': bool(password) and owner.has_verified_password() is True})
             except BaseException:
                 self._release_authentication(item)
                 raise
@@ -554,6 +555,7 @@ class PurchaseBatch:
                 shadow.browser_password = owner.browser_password
                 shadow.reject_password = owner.reject_password
                 shadow.password_submitted = owner.password_submitted
+                shadow.has_verified_password = owner.has_verified_password
                 shadow.begin_password_authentication = owner.begin_password_authentication
                 shadow.password_submission_interrupted = owner.password_submission_interrupted
                 shadow.confirm_password_authenticated = owner.confirm_password_authenticated

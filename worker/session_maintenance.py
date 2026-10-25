@@ -7,10 +7,31 @@ import requests
 import duo_killer
 
 
+def authentication_failure_diagnostics(error):
+    """Export bounded protocol facts, never exception text or private payloads."""
+    result={};seen=set()
+    for _ in range(8):
+        if error is None or id(error) in seen:
+            break
+        seen.add(id(error))
+        phase=getattr(error,'phase',None)
+        if phase in ('password_authentication','authentication_context','store_exchange'):
+            result.setdefault('authentication_phase',phase)
+        status=getattr(error,'http_status',None)
+        if type(status) is not int:
+            status=getattr(error,'status',None)
+        if type(status) is not int and isinstance(error,requests.RequestException) and error.response is not None:
+            status=error.response.status_code
+        if type(status) is int and 100<=status<=599:
+            result.setdefault('http_status',status)
+        error=getattr(error,'__cause__',None)
+    return result
+
+
 def record_maintenance_result(service, result, *, cooling=False, warm_only=False):
     activity = getattr(getattr(service, 'channel', None), 'activity', None)
     if activity is not None:
-        details = {key: result[key] for key in ('status', 'error_code', 'http_status', 'checked_at_ms', 'preheat_flow', 'preparation_stage', 'order_ready', 'review_verified', 'browser_mode')
+        details = {key: result[key] for key in ('status', 'error_code', 'http_status', 'authentication_phase', 'checked_at_ms', 'preheat_flow', 'preparation_stage', 'order_ready', 'review_verified', 'browser_mode')
                    if key in result}
         details.update(operation='session_maintain', transport='shared_session'
                        if warm_only and result.get('preheat_flow') == 'pickup_prepare' else 'official_browser',
@@ -79,7 +100,8 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
     except Exception as error:
         if isinstance(getattr(service,'_prepared_claim',None),dict):
             raise
-        http_status = getattr(error, 'http_status', None) or getattr(error, 'status', None)
+        diagnostics=authentication_failure_diagnostics(error)
+        http_status = diagnostics.get('http_status')
         if http_status is None and isinstance(error, requests.RequestException) and error.response is not None:
             http_status = error.response.status_code
         legacy_status = re.search(r'\bHTTP\s+(403|429|541)\b', str(error))
@@ -107,6 +129,7 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
                       'message': ('会话检查的网络请求未完成；请检查网络，未判定登录过期。' if network else
                                   '无法访问本地浏览器资料或文件；会话状态尚未检查。' if local_io else
                                   '会话检查未完成，请查看任务诊断；未判定登录过期或重置账号。')}
+        result.update(diagnostics)
     result['browser_mode'] = browser_mode
     result['preheat_flow'] = preheat_flow
     result['checked_at_ms'] = stamp

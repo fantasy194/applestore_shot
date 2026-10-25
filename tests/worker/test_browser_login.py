@@ -9,7 +9,7 @@ class BrowserLoginTests(unittest.TestCase):
         for status,body,confirmed in ((200,{'authType':'hsa2'},True),
                 (200,{'authType':'unexpected'},False),
                 (200,{'serviceErrors':[{'code':'fixture'}],'authType':'hsa2'},False),
-                (409,{'authType':'hsa2'},False),(401,{},False)):
+                (409,{'authType':'hsa2'},True),(409,{'authType':'unexpected'},False),(401,{},False)):
             with self.subTest(status=status,body=body):
                 context=Mock();service=Mock()
                 browser_login.observe_login_network(context,service)
@@ -33,6 +33,21 @@ class BrowserLoginTests(unittest.TestCase):
                 self.assertTrue(state['authentication_failed'])
                 self.assertFalse(state['credential_rejected'])
                 service.confirm_password_authenticated.assert_not_called()
+
+    def test_known_password_acceptance_does_not_clear_shop_block_or_complete_otp(self):
+        for status in (200,409):
+            with self.subTest(status=status):
+                context=Mock();service=Mock()
+                state=browser_login.observe_login_network(context,service)
+                state['blocked_status']=541;state['error']='fixture Shop rejected'
+                events={call.args[0]:call.args[1] for call in context.on.call_args_list}
+                request=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/signin/complete')
+                events['request'](request)
+                events['response'](Mock(request=request,status=status,json=lambda:{'authType':'hsa2'}))
+                service.confirm_password_authenticated.assert_called_once_with()
+                self.assertEqual(state['blocked_status'],541)
+                self.assertEqual(state['error'],'fixture Shop rejected')
+                self.assertFalse(state['authentication_completed'])
 
     def scoped_network(self):
         context=Mock()

@@ -231,7 +231,7 @@ class CurrentCheckoutAuthenticationTests(unittest.TestCase):
                 with self.service.checkout_authentication():
                     if submitted:
                         self.service.password_submitted('synthetic-password')
-                    raise LoginError('synthetic rejection',status=status,codes=codes)
+                    raise LoginError('synthetic rejection',status=status,codes=codes,phase='password_authentication')
             if rejected:
                 self.assertLess(self.events.index('credential_rejected'),self.events.index('released'))
             else:self.assertNotIn('credential_rejected',self.events)

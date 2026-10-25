@@ -126,6 +126,22 @@ def observe_login_network(context, service, *, page=None):
             state['last_activity'] = time.monotonic()
             state['pending'].pop(response.request, None)
             log.info('[官网浏览器] %s：HTTP %s', name, response.status)
+            path = urlsplit(response.request.url).path
+            password_accepted = path == '/appleauth/auth/2sv/trust' and response.status in (200, 204)
+            if path == '/appleauth/auth/signin/complete' and response.status in (200, 409):
+                try:
+                    data = response.json()
+                    auth_type = data.get('authType') if isinstance(data, dict) else None
+                    password_accepted = (isinstance(data, dict) and not data.get('serviceErrors')
+                        and (response.status == 409 and auth_type == 'hsa2'
+                             or response.status == 200 and auth_type in ('hsa2', 'hsa', 'sa', 'non-sa')))
+                except Exception:
+                    password_accepted = False
+            confirmed_password = getattr(service, 'confirm_password_authenticated', None)
+            if password_accepted and not state['credential_rejected'] and callable(confirmed_password):
+                # Password acceptance is independent from a later blocked Shop
+                # exchange or an OTP wait. It never declares the session ready.
+                confirmed_password()
             if response.status >= 500 or response.status in (403, 429):
                 state['error'] = f'官网浏览器的{name}返回 HTTP {response.status}；本次登录未完成。'
                 state['blocked_status'] = response.status
@@ -146,19 +162,6 @@ def observe_login_network(context, service, *, page=None):
                 state['error'] = f'官网浏览器的{name}未通过；本次未自动重新提交。'
             elif response.status < 400 and state.get('blocked_status') not in (403, 429, 541):
                 state['error'], state['blocked_status'] = None, None
-                path = urlsplit(response.request.url).path
-                password_accepted = path == '/appleauth/auth/2sv/trust' and response.status in (200, 204)
-                if path == '/appleauth/auth/signin/complete' and response.status == 200:
-                    try:
-                        data = response.json()
-                        password_accepted = (isinstance(data, dict) and not data.get('serviceErrors')
-                            and data.get('authType') in ('hsa2', 'hsa', 'sa', 'non-sa'))
-                    except Exception:
-                        # An incomplete body is not positive credential proof.
-                        password_accepted = False
-                confirmed_password = getattr(service, 'confirm_password_authenticated', None)
-                if password_accepted and callable(confirmed_password):
-                    confirmed_password()
                 if (not state['authentication_failed']
                         and (path == '/shop/signIn/idms/authx' and response.status == 200
                              or path == '/appleauth/auth/2sv/trust' and response.status in (200, 204))):

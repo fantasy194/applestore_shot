@@ -284,7 +284,8 @@ class Channel:
             if password is not None and (not isinstance(password, str) or not password
                                          or len(password.encode('utf-8')) > 4096):
                 raise ValueError('结账凭据无效。')
-            yield {'password': password, 'remember': reply.get('remember') is True}
+            yield {'password': password, 'remember': reply.get('remember') is True,
+                   'verified': reply.get('verified') is True}
         except Exception:
             self.emit('checkout_auth_failed', checkout_auth_lease=lease)
             raise

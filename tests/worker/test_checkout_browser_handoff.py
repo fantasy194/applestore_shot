@@ -78,6 +78,51 @@ class CheckoutBrowserHandoffTests(unittest.TestCase):
         self.assertFalse(duo_killer.reauthenticate_checkout(self.flow))
         self.login.assert_called_once()
 
+    def test_known_password_context_rejection_uses_same_live_checkout_once_for_all_entries(self):
+        for entry_kind in ('manual','scheduled','queue'):
+            with self.subTest(entry=entry_kind):
+                self.flow.url=self.entry;self.flow.model={'signIn':{'old':True}}
+                self.flow._browser_authentication_recovery_attempted=False
+                self.flow._http_authentication_rejected=False
+                self.service.authentication_failed=False
+                self.service._password_authenticated=self.service.password
+                self.service.action='purchase'
+                self.service._purchase_session_owner=self.service if entry_kind=='queue' else None
+                self.service.task_created_at=100 if entry_kind=='scheduled' else None
+                self.login.reset_mock();self.recover.reset_mock()
+                self.login.side_effect=LoginError('fixture known password context rejected',
+                    status=401,codes=('-20101',),phase='password_authentication')
+                original_flow,original_session=self.flow,self.flow.session
+                with patch.object(duo_killer,'add_to_bag') as add,patch.object(duo_killer,'pay_bag') as pay:
+                    self.assertTrue(duo_killer.reauthenticate_checkout(self.flow))
+                self.assertIs(self.flow,original_flow);self.assertIs(self.flow.session,original_session)
+                self.assertEqual(self.recover.call_args.args[0]['entry_url'],self.entry)
+                self.login.assert_called_once();self.recover.assert_called_once()
+                add.assert_not_called();pay.assert_not_called()
+                self.assertFalse(self.service.submitted)
+                self.assertFalse(self.service.authentication_failed)
+                self.flow.url=self.entry
+                with self.assertRaises(ValueError):duo_killer.reauthenticate_checkout(self.flow)
+                self.login.assert_called_once();self.recover.assert_called_once()
+
+    def test_unverified_password_rejection_never_uses_known_password_handoff(self):
+        self.service.vault.get.return_value=None
+        self.login.side_effect=LoginError('fixture unverified password refused',
+            status=401,codes=('-20101',),phase='password_authentication')
+        with self.assertRaises(ValueError):duo_killer.reauthenticate_checkout(self.flow)
+        self.recover.assert_not_called()
+        self.assertEqual(self.flow.url,self.entry)
+
+    def test_known_password_browser_rejection_is_terminal_without_another_protocol_attempt(self):
+        self.service._password_authenticated=self.service.password
+        self.login.side_effect=LoginError('fixture known password context rejected',
+            status=401,codes=('-20101',),phase='password_authentication')
+        self.recover.side_effect=ValueError('fixture official browser refused current authentication')
+        with self.assertRaises(ValueError):duo_killer.reauthenticate_checkout(self.flow)
+        with self.assertRaises(ValueError):duo_killer.reauthenticate_checkout(self.flow)
+        self.login.assert_called_once();self.recover.assert_called_once()
+        self.assertEqual(self.flow.url,self.entry)
+
     def test_actual_init_data_string_with_script_terminator_is_preserved(self):
         self.reply['init_data']['checkout']['fulfillment']['message']='prefix </script> suffix < 3'
         self.assertTrue(duo_killer.reauthenticate_checkout(self.flow))

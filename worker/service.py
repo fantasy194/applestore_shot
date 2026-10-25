@@ -33,6 +33,7 @@ class Service:
         self._password_submitted = None
         self._password_authenticated = None
         self._password_persisted = None
+        self._credential_source = 'task_memory'
         self._account_auth_active = False
         self.authentication_requested = False
         self.authentication_failed = False
@@ -148,20 +149,43 @@ class Service:
             self.password = value['password']
             self.password_rejected = False
             self.remember = value.get('remember') is True
+            self._credential_source = 'app_prompt'
+            self._credential_audit('received')
         return self.password
+
+    def _credential_audit(self, state, *, phase=None):
+        """Only bounded lifecycle labels and booleans reach diagnostics."""
+        activity = getattr(self.channel, 'activity', None)
+        if activity is None:
+            return
+        try:
+            activity.record('credential_state', '账号凭据状态已更新。', details={
+                'credential_state': state, 'credential_source': self._credential_source,
+                'credential_phase': phase,
+                'credential_available': bool(self.password),
+                'credential_saved': bool(self.password and self._password_persisted == self.password),
+                'credential_save_requested': self.remember is True})
+        except Exception:
+            pass  # Diagnostic storage never changes credential handling.
 
     def _load_saved_password(self):
         """Distinguish an absent password from an unreadable encrypted vault."""
         if self.password or self.password_rejected:
+            self._credential_audit('reused' if self.password else 'rejected')
             return
         try:
             stored = self.vault.get(self.channel.account_id)
         except Exception:
+            self._credential_audit('storage_unavailable')
             from browser_login import BrowserSessionError
             raise BrowserSessionError('CREDENTIAL_STORAGE_UNAVAILABLE',
                 '已保存凭据暂时无法读取，请检查凭据保险库；未删除或覆盖原凭据。',
                 status='requires_login', requires_login=True) from None
         self.password = stored if isinstance(stored, str) and stored else None
+        if self.password:
+            self._credential_source = 'vault'
+            self._password_persisted = self.password
+        self._credential_audit('reused' if self.password else 'missing')
 
     def begin_password_authentication(self):
         self._password_submitted = None
@@ -171,6 +195,9 @@ class Service:
 
     def password_submitted(self, password=None):
         """Record only an app-provided password used by this authentication."""
+        # A newly submitted HTTP password may differ after browser recovery.
+        # Never leave proof from an earlier submission on a mismatched value.
+        self._password_submitted = None
         if (isinstance(self.password, str) and self.password and not self.password_rejected
                 and (password is None or password == self.password)):
             self._password_submitted = self.password
@@ -181,12 +208,37 @@ class Service:
                 or self._password_submitted != self.password):
             return
         if self._password_authenticated == self.password:
+            if not self._parallel_child:
+                self.persist_password()
             return
         self._password_authenticated = self.password
+        self._credential_audit('accepted', phase='password_authentication')
         if self._parallel_child:
             self.channel.emit('credential_authenticated')
         else:
+            self.channel.emit('credential_accepted')
             self.persist_password()
+
+    def has_verified_password(self):
+        """Historical password proof is not proof this login attempt succeeded."""
+        if not self.password or self.password_rejected:
+            return False
+        if self._password_authenticated == self.password or self._password_persisted == self.password:
+            return True
+        if self._parallel_child:
+            return False  # Only the original owner may inspect its durable vault.
+        try:
+            stored = self.vault.get(self.channel.account_id)
+        except Exception:
+            self._credential_audit('storage_unavailable')
+            from browser_login import BrowserSessionError
+            raise BrowserSessionError('CREDENTIAL_STORAGE_UNAVAILABLE',
+                '已保存凭据暂时无法读取，请检查凭据保险库；未删除或覆盖原凭据。',
+                status='requires_login', requires_login=True) from None
+        if isinstance(stored, str) and stored and stored == self.password:
+            self._password_persisted = self.password
+            return True
+        return False
 
     @contextmanager
     def checkout_authentication(self):
@@ -207,6 +259,9 @@ class Service:
                 self.password = (credential.get('password') if isinstance(credential, dict)
                                  and isinstance(credential.get('password'), str) else None)
                 self.remember = False
+                self._password_authenticated = (self.password if self.password
+                    and credential.get('verified') is True else None)
+                self._password_submitted = None
             self._checkout_auth_active = True
             self._checkout_browser_recovery_used = False
             try:
@@ -219,7 +274,9 @@ class Service:
                     if cause is None or id(cause) in seen:
                         break
                     seen.add(id(cause))
-                    if getattr(cause, 'status', None) == 401 and '-20101' in (getattr(cause, 'codes', None) or ()):
+                    if (getattr(cause, 'status', None) == 401
+                            and getattr(cause, 'phase', None) == 'password_authentication'
+                            and '-20101' in (getattr(cause, 'codes', None) or ())):
                         self.reject_password()
                         break
                     cause = getattr(cause, '__cause__', None)
@@ -234,6 +291,7 @@ class Service:
                 self._checkout_auth_active = False
                 if self._parallel_child:
                     self.password = None
+                    self._password_authenticated = self._password_submitted = None
 
     def recover_checkout_authentication(self, payload):
         """Recover only this live Checkout, using the original account browser."""
@@ -287,6 +345,8 @@ class Service:
             self.password = value['password']
             self.password_rejected = False
             self.remember = value.get('remember') is True
+            self._credential_source = 'app_prompt'
+            self._credential_audit('received')
         return self.account, self.password
 
     def text(self, label, default=''):
@@ -645,24 +705,40 @@ class Service:
             try:
                 self.vault.save(self.channel.account_id, self.password)
                 self._password_persisted = self.password
+                self._credential_audit('saved', phase='password_authentication')
+                self.channel.emit('log', message='密码已保存到凭据保险库并完成读取校验。')
             except Exception:
+                self._credential_audit('save_failed', phase='password_authentication')
                 self.stage('凭据保险库未保存密码；当前服务运行期间仍可复用，重启后需重新输入')
 
     def reject_password(self):
         # Browser autofill/manual input can reject a different password. Only
         # this authentication's actual app-provided value can invalidate cache.
         if not self.password or self._password_submitted != self.password:
+            self._credential_audit('rejection_ignored', phase='password_authentication')
             return
+        self.authentication_failed = True
+        if self.has_verified_password():
+            # Apple can refuse a new transaction even with a password accepted
+            # earlier. Preserve that proven value; the current attempt still
+            # fails unless its own bounded recovery obtains actual login proof.
+            self._credential_audit('rejected_preserved', phase='password_authentication')
+            return
+        saved_available = False
         if not self.password_rejected:
             if not self._parallel_child:
                 try:
-                    self.vault.invalidate(self.channel.account_id, self.password)
+                    stored = self.vault.get(self.channel.account_id)
+                    saved_available = isinstance(stored, str) and bool(stored)
                 except Exception:
-                    self.stage('被拒绝的已保存密码未能清除，请检查凭据保险库或手动忘记密码')
-            self.channel.emit('credential_rejected')
-        self.password_rejected = True
+                    self._credential_audit('storage_unavailable')
+            # Rejection may clear an unverified candidate, never a previously
+            # authenticated durable value. Explicit forget remains separate.
+            self.channel.emit('credential_rejected', **({'saved_credential_available': True} if saved_available else {}))
+            self._credential_audit('rejected', phase='password_authentication')
+        self.password_rejected = not saved_available
         self.password = None
-        self._password_submitted = self._password_authenticated = None
+        self._password_submitted = self._password_authenticated = self._password_persisted = None
 
     def cleanup_credentials(self, error=None):
         # Preserve account identity, trust/address/order configuration. Only an
@@ -682,12 +758,16 @@ class Service:
             if cause is None or id(cause) in seen:
                 break
             seen.add(id(cause))
-            if (getattr(cause, 'status', None) == 401 and '-20101' in (getattr(cause, 'codes', None) or ())):
+            if (getattr(cause, 'status', None) == 401
+                    and getattr(cause, 'phase', None) == 'password_authentication'
+                    and '-20101' in (getattr(cause, 'codes', None) or ())):
                 rejected = True
                 break
             cause = getattr(cause, '__cause__', None)
         if rejected:
             self.reject_password()
+        elif any(getattr(error, key, None) is not None for key in ('status', 'phase')):
+            self._credential_audit('rejection_ignored', phase=getattr(error, 'phase', None))
         self.password = None
         self._password_submitted = self._password_authenticated = self._password_persisted = None
 
@@ -765,7 +845,13 @@ class Service:
         """Refresh idle browser sessions; retain explicit manual preheat behavior."""
         self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')
         from purchase_session import verify_account_session
+        previous_requested = self.authentication_requested
+        previous_interaction = self.purchase_auth_interaction
         result = verify_account_session(self)
+        # Authentication succeeded in its own scope. A subsequent read-only
+        # bag/network failure must not be relabeled as another login request.
+        self.authentication_requested = previous_requested
+        self.purchase_auth_interaction = previous_interaction
         refreshed = result.get('browser_started') is True
         empty_bag_ready = duo_killer.warm_empty_bag()
         result.update(warm_login=True, browser_context_refreshed=refreshed,

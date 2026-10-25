@@ -26,6 +26,9 @@ DETAIL_FIELDS = frozenset((
     'success', 'prompt_kind', 'prepared', 'auto_purchase', 'operation', 'transport', 'browser_mode', 'configured',
     'queue_job_id', 'queue_assignment', 'sequence', 'enqueued_at_ms', 'mode', 'max_concurrency', 'queued_count', 'running_count', 'source',
     'browser_input_reason', 'browser_input_phase', 'browser_input_error',
+    'credential_state', 'credential_source', 'credential_phase', 'credential_available',
+    'credential_saved', 'credential_save_requested',
+    'authentication_phase',
 ))
 IDENTIFIER = re.compile(r'[A-Za-z0-9_.:-]{1,100}')
 INPUT_DIAGNOSTICS = {
@@ -33,6 +36,13 @@ INPUT_DIAGNOSTICS = {
         'focus_changed', 'element_replaced', 'value_changed', 'field_missing', 'invalid_text', 'cdp_error'},
     'browser_input_phase': {'recognition', 'before_input', 'focus', 'clear', 'type', 'verify', 'submit', 'navigation', 'input'},
     'browser_input_error': {'timeout', 'detached_context', 'target_closed', 'protocol_error', 'other'},
+}
+CREDENTIAL_DIAGNOSTICS = {
+    'credential_state': {'received', 'saved', 'reused', 'accepted', 'missing', 'rejected', 'rejected_preserved',
+                         'rejection_ignored', 'storage_unavailable', 'save_failed'},
+    'credential_source': {'app_prompt', 'service_cache', 'vault', 'task_memory'},
+    'credential_phase': {'password_authentication', 'authentication_context'},
+    'authentication_phase': {'password_authentication', 'authentication_context', 'store_exchange'},
 }
 SENSITIVE_ASSIGNMENT = re.compile(
     r'''(?ix)(["']?(?:password|passwd|pwd|token|access_token|refresh_token|id_token|authorization|cookie|set-cookie|otp|verification_code|验证码|密码|x-aos-stk|x-as-actk|csrf|secret|api_?key)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}]+)''')
@@ -70,6 +80,14 @@ def safe_details(details):
             continue
         if key in INPUT_DIAGNOSTICS:
             if isinstance(value, str) and value in INPUT_DIAGNOSTICS[key]:
+                result[key] = value
+            continue
+        if key in CREDENTIAL_DIAGNOSTICS:
+            if isinstance(value, str) and value in CREDENTIAL_DIAGNOSTICS[key]:
+                result[key] = value
+            continue
+        if key in ('credential_available', 'credential_saved', 'credential_save_requested'):
+            if type(value) is bool:
                 result[key] = value
             continue
         if value is None or type(value) is bool:

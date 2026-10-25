@@ -51,6 +51,8 @@ class Vault:
         if not self.backend:
             raise ValueError('当前系统没有可用的凭据保险库。')
         self.backend.set_password(self.service, account_id, password)
+        if self.get(account_id) != password:
+            raise ValueError('凭据保险库保存后的读取校验未通过，尚未确认保存成功。')
 
     def delete(self, account_id):
         if getattr(self, 'configuration_error', None):

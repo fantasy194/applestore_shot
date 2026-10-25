@@ -968,9 +968,10 @@ def _checkout_browser_recovery(flow, handler, expected):
 def reauthenticate_checkout(flow, *, expected=None):
     if not urlsplit(flow.url).path.startswith("/shop/signIn"):
         return False
-    from apple_login import AppleStoreLogin, LoginError, load_credentials
+    from apple_login import AppleStoreLogin, LoginError, load_credentials, recoverable_password_rejection
     if (getattr(flow, '_browser_authentication_recovery_attempted', False) is True
-            or getattr(flow, '_http_authx_rejected', False) is True):
+            or getattr(flow, '_http_authx_rejected', False) is True
+            or getattr(flow, '_http_authentication_rejected', False) is True):
         raise ValueError('本次结账认证恢复已尝试，未重复发送认证。')
     if getattr(interaction.handler, 'submitted', False) is True:
         raise ValueError('当前结账已有提交记录，未重新认证或重放购买。')
@@ -997,7 +998,11 @@ def reauthenticate_checkout(flow, *, expected=None):
             if error.status == 541 and error.phase == 'store_exchange':
                 flow._http_authx_rejected = True
             handler = interaction.handler
-            if (error.status == 541 and error.phase == 'store_exchange'
+            browser_recoverable = (error.status == 541 and error.phase == 'store_exchange'
+                                  or recoverable_password_rejection(error, handler))
+            if browser_recoverable:
+                flow._http_authentication_rejected = True
+            if (browser_recoverable
                     and getattr(handler, 'submitted', False) is not True
                     and callable(getattr(handler, 'recover_checkout_authentication', None))):
                 _checkout_browser_recovery(flow, handler, expected)

@@ -102,13 +102,12 @@ class BrowserPasswordTests(unittest.TestCase):
                 else:
                     self.channel.emit.assert_not_called()
 
-    def test_rejected_credential_does_not_reload_stale_vault_password(self):
+    def test_unverified_rejected_candidate_without_durable_password_can_be_replaced(self):
         self.service.password = 'private-rejected-fixture'
-        self.vault.get.return_value = 'private-rejected-fixture'
+        self.vault.get.return_value = None
         self.service.password_submitted()
         self.service.reject_password()
         self.assertIsNone(self.service.browser_password(allow_prompt=False))
-        self.vault.get.assert_not_called()
         self.channel.emit.assert_called_once_with('credential_rejected')
         self.channel.prompt.return_value = {'password': 'private-replacement', 'remember': False}
         self.assertEqual(self.service.browser_password(allow_prompt=True), 'private-replacement')
@@ -125,7 +124,7 @@ class BrowserPasswordTests(unittest.TestCase):
             client = Mock()
             def refused(*args, **kwargs):
                 self.service.password_submitted('private-checkout-fixture')
-                raise LoginError('private fixture',status=401,codes=['-20101'])
+                raise LoginError('private fixture',status=401,codes=['-20101'],phase='password_authentication')
             client.login.side_effect = refused
             with patch('apple_login.AppleStoreLogin',return_value=client), patch('requests.Session.send',side_effect=AssertionError('network forbidden')):
                 try:
@@ -140,15 +139,17 @@ class BrowserPasswordTests(unittest.TestCase):
 
     def test_wrapped_srp_rejection_uses_structured_cause_and_preserves_541(self):
         from apple_login import LoginError
-        for status, codes, rejected in [(401, ['-20101'], True),(541, [], False),(401, ['other'], False)]:
-            with self.subTest(status=status, codes=codes):
+        for status, codes, phase, rejected in [(401, ['-20101'], 'password_authentication', True),
+                (401, ['-20101'], 'authentication_context', False), (541, [], 'store_exchange', False),
+                (401, ['other'], 'password_authentication', False)]:
+            with self.subTest(status=status, codes=codes, phase=phase):
                 self.channel.emit.reset_mock()
                 self.service.password_rejected = False
                 self.service.password = 'private-fixture'
                 self.service.password_submitted()
                 try:
                     try:
-                        raise LoginError('private fixture', status=status, codes=codes)
+                        raise LoginError('private fixture', status=status, codes=codes, phase=phase)
                     except LoginError as error:
                         raise ValueError('public wrapper') from error
                 except ValueError as error:
@@ -180,13 +181,13 @@ class BrowserPasswordTests(unittest.TestCase):
         self.assertTrue(status['persistent'])
         self.assertNotIn('private', status)
 
-    def test_explicit_password_rejection_invalidates_matching_persistence_once(self):
+    def test_explicit_password_rejection_clears_only_unverified_candidate_once(self):
         self.service.password = 'rejected-fixture'
         self.service.password_submitted()
         self.service.reject_password()
-        self.vault.invalidate.assert_called_once_with('fixture-account', 'rejected-fixture')
+        self.vault.invalidate.assert_not_called()
         self.service.reject_password()
-        self.vault.invalidate.assert_called_once()
+        self.channel.emit.assert_called_once_with('credential_rejected')
 
     def test_encrypted_vault_is_shared_by_successful_login_next_task_and_forget(self):
         import os
@@ -215,7 +216,9 @@ class BrowserPasswordTests(unittest.TestCase):
             next_service.browser_password(allow_prompt=False)
             next_service.password_submitted()
             next_service.reject_password()
-            self.assertIsNone(Vault().get('fixture-account'))
+            self.assertEqual(Vault().get('fixture-account'), '  saved-fixture  ')
+            self.assertEqual(next_service.password, '  saved-fixture  ')
+            self.assertFalse(next_service.password_rejected)
             next_service.vault.save('fixture-account', 'replacement')
             next_service.run('forget_password', {})
             self.assertIsNone(Vault().get('fixture-account'))

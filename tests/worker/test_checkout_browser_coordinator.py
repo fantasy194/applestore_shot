@@ -140,7 +140,7 @@ class CheckoutBrowserCoordinatorTests(unittest.TestCase):
         self.assertFalse(result['pending_orders'])
         self.assertTrue(self.service.password_rejected)
         self.assertIsNone(self.service.password)
-        self.service.vault.invalidate.assert_called_once_with(self.account_id,'synthetic-password')
+        self.service.vault.invalidate.assert_not_called()
 
     def test_shadow_password_acceptance_persists_owner_before_later_failure(self):
         self.service.remember = True

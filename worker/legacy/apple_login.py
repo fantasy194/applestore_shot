@@ -41,6 +41,15 @@ class LoginError(Exception):
         self.phase = phase
 
 
+def recoverable_password_rejection(error, service):
+    """Known accepted credentials may need the current official browser context."""
+    if (not isinstance(error, LoginError) or error.status != 401
+            or '-20101' not in error.codes or error.phase != 'password_authentication'):
+        return False
+    verified = getattr(service, 'has_verified_password', None)
+    return callable(verified) and verified() is True
+
+
 def browser_profile_path(auth_path=None):
     auth_path = Path(auth_path).expanduser() if auth_path is not None else None
     root = auth_path.parent if auth_path else Path(__file__).resolve().parent
@@ -578,13 +587,16 @@ class AppleStoreLogin:
         try:
             data = self.expect(response, allowed)
         except LoginError as error:
+            # IDMS may return the same code during context initialization and
+            # password verification. Only the latter tested the submitted secret.
+            error.phase = 'password_authentication' if path == '/signin/complete' else 'authentication_context'
             if error.status == 401 and "-20101" in error.codes:
                 config_path = self.auth_path or "auth.json"
                 raise LoginError(
                     "Apple 账号或密码验证失败（HTTP 401，错误代码 -20101）。"
                     f"请检查 {config_path} 中的 account 和 password，注意大小写、输入法及首尾空格；"
                     "修改后重新运行 -l。若确认账密正确，请先在官网验证登录；此错误不一定由密码输错导致。",
-                    status=error.status, codes=error.codes) from None
+                    status=error.status, codes=error.codes, phase=error.phase) from None
             raise
         if not isinstance(data, dict):
             raise LoginError("认证接口返回了非预期 JSON。")
@@ -741,7 +753,8 @@ class AppleStoreLogin:
             self.update_trust(trust_response)
 
     def discard_failed_login(self, error):
-        if isinstance(error, LoginError) and error.status == 541:
+        if (isinstance(error, LoginError) and error.status == 541
+                or recoverable_password_rejection(error, interaction.handler)):
             # The authx response has already updated this jar (including
             # expirations/deletions). Keep that current state, never restore
             # a pre-request snapshot or treat a merchant block as bad password.
@@ -785,7 +798,7 @@ class AppleStoreLogin:
                     "Apple 账号或密码验证失败（HTTP 401，错误代码 -20101）。"
                     "账号、保存的密码和设备信任已保留；本次失败会话已失效，不自动重试。"
                     "此错误不一定由密码输错导致，请先核对官网登录。",
-                    status=error.status, codes=error.codes) from None
+                    status=error.status, codes=error.codes, phase=error.phase) from None
             raise
 
     def begin_authentication_context(self):
@@ -806,6 +819,9 @@ class AppleStoreLogin:
         log.info('[认证上下文] 开始新认证，旧会话级 aasp 数量=%s；商城会话与设备信任保留。', removed)
 
     def _login(self, account, password, sms=False, *, signin_url=None, signin_response=None):
+        reset_password = getattr(interaction.handler, 'begin_password_authentication', None)
+        if callable(reset_password):
+            reset_password()
         self.account = account
         self.begin_authentication_context()
         self.restore_trust()
@@ -840,6 +856,10 @@ class AppleStoreLogin:
         hc = {}
         if self.hc.get("X-Apple-HC-Challenge"):
             hc["X-APPLE-HC"] = hashcash(self.hc["X-Apple-HC-Bits"], self.hc["X-Apple-HC-Challenge"])
+        # Browser-context initialization can itself authenticate with a newer
+        # app password. Bind this protocol attempt only to its actual argument.
+        if callable(reset_password):
+            reset_password()
         submitted_password = getattr(interaction.handler, 'password_submitted', None)
         if callable(submitted_password):
             submitted_password(password)
@@ -851,6 +871,9 @@ class AppleStoreLogin:
         if response.status_code == 409:
             if data.get("authType") != "hsa2":
                 raise LoginError("服务器要求额外认证，但不属于当前支持的 hsa2 验证码流程。")
+            confirmed = getattr(interaction.handler, 'confirm_password_authenticated', None)
+            if callable(confirmed):
+                confirmed()
             self.verify_two_factor(sms)
         elif data.get("authType") not in ("hsa2", "hsa", "sa", "non-sa"):
             raise LoginError("密码认证返回未知状态，未宣告登录成功。")

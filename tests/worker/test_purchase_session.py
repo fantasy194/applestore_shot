@@ -213,6 +213,38 @@ class PurchaseSessionTests(unittest.TestCase):
             self.browser.assert_not_called()
             self.assertFalse(self.service._account_auth_active)
 
+    def test_known_password_context_rejection_uses_one_preflight_browser_handoff(self):
+        self.service.password='fixture-known-password'
+        self.service._password_authenticated=self.service.password
+        self.account_read.side_effect=LoginError('fixture known password context rejected',
+            status=401,codes=('-20101',),phase='password_authentication')
+        with patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed'}) as purchase:
+            self.service.run('purchase',{'sku':'MK2M4CH'})
+        self.account_read.assert_called_once();self.browser.assert_called_once();purchase.assert_called_once()
+        self.assertFalse(self.service._http_session_rejected)
+
+    def test_unverified_password_context_rejection_does_not_retry_preflight_in_browser(self):
+        self.service.password='fixture-unverified-password'
+        self.service.vault.get.return_value=None
+        self.account_read.side_effect=LoginError('fixture unverified password rejected',
+            status=401,codes=('-20101',),phase='password_authentication')
+        with patch('duo_killer.purchase_sku') as purchase:
+            with self.assertRaises(LoginError):self.service.run('purchase',{'sku':'MK2M4CH'})
+        self.account_read.assert_called_once();self.browser.assert_not_called();purchase.assert_not_called()
+
+    def test_queue_known_password_rejection_uses_same_preflight_handoff_once(self):
+        self.service.password='fixture-known-password'
+        self.service._password_authenticated=self.service.password
+        self.account_read.side_effect=LoginError('fixture known password context rejected',
+            status=401,codes=('-20101',),phase='password_authentication')
+        def execute(owner,item):
+            self.assertEqual(self.events,['canonical-browser-verified'])
+            return {'success':False,'status':'failed','message':'fixture no stock'}
+        result=QueuedCheckout(self.service,{'queue_targets':[target('known-password')]},
+            parent_executor=execute,backoff_seconds=0).run()
+        self.assertEqual(result['queue_jobs'][0]['result']['message'],'fixture no stock')
+        self.account_read.assert_called_once();self.browser.assert_called_once()
+
     def test_resolved_merchant_rejection_does_not_disable_stock_failure_retry(self):
         def rejected(session,**options):
             self.service.authentication_failed=True

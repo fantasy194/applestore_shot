@@ -64,7 +64,7 @@ def _read_or_restore(service):
             try:
                 duo_killer.login()
             except Exception as error:
-                if _merchant_exchange_rejected(error):
+                if _browser_recovery_required(error, service):
                     return _restore_after_rejection(service)
                 raise
             auth=json.loads(Path(service.auth).read_text(encoding='utf-8'))
@@ -79,7 +79,7 @@ def _read_or_restore(service):
                 # that response's Session, SSI/STK, dynamic URL and saved trust.
                 result=duo_killer.account_info(session,reauthenticate=authenticate_current)
             except Exception as error:
-                if not _merchant_exchange_rejected(error):
+                if not _browser_recovery_required(error, service):
                     raise
                 # Persist current response rotations/deletions before browser
                 # handoff. Never revive the pre-request HTTP snapshot.
@@ -98,15 +98,17 @@ def _read_or_restore(service):
         status='failed',requires_login=False)
 
 
-def _merchant_exchange_rejected(error):
-    """Only a completed IDMS exchange rejected by Shop permits one handoff."""
-    from apple_login import LoginError
+def _browser_recovery_required(error, service):
+    """A current Shop block or known-password context rejection permits one handoff."""
+    from apple_login import LoginError, recoverable_password_rejection
     seen=set()
     for _ in range(8):
         if error is None or id(error) in seen:
             break
         seen.add(id(error))
         if isinstance(error,LoginError) and error.status==541 and error.phase=='store_exchange':
+            return True
+        if recoverable_password_rejection(error, service):
             return True
         error=getattr(error,'__cause__',None)
     return False

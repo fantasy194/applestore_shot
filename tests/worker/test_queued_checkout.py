@@ -184,7 +184,9 @@ class QueueTests(unittest.TestCase):
             parent = Service(self.channel,self.root,self.task,'fixture@example.test',vault=Mock())
             parent.password = 'private-parent-fixture'
             parent.remember = True
-            parent.vault.get.side_effect = AssertionError('vault must not be needed')
+            durable = {}
+            parent.vault.get.side_effect = lambda account: durable.get(account)
+            parent.vault.save.side_effect = lambda account, password: durable.__setitem__(account, password)
             channel = Mock(account_id=self.channel.account_id,browser_task_id='fixture',browser_task_dir=self.task)
             context = SimpleNamespace(channel=channel,root=self.root,task_dir=self.task,
                                       account=parent.account,parent_service=parent,submitted=False)
@@ -219,9 +221,22 @@ class QueueTests(unittest.TestCase):
                 raise ValueError('fixture authentication refused')
             with patch('duo_killer.purchase_sku',side_effect=rejected), self.assertRaises(ValueError):
                 run_parent_serial(context,{'sku':'MLH74FE','quantity':1,'fulfillment':'HOME'})
-            self.assertTrue(parent.password_rejected)
+            self.assertFalse(parent.password_rejected)
+            self.assertEqual(parent.password, 'private-replacement-fixture')
+            self.assertTrue(context.authentication_failed)
+            self.assertEqual(durable[channel.account_id], 'private-replacement-fixture')
+            self.assertFalse(any(call.args[0] == 'credential_rejected' for call in channel.emit.call_args_list))
+            def wrong_candidate(_sku, **_options):
+                interaction.handler.password = 'never-accepted-fixture'
+                interaction.handler.password_submitted('never-accepted-fixture')
+                interaction.handler.reject_password()
+                raise ValueError('fixture new candidate refused')
+            with patch('duo_killer.purchase_sku',side_effect=wrong_candidate), self.assertRaises(ValueError):
+                run_parent_serial(context,{'sku':'MLH74FE','quantity':1,'fulfillment':'HOME'})
+            self.assertFalse(parent.password_rejected)
             self.assertIsNone(parent.password)
-            channel.emit.assert_any_call('credential_rejected')
+            self.assertEqual(durable[channel.account_id], 'private-replacement-fixture')
+            channel.emit.assert_any_call('credential_rejected', saved_credential_available=True)
         finally:
             interaction.handler, alipay_qr.ROOT = handler, qr
             for key,value in originals.items(): setattr(duo_killer,key,value)

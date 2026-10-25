@@ -84,6 +84,7 @@ def main():
             raise ValueError('任务与账号标识不匹配。')
         credential = request.pop('credential', None)
         credential_remember = request.pop('credential_remember', False) is True
+        credential_verified = request.pop('credential_verified', False) is True
         credential_rejected = request.pop('credential_rejected', False) is True
         params = request.get('params', {})
         child = isinstance(params, dict) and params.get('_parallel_child') is True
@@ -122,6 +123,9 @@ def main():
             if isinstance(credential, str) and credential and len(credential.encode('utf-8')) <= 4096 and not child:
                 service.password = credential
                 service.remember = credential_remember or legacy_remember
+                service._credential_source = 'service_cache'
+                if credential_verified:
+                    service._password_authenticated = credential
             credential = None
             service.enable_logging()
             result = service.run(request['action'], request.get('params', {}))

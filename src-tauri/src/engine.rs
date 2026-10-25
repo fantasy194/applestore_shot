@@ -263,6 +263,7 @@ struct Control {
 struct SessionCredential {
     password: Option<String>,
     remember: bool,
+    verified: bool,
     generation: u64,
     rejected: bool,
 }
@@ -865,6 +866,7 @@ impl Engine {
             };
             state.rejected = false;
             state.remember = action != "forget_password" && remember_password;
+            state.verified = false;
         }
         self.update(&app, &id, |_| {});
         let engine = self.clone();
@@ -905,7 +907,7 @@ impl Engine {
             .try_send(message)
             .map_err(|_| "无法发送输入，任务可能已退出")?;
         if let Some(password) = password {
-            credentials.insert(account_id.into(), SessionCredential {password:Some(password),remember:value["remember"]==true,generation,rejected:false});
+            credentials.insert(account_id.into(), SessionCredential {password:Some(password),remember:value["remember"]==true,verified:false,generation,rejected:false});
         }
         drop(credentials);
         task.prompt = None;
@@ -1013,8 +1015,9 @@ impl Engine {
             let mut credential_generation = state.generation;
             let credential = state.password;
             let credential_remember = state.remember;
+            let credential_verified = state.verified;
             let credential_rejected = state.rejected;
-            stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params,"credential":credential,"credential_remember":credential_remember,"credential_rejected":credential_rejected})).as_bytes()).await.map_err(|e| e.to_string())?;
+            stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params,"credential":credential,"credential_remember":credential_remember,"credential_verified":credential_verified,"credential_rejected":credential_rejected})).as_bytes()).await.map_err(|e| e.to_string())?;
             let mut lines = BufReader::new(stdout).lines();
             self.update(&app, &id, |t| { t.status = "running".into(); t.stage = "开始执行".into();
                 t.execution_started_at_ms = Some(now_ms()); });
@@ -1038,13 +1041,23 @@ impl Engine {
                         let mut event: Value = serde_json::from_str(&line).map_err(|_| "业务进程返回了无效的数据")?;
                         if event["account_id"] != account.id || event["task_id"] != id || event["v"] != 1 { return Err("业务进程的账号或任务标识不匹配".into()); }
                         let kind = event["type"].as_str().unwrap_or("").to_owned();
+                        if kind == "credential_accepted" {
+                            let mut credentials = self.session_passwords.lock().unwrap();
+                            if let Some(state) = credentials.get_mut(&account.id) {
+                                if state.generation == credential_generation && state.password.is_some() {
+                                    state.verified = true;
+                                }
+                            }
+                            continue;
+                        }
                         if kind == "credential_rejected" {
                             let mut credentials = self.session_passwords.lock().unwrap();
                             let state = credentials.entry(account.id.clone()).or_default();
-                            if state.generation == credential_generation {
+                            if state.generation == credential_generation && !state.verified {
                                 state.password = None;
                                 state.remember = false;
-                                state.rejected = true;
+                                state.verified = false;
+                                state.rejected = event["saved_credential_available"] != true;
                             }
                             continue;
                         }
@@ -2080,8 +2093,15 @@ if r['params'].get('reject_delay'):
  time.sleep(.5)
  emit('credential_rejected')
 if r['params'].get('reject'):
- emit('credential_rejected')
-emit('result',result={'success':True,'has_credential':r.get('credential')=='fixture-secret-never-on-disk','rejected':r.get('credential_rejected',False),'remember':r.get('credential_remember',False)})
+ emit('credential_rejected',saved_credential_available=r['params'].get('saved_available') is True)
+if r['params'].get('accept_delay'):
+ import time
+ emit('stage',message='fixture-before-accept')
+ time.sleep(.5)
+ emit('credential_accepted')
+if r['params'].get('accept'):
+ emit('credential_accepted')
+emit('result',result={'success':True,'has_credential':r.get('credential')=='fixture-secret-never-on-disk','rejected':r.get('credential_rejected',False),'remember':r.get('credential_remember',False),'verified':r.get('credential_verified',False)})
 "#).unwrap();
         let host = TaskHost { worker: python, script: Some(script), on_update: Arc::new(|_| {}) };
         let id = engine.start(host.clone(), account.id.clone(), "bag".into(), json!({"ask":true,"generic_failure":true})).unwrap();
@@ -2097,14 +2117,20 @@ emit('result',result={'success':True,'has_credential':r.get('credential')=='fixt
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(engine.tasks.lock().unwrap()[&id].status,"failed");
-        for (owner, params, has_credential, rejected, remember) in [
-            (account.id.clone(),json!({}),true,false,true),
-            (another.id.clone(),json!({}),false,false,false),
-            (account.id.clone(),json!({"reject":true}),true,false,true),
-            (account.id.clone(),json!({}),false,true,false),
-            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk"}),true,false,false),
-            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk","remember":true}),true,false,true),
-            (account.id.clone(),json!({}),true,false,true),
+        for (owner, params, has_credential, rejected, remember, verified) in [
+            (account.id.clone(),json!({}),true,false,true,false),
+            (another.id.clone(),json!({"accept":true}),false,false,false,false),
+            (account.id.clone(),json!({"reject":true}),true,false,true,false),
+            (account.id.clone(),json!({}),false,true,false,false),
+            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk"}),true,false,false,false),
+            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk","remember":true}),true,false,true,false),
+            (account.id.clone(),json!({"accept":true}),true,false,true,false),
+            (account.id.clone(),json!({"reject":true}),true,false,true,true),
+            (account.id.clone(),json!({}),true,false,true,true),
+            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk"}),true,false,false,false),
+            (account.id.clone(),json!({"reject":true,"saved_available":true}),true,false,false,false),
+            (account.id.clone(),json!({}),false,false,false,false),
+            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk","remember":true}),true,false,true,false),
         ] {
             let id=engine.start(host.clone(),owner,"bag".into(),params).unwrap();
             for _ in 0..500 {
@@ -2116,6 +2142,7 @@ emit('result',result={'success':True,'has_credential':r.get('credential')=='fixt
             assert_eq!(task.result.as_ref().unwrap()["has_credential"],has_credential);
             assert_eq!(task.result.as_ref().unwrap()["rejected"],rejected);
             assert_eq!(task.result.as_ref().unwrap()["remember"],remember);
+            assert_eq!(task.result.as_ref().unwrap()["verified"],verified);
             let disk=fs::read_to_string(scope_dir(temp.path(),&task.account_id).join("tasks").join(&id).join("task.json")).unwrap();
             assert!(!disk.contains("fixture-secret-never-on-disk"));
             assert!(!serde_json::to_string(&engine.snapshot()).unwrap().contains("fixture-secret-never-on-disk"));
@@ -2132,6 +2159,18 @@ emit('result',result={'success':True,'has_credential':r.get('credential')=='fixt
         }
         assert_eq!(engine.tasks.lock().unwrap()[&newer].result.as_ref().unwrap()["has_credential"],true);
         assert!(!engine.session_passwords.lock().unwrap().get(&account.id).unwrap().rejected);
+        let old=engine.start(host.clone(),account.id.clone(),"bag".into(),json!({"accept_delay":true})).unwrap();
+        for _ in 0..500 {
+            if engine.tasks.lock().unwrap()[&old].stage=="fixture-before-accept" { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let newer=engine.start(host.clone(),account.id.clone(),"bag".into(),json!({"password":"fixture-secret-never-on-disk"})).unwrap();
+        for _ in 0..500 {
+            if terminal(&engine.tasks.lock().unwrap()[&newer].status) && !engine.controls.lock().unwrap().contains_key(&newer) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(engine.tasks.lock().unwrap()[&newer].result.as_ref().unwrap()["verified"],false);
+        assert!(!engine.session_passwords.lock().unwrap().get(&account.id).unwrap().verified);
         let id=engine.start(host.clone(),account.id.clone(),"forget_password".into(),json!({})).unwrap();
         assert!(engine.session_passwords.lock().unwrap().get(&account.id).unwrap().password.is_none());
         for _ in 0..500 {
