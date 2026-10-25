@@ -1,5 +1,6 @@
 """Live checkout reuse requires a new authorized owner and positive no-write proof."""
 from types import SimpleNamespace
+import time
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -56,8 +57,10 @@ class LiveCheckoutTests(TestCase):
         self.session.close.assert_called_once()
 
     def test_expiry_config_product_or_account_change_disposes_lease(self):
+        current = time.monotonic()
         cases = [('selection', ('MK2P4CH/A', 1)), ('config_hash', 'changed'),
-                 ('account_id', 'other-account'), ('created', -1)]
+                 ('account_id', 'other-account'), ('created', current - 301),
+                 ('created', current + 301)]
         for key, value in cases:
             with self.subTest(key=key):
                 self.assertTrue(self.retain())
