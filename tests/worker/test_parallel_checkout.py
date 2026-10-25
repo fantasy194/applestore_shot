@@ -70,15 +70,21 @@ if mode in ('ipc_auth', 'ipc_otp', 'ipc_eof', 'ipc_reject', 'ipc_accept', 'ipc_c
     from protocol import Channel
     channel = Channel(a.account_id, a.task_id)
     threading.Thread(target=channel.read_replies, args=(sys.stdin,), daemon=True).start()
+    def wait_for_parent_prompt():
+        marker = root.parents[2] / 'fixture-otp-owner-visible'
+        deadline = time.monotonic() + 12
+        while not marker.exists():
+            assert time.monotonic() < deadline, 'parent did not publish first OTP prompt'
+            time.sleep(.01)
     if mode == 'ipc_otp_exit_then_valid' and index == 2:
-        time.sleep(.4)
+        wait_for_parent_prompt()
     with channel.checkout_authentication() as credential:
         assert credential['password'] == params.get('expected_fixture_password', 'ipc-private-fixture')
         write(task / 'fixture-auth-start.json', {'time':time.time()})
         if mode == 'ipc_otp_exit_then_valid' and index == 1:
             channel.emit('prompt', prompt={'id':'dying-otp','kind':'code','label':'输入六位验证码',
                          'checkout_auth_lease':channel._checkout_auth_lease})
-            time.sleep(.25)
+            wait_for_parent_prompt()
             os._exit(20)
         if mode in ('ipc_otp', 'ipc_otp_exit_then_valid'):
             code = channel.prompt('code', '输入六位验证码')
@@ -260,6 +266,11 @@ class ParallelPurchaseTests(unittest.TestCase):
                 for raw in self.channel.output.getvalue().splitlines():
                     event = json.loads(raw)
                     prompt = event.get('prompt') or {}
+                    if event.get('type') == 'prompt' and '[尝试 1/2]' in prompt.get('label','') and prompt['id'] not in replied:
+                        replied.add(prompt['id'])
+                        # Kill the owner only after its public prompt exists;
+                        # scheduler speed must not choose the tested scenario.
+                        (self.task_dir / 'parallel' / 'fixture-otp-owner-visible').touch()
                     if event.get('type') == 'prompt' and '[尝试 2/2]' in prompt.get('label','') and prompt['id'] not in replied:
                         replied.add(prompt['id'])
                         self.channel.receive({'type':'reply','account_id':self.channel.account_id,
