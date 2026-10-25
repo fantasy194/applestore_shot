@@ -106,6 +106,9 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(pool.status()['dispatchable_count'], 0)
         with self.assertRaises(ProxyError):
             pool.acquire()
+        # Freeze replenishment before discarding: a new replacement lease is
+        # valid, but this case verifies persistence of the failed original.
+        pool.close()
         pool.release(lease, failed=True)
         self.assertEqual(lease.status, 'discarded')
         self.assertEqual(pool.status()['dispatchable_count'], 0)
@@ -114,10 +117,10 @@ class ProxyTests(unittest.TestCase):
         names = {entry['event'] for entry in events}
         self.assertTrue({'proxy_refill_reserved', 'proxy_refill_complete', 'proxy_lease_discarded'} <= names)
         self.assertNotIn('http://8.8.8.', json.dumps(events))
-        pool.close()
         restored = self.pool(pool_size=1)
         self.assertEqual(restored.status()['discarded_count'], 1)
         self.assertEqual(restored.status()['dispatchable_count'], 0)
+        self.assertEqual([(item.url, item.status) for item in restored.leases], [(lease.url, 'discarded')])
 
     def test_vendor_dm_query_and_china_wall_clock_expiry(self):
         queries = []
