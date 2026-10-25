@@ -610,6 +610,12 @@ class PartialPickupPreparationTests(TestCase):
         self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
 
     def test_partial_takeover_continues_original_checkout_without_readding(self):
+        self.partial_takeover()
+
+    def test_partial_takeover_ignores_inactive_review_and_canonicalizes_sku(self):
+        self.partial_takeover(review_stub=True)
+
+    def partial_takeover(self, review_stub=False):
         self.config['pickup']['store_id'] = 'R580'
         checkout_options.save_config(self.service.checkout, self.config)
         self.service.preparing = True
@@ -634,6 +640,9 @@ class PartialPickupPreparationTests(TestCase):
             self.assertTrue(fresh)
             body = option_fixtures.fulfillment_model(mixed=False)
             body['checkout']['fulfillment']['item-0'] = deepcopy(flow.item)
+            if review_stub:
+                body['checkout']['review'] = {'fulfillmentReview': {}}
+                body['checkout']['fulfillment']['item-0']['d']['sku'] = 'MK2M4CH'
             flow.model = deepcopy(body)
             flow.current_response_body = deepcopy(body)
         flow.page = Mock(side_effect=page)
@@ -730,6 +739,72 @@ class PartialPickupPreparationTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, 'bag fallback'):
                 shop.purchase_sku('MK2M4CH', quantity=1, prepare_only=True)
         flow.page.assert_not_called()
+
+
+class PreparedPhysicalEvidenceTests(TestCase):
+    expected = [('MK2M4CH/A', 1)]
+
+    def item(self, sku='MK2M4CH/A', quantity=1):
+        return {'d': {'sku': sku}, 'itemQuantity': {'d': {'quantity': quantity}}}
+
+    def flow(self, body):
+        return Mock(session=object(), current_response_body=deepcopy(body), model=deepcopy(body))
+
+    def test_fresh_companion_evidence_matches_canonical_sku_without_bag_request(self):
+        flow = self.flow({'checkout': {'d': {'page': 'Fulfillment'}, 'review': {},
+            'companionBar': {'orderDetails': {'item-0': self.item('mk2m4ch', '1')}}}})
+        with patch.object(shop, 'Checkout') as reader:
+            shop.verify_prepared_physical_items(flow, self.expected)
+        reader.assert_not_called()
+
+    def test_missing_evidence_reads_bag_once_and_preserves_original_checkout(self):
+        flow = self.flow({'checkout': {'d': {'page': 'Fulfillment'}, 'review': {}}})
+        original_body, original_model = flow.current_response_body, flow.model
+        reader = self.flow({'shoppingCart': {'items': {'item-0': self.item()}}})
+        with patch.object(shop, 'Checkout', return_value=reader) as construct:
+            shop.verify_prepared_physical_items(flow, self.expected)
+        construct.assert_called_once_with(flow.session)
+        reader.page.assert_called_once_with(flow.apple_url('/shop/bag'), '自提准备后核对购物袋商品', fresh=True)
+        self.assertIs(flow.current_response_body, original_body)
+        self.assertIs(flow.model, original_model)
+        flow.action.assert_not_called()
+
+    def test_inactive_review_is_not_physical_authority_on_fulfillment(self):
+        flow = self.flow({'checkout': {'d': {'page': 'Fulfillment'},
+            'review': {'fulfillmentReview': {'item-0': self.item(quantity=2)}},
+            'fulfillment': {'item-0': self.item(), 'metadata': {'d': {'sku': 'MK2M4CH'}}}}})
+        with patch.object(shop, 'Checkout') as reader:
+            shop.verify_prepared_physical_items(flow, self.expected)
+        reader.assert_not_called()
+
+    def test_conflicting_or_malformed_evidence_never_uses_bag_fallback(self):
+        for item in (self.item('MK2P4CH'), self.item(quantity=2), self.item(quantity=True),
+                     self.item(quantity=1.5), self.item(quantity=0), self.item(quantity=-1),
+                     self.item(quantity=None), self.item(sku='MK2M4LL/A'),
+                     {'d': {}, 'itemQuantity': {'d': {'quantity': 1}}}):
+            flow = self.flow({'checkout': {'d': {'page': 'Fulfillment'},
+                'fulfillment': {'item-0': item},
+                'companionBar': {'orderDetails': {'item-0': self.item()}}}})
+            with self.subTest(item=item), patch.object(shop, 'Checkout') as reader:
+                with self.assertRaises(ValueError):
+                    shop.verify_prepared_physical_items(flow, self.expected)
+                reader.assert_not_called()
+                flow.action.assert_not_called()
+
+    def test_duplicate_physical_rows_are_not_collapsed(self):
+        flow = self.flow({'checkout': {'fulfillment': {'items': [self.item(), self.item()]}}})
+        with patch.object(shop, 'Checkout') as reader, self.assertRaises(ValueError):
+            shop.verify_prepared_physical_items(flow, self.expected)
+        reader.assert_not_called()
+
+    def test_bag_missing_or_changed_evidence_still_stops(self):
+        for items in ({}, {'item-0': self.item(quantity=2)}):
+            flow = self.flow({'checkout': {'d': {'page': 'Fulfillment'}}})
+            reader = self.flow({'shoppingCart': {'items': items}})
+            with self.subTest(items=items), patch.object(shop, 'Checkout', return_value=reader):
+                with self.assertRaisesRegex(ValueError, '购物袋商品或数量'):
+                    shop.verify_prepared_physical_items(flow, self.expected)
+            flow.action.assert_not_called()
 
 
 class PreparedPromptDeadlineTests(TestCase):

@@ -1054,6 +1054,69 @@ def model_items(model):
                   for item in model_item_nodes(model))
 
 
+def checkout_physical_items(model):
+    """Canonical physical evidence; malformed rows are not missing evidence."""
+    rows = []
+    def visit(node):
+        if isinstance(node, list):
+            for child in node:
+                visit(child)
+        elif isinstance(node, dict):
+            if 'itemQuantity' in node:
+                if not isinstance(field(node, 'd.sku'), str):
+                    raise ValueError('官网实物商品 SKU 无效；未提交订单。')
+                quantity = field(node, 'itemQuantity.d.quantity')
+                if isinstance(quantity, str) and re.fullmatch(r'[1-9][0-9]*', quantity):
+                    quantity = int(quantity)
+                if type(quantity) is not int or quantity < 1:
+                    raise ValueError('官网实物商品数量无效；未提交订单。')
+                rows.append((normalize_sku(field(node, 'd.sku')), quantity))
+            else:
+                for child in node.values():
+                    visit(child)
+    visit(model)
+    return sorted(rows)
+
+
+def active_checkout_review(flow):
+    # Incremental responses can retain an inactive Review skeleton or old model.
+    page = field(flow.model, 'checkout.d.page')
+    return page in (None, 'Review') and isinstance(field(flow.model, 'checkout.review'), dict)
+
+
+def verify_prepared_physical_items(flow, expected):
+    """Require current evidence; only absence permits one read-only bag check."""
+    wanted = sorted((normalize_sku(sku), quantity) for sku, quantity in expected)
+    body = flow.current_response_body
+    page = field(body, 'checkout.d.page')
+    page_label = page if page in ('Review', 'Fulfillment', 'PickupContact', 'Billing', 'Shipping') else 'unknown'
+    found = False
+    for source in ('checkout.review.fulfillmentReview', 'checkout.fulfillment',
+                   'checkout.shipping', 'checkout.companionBar.orderDetails'):
+        if source == 'checkout.review.fulfillmentReview' and page not in (None, 'Review'):
+            continue
+        try:
+            products = checkout_physical_items(field(body, source, {}))
+        except (ValueError, TypeError):
+            log.info('[自提准备核验] page=%s source=%s state=invalid', page_label, source)
+            raise ValueError('官网商品或数量无效，无法核对自提准备；未提交订单。') from None
+        state = 'matched' if products == wanted else 'mismatch' if products else 'missing'
+        log.info('[自提准备核验] page=%s source=%s state=%s products=%s', page_label, source, state, products)
+        if products and products != wanted:
+            raise ValueError('官网商品或数量与自提准备时不同，请重新准备；未提交订单。')
+        found = found or bool(products)
+    if found:
+        return
+    # Separate reader preserves the original Checkout, dynamic actions and response.
+    reader = Checkout(flow.session)
+    reader.page(flow.apple_url('/shop/bag'), '自提准备后核对购物袋商品', fresh=True)
+    products = checkout_physical_items(field(reader.current_response_body, 'shoppingCart.items', {}))
+    state = 'matched' if products == wanted else 'mismatch' if products else 'missing'
+    log.info('[自提准备核验] page=%s source=shoppingCart.items state=%s products=%s', page_label, state, products)
+    if products != wanted:
+        raise ValueError('官网购物袋商品或数量未能确认与自提准备一致；未提交订单。')
+
+
 def selection_mismatch_message(items, selection, stage='购物袋'):
     """Explain only product data; never include account/address/session data."""
     wanted = f'{selection[0]} ×{selection[1]}' if selection else '单一商品，数量为正整数'
@@ -1251,7 +1314,7 @@ def checkout_review(flow):
     # Billing 的成功响应可能仍带旧步骤模型；重新读取页面同步状态，不能重放 POST。
     for attempt in range(3):
         review = field(flow.model, "checkout.review")
-        if isinstance(review, dict):
+        if active_checkout_review(flow):
             return review
         if field(flow.model, "checkout.d.page") != "Billing" or attempt == 2:
             break
@@ -1301,8 +1364,10 @@ def pay_bag(*, flow=None, prepare_only=False):
 def continue_checkout(flow, expected, *, prepare_only=False):
     from checkout_recovery import recover_step
     from pickup_options import PickupUnavailable
-    if isinstance(field(flow.model, 'checkout.review'), dict):
+    if active_checkout_review(flow):
         return pay_review(flow, expected, prepare_only=prepare_only)
+    if isinstance(field(flow.model, 'checkout'), dict):
+        flow.model['checkout'].pop('review', None)
     page = field(flow.model, 'checkout.d.page')
     if page not in ('PickupContact', 'Shipping', 'Billing', 'Review'):
         pickup = getattr(interaction.handler, 'fulfillment_mode', 'HOME') == 'RETAIL'
@@ -1332,7 +1397,7 @@ def continue_checkout(flow, expected, *, prepare_only=False):
         recover_step(flow, '取货联系人', lambda: pickup_contact(flow, read_config(ROOT / 'checkout.json'), ROOT / 'checkout.json'))
     if field(flow.model, 'checkout.d.page') not in ('Billing', 'Review'):
         recover_step(flow, '地址', lambda: checkout_shipping(flow))
-    if not isinstance(field(flow.model, 'checkout.review'), dict):
+    if not active_checkout_review(flow):
         recover_step(flow, '支付方式', lambda: checkout_billing(flow))
     return pay_review(flow, expected, prepare_only=prepare_only)
 
@@ -1383,7 +1448,7 @@ def selected_applecare(model):
 
 def pay_review(flow, expected, *, prepare_only=False):
     review = checkout_review(flow)
-    if model_items(review.get("fulfillmentReview", {})) != expected:
+    if checkout_physical_items(review.get("fulfillmentReview", {})) != sorted((normalize_sku(sku), quantity) for sku, quantity in expected):
         raise ValueError("订单复核未通过：官网商品或数量与预期不一致；未提交订单。")
     # A fresh Review HTML can omit the payment-specific child entirely. Use
     # Apple's declared edit action to rebuild Billing, rather than assuming
@@ -1401,7 +1466,7 @@ def pay_review(flow, expected, *, prepare_only=False):
         flow.model['checkout'].pop('review', None)
         checkout_billing(flow)
         review = checkout_review(flow)
-    if model_items(review.get("fulfillmentReview", {})) != expected:
+    if checkout_physical_items(review.get("fulfillmentReview", {})) != sorted((normalize_sku(sku), quantity) for sku, quantity in expected):
         raise ValueError("订单复核未通过：重新选择支付方式后商品或数量发生变化；未提交订单。")
     if field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY":
         raise ValueError("订单复核未通过：官网未确认支付方式为支付宝；未提交订单。")
@@ -1538,11 +1603,12 @@ def _resume_prepared_checkout(flow, expected, approved_details, review_verified,
                                   for key in ('date', 'timeSlotValue'))
     handler.prepared_order = ({'details': approved_details, 'config_hash': config_hash}
                               if same_store else None)
+    verify_prepared_physical_items(flow, expected)
     fresh_review = field(flow.current_response_body, 'checkout.review')
-    if isinstance(fresh_review, dict):
+    current_page = field(flow.current_response_body, 'checkout.d.page')
+    has_review = current_page in (None, 'Review') and isinstance(fresh_review, dict)
+    if has_review:
         fulfillment = fresh_review.get('fulfillmentReview', {})
-        if model_items(fulfillment) != expected:
-            raise ValueError('官网商品或数量与自提准备时不同，请重新准备；未提交订单。')
         if not force_selection and any(key.startswith('reviewGroup-') for key in fulfillment):
             expected_store = {'storeId': approved_details.get('store_id'),
                               'storeName': approved_details.get('store'), 'storeDisabled': False}
@@ -1554,15 +1620,9 @@ def _resume_prepared_checkout(flow, expected, approved_details, review_verified,
     # other authorized stores return to fulfillment in this exact Checkout.
     store_confirmed = False if force_selection else prepared_pickup_store_confirmed(flow.current_response_body, approved_details)
     contact_confirmed = prepared_pickup_contact_confirmed(flow.current_response_body, read_config(config))
-    current_page = field(flow.current_response_body, 'checkout.d.page')
-    if not isinstance(fresh_review, dict):
+    if not has_review:
         # A partial preparation has no Review authority. Its live current
         # physical items must still match before continuing fulfillment.
-        evidence = [model_items(field(flow.current_response_body, path, {}))
-                    for path in ('checkout.fulfillment', 'checkout.companionBar.orderDetails')]
-        evidence = [items for items in evidence if items]
-        if not evidence or any(items != expected for items in evidence):
-            raise ValueError('官网商品或数量与自提准备时不同，请重新准备；未提交订单。')
         if current_page not in ('Fulfillment', 'PickupContact', 'Billing'):
             raise ValueError('官网未返回可继续的原自提结算步骤；未提交订单。')
         if current_page != 'Fulfillment' and not store_confirmed:

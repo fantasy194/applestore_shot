@@ -1,5 +1,7 @@
 # 架构与运行约定
 
+0.1.19 的活准备接手区分商品依据缺失与真实冲突，并按当前页面判定 Review，见 [本轮失败分析与准备复核](PREPARED-REVALIDATION-WAVE.md)。
+
 0.1.18 修复已验证密码被后续认证拒绝误删，及跨任务的验证依据、精确认证阶段和保存后读取校验，见 [已验证凭据保留](VERIFIED-CREDENTIAL-RETENTION.md)。
 
 0.1.17 的按账号凭据缓存、认证后保存、密码拒绝归属和协议优先的统一恢复入口，见 [登录与凭据生命周期](LOGIN-CREDENTIAL-LIFECYCLE.md)。
