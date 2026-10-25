@@ -141,6 +141,52 @@ fn blocked_reason(snapshot: &Snapshot, account: &str) -> Option<&'static str> {
     None
 }
 
+/// Preparation only: the worker rechecks these public target identities against
+/// the current encrypted monitor settings before accepting the effective scope.
+fn monitor_preparation_plan(snapshot: &Snapshot, account: &str, preset_sku: &str, preset_quantity: u32,
+    config: &Value) -> Option<Value> {
+    let monitor = snapshot.tasks.iter().filter(|task| task.action=="inventory_monitor" && active(&task.status))
+        .max_by_key(|task|task.updated_at)?;
+    let targets = monitor.result.as_ref()?["targets"].as_array()?;
+    let canonical = |sku: &str| sku.trim().to_ascii_uppercase().trim_end_matches("/A").to_owned();
+    let mut authorized: Vec<_> = targets.iter().filter(|target|target["account_id"]==account && target["auto_purchase"]==true
+        && target["sku"].as_str().is_some_and(|sku|!sku.is_empty() && sku.len()<=32 && canonical(sku).bytes().all(|c|c.is_ascii_alphanumeric()))
+        && target["quantity"].as_u64().is_some_and(|quantity|(1..=99).contains(&quantity))
+        && target["store_id"].as_str().is_some_and(|id|id.starts_with('R') && id.len()>1 && id.len()<=9 && id[1..].bytes().all(|c|c.is_ascii_digit()))
+        && target.get("pickup_policy").is_none_or(|policy|policy.is_object()
+            && [("contact_mode","local"),("id_last4","")].iter().all(|(field,default)|
+                policy.get(*field).is_none_or(|value|value.as_str()==Some(config["pickup"][*field].as_str().unwrap_or(default))))))
+        .collect();
+    if let Some(stores)=config["pickup"]["stores"].as_array().filter(|_|config["pickup"]["selection_mode"]=="priority") {
+        authorized.sort_by_key(|target|stores.iter().position(|store|store["store_id"]==target["store_id"]).unwrap_or(usize::MAX));
+    }
+    let first = authorized.iter().find(|target|canonical(target["sku"].as_str().unwrap())==canonical(preset_sku)
+        && target["quantity"].as_u64()==Some(u64::from(preset_quantity))).or_else(||authorized.first())?;
+    let sku = canonical(first["sku"].as_str()?);
+    let quantity = first["quantity"].as_u64()?;
+    let pickup = &config["pickup"];
+    let mut stores = Vec::new(); let mut identities = Vec::new();
+    for target in authorized.into_iter().filter(|target|canonical(target["sku"].as_str().unwrap())==sku && target["quantity"].as_u64()==Some(quantity)) {
+        // Explicit monitor authorization supplies the scope. The manual preset
+        // only orders matching stores and supplies their existing public query.
+        // Shared preparation never merges purchase counts or success groups.
+        let row = pickup["stores"].as_array().filter(|_|pickup["selection_mode"]=="priority")
+            .and_then(|stores|stores.iter().find(|store|store["store_id"]==target["store_id"]))
+            .cloned().unwrap_or_else(||json!({"store_id":target["store_id"],"store_name":target["store_name"],"search":target["location"]}));
+        if row["store_name"].as_str().is_none_or(|v|v.trim().is_empty()) || row["search"].as_str().is_none_or(|v|v.trim().is_empty()) {continue;}
+        if stores.iter().any(|store:&Value|store["store_id"]==row["store_id"]) {continue;}
+        stores.push(row);
+        identities.push(json!({"id":target["id"],"sku":target["sku"],"quantity":quantity,"store_id":target["store_id"]}));
+        if stores.len()==30 {break;}
+    }
+    if stores.is_empty(){return None;}
+    let mut policy=json!({"selection_mode":"priority","stores":stores,
+        "contact_mode":pickup["contact_mode"].as_str().unwrap_or("local"),
+        "time_slot_rule":{"mode":"earliest","fallback":"earliest"}});
+    if let Some(value)=pickup.get("id_last4"){policy["id_last4"]=value.clone();}
+    Some(json!({"sku":sku,"quantity":quantity,"pickup_policy":policy,"preparation_targets":identities}))
+}
+
 fn next_check(snapshot: &Snapshot, run: &Run, settings: &Settings, started_at: u64) -> u64 {
     if run.flow == "pickup_prepare" && run.status == "preparation_expired" {
         // Expiry is not a failed purchase. Keep a fresh preparation while idle,
@@ -253,6 +299,13 @@ impl Maintenance {
         if flow == "pickup_prepare" {
             params["sku"] = json!(account.preset_sku);
             params["quantity"] = json!(account.preset_quantity);
+            let config_path=self.root.join("accounts").join(account_id).join("checkout.json");
+            if let Some(config)=fs::read(config_path).ok().filter(|raw|raw.len()<=262_144)
+                .and_then(|raw|serde_json::from_slice::<Value>(&raw).ok()) {
+                if let Some(plan)=monitor_preparation_plan(&snapshot,account_id,&account.preset_sku,account.preset_quantity,&config) {
+                    for (key,value) in plan.as_object().unwrap(){params[key]=value.clone();}
+                }
+            }
         }
         let task_id = engine.start(host.clone(), account_id.into(), "session_maintain".into(), params)?;
         let mut settings = self.settings.lock().unwrap();
@@ -373,6 +426,38 @@ mod tests {
             "action":action,"status":status,"stage":"fixture","created_at":updated_at,
             "updated_at":updated_at,"execution_started_at_ms":updated_at*1000,
             "prompt":null,"result":null,"order_submitted":false,"logs":[]})).unwrap()
+    }
+
+    #[test]
+    fn monitor_preparation_combines_only_authorized_same_selection_without_writing_base() {
+        let temporary=tempfile::tempdir().unwrap();
+        let (engine,account)=fixture_engine(temporary.path());
+        let mut snapshot=engine.snapshot();
+        let mut monitor=fixture_task("local","inventory_monitor","running",100);
+        let target=|id:&str,part:&str,quantity:u32,store:&str,auto:bool|json!({"id":id,"account_id":account,"sku":part,"quantity":quantity,"store_id":store,"store_name":store,"location":"Fixture City","auto_purchase":auto});
+        monitor.result=Some(json!({"targets":[target("a","MK2P4CH",1,"R001",true),target("b","MK2P4CH/A",1,"R002",true),target("c","OTHER",1,"R003",true),target("d","MK2P4CH",2,"R004",true),target("e","MK2P4CH",1,"R005",false)]}));
+        snapshot.tasks.push(monitor);
+        let base=json!({"pickup":{"selection_mode":"fixed","store_id":"R001","contact_mode":"official","id_last4":"1234"}});
+        let plan=monitor_preparation_plan(&snapshot,&account,"MK2P4CH",1,&base).unwrap();
+        assert_eq!(plan["quantity"],1);assert_eq!(plan["preparation_targets"].as_array().unwrap().len(),2);
+        assert_eq!(plan["pickup_policy"]["stores"].as_array().unwrap().iter().map(|row|row["store_id"].as_str().unwrap()).collect::<Vec<_>>(),vec!["R001","R002"]);
+        assert_eq!(plan["pickup_policy"]["contact_mode"],"official");assert_eq!(plan["pickup_policy"]["id_last4"],"1234");
+        assert_eq!(base["pickup"]["selection_mode"],"fixed");
+        let priority=json!({"pickup":{"selection_mode":"priority","stores":[{"store_id":"R002","store_name":"Second","search":"City"}]}});
+        let narrowed=monitor_preparation_plan(&snapshot,&account,"MK2P4CH",1,&priority).unwrap();
+        assert_eq!(narrowed["pickup_policy"]["stores"].as_array().unwrap().len(),2);
+        assert_eq!(narrowed["pickup_policy"]["stores"][0]["store_id"],"R002");
+        assert_eq!(narrowed["pickup_policy"]["stores"][0]["store_name"],"Second");
+        assert_eq!(narrowed["pickup_policy"]["stores"][1]["store_id"],"R001");
+        assert_eq!(narrowed["pickup_policy"]["stores"][1]["search"],"Fixture City");
+        // A future target carrying genuinely different contact rules cannot be
+        // silently prepared with the account's rules just because its SKU matches.
+        snapshot.tasks[0].result.as_mut().unwrap()["targets"][0]["pickup_policy"]=json!({"contact_mode":"official"});
+        let compatible=monitor_preparation_plan(&snapshot,&account,"MK2P4CH",1,&priority).unwrap();
+        assert_eq!(compatible["preparation_targets"].as_array().unwrap().len(),1);
+        assert_eq!(compatible["preparation_targets"][0]["store_id"],"R002");
+        snapshot.tasks[0].status="cancelled".into();
+        assert!(monitor_preparation_plan(&snapshot,&account,"MK2P4CH",1,&base).is_none());
     }
 
     #[test]

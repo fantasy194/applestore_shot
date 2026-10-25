@@ -240,7 +240,7 @@ class PickupPolicyTests(TestCase):
             self.run_flow(flow)
         self.assertEqual(flow.submissions,0)
 
-    def test_temporary_priority_policy_ignores_monitor_anchor_and_never_changes_saved_config(self):
+    def test_explicit_monitor_assignment_narrows_priority_pool_without_changing_saved_config(self):
         before=self.service.checkout.read_bytes()
         desired=policy(stores=list(reversed(STORES)))
         flow=PolicyFlow()
@@ -248,7 +248,8 @@ class PickupPolicyTests(TestCase):
             result=self.service.run('purchase',{'sku':'MK2M4CH','quantity':1,'fulfillment':'RETAIL',
                 'pickup_store_id':'R580','pickup_store_name':'测试门店','pickup_location':'200000',
                 'pickup_policy':desired})
-        self.assertEqual(result['pickup_store_id'],'R581')
+        self.assertEqual(result['pickup_store_id'],'R580')
+        self.assertEqual([store['store_id'] for store in self.service.pickup_policy_override['stores']],['R580'])
         self.assertEqual(self.service.checkout.read_bytes(),before)
         self.assertEqual(flow.submissions,1)
         first=options.config_fingerprint(self.service.checkout)

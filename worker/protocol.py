@@ -242,9 +242,11 @@ class Channel:
                 self.checkpoint()
                 if _alive is not None and (deadline is None or time.monotonic() < deadline):
                     continue
+                self.emit('prompt_closed', request_id=request_id)
                 raise PromptExpired('准备等待已超时，请重新准备；未提交订单。') from None
             self.checkpoint()
             if deadline is not None and time.monotonic() >= deadline:
+                self.emit('prompt_closed', request_id=request_id)
                 raise PromptExpired('准备等待已超时，请重新准备；未提交订单。')
             if response and response.get('request_id') == request_id:
                 return response.get('value')

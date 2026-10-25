@@ -604,6 +604,79 @@ def official_review_proof(model):
     return proof
 
 
+def prepared_contact_review_proof(model, accepted_proof=None):
+    """Recheck current Review; local configuration alone is never acceptance.
+
+    An old proof is useful for redacted displays only after the original form
+    was accepted. No data is persisted here and mismatches remain hard errors.
+    """
+    from copy import deepcopy
+    from duo_killer import field
+    if field(model, 'checkout.d.page') != 'Review':
+        return None
+    present = set()
+    def visit(node):
+        if not isinstance(node, dict):
+            return
+        data = node.get('d', {})
+        if isinstance(data, dict):
+            present.update(key for key in (*CONTACT_FIELDS, 'fullName')
+                           if isinstance(data.get(key), str) and data[key].strip())
+        for key, child in node.items():
+            if key not in ('a', 'b', 'd', 'm', 'p'):
+                visit(child)
+    visit(field(model, 'checkout.review.pickupContactReview'))
+    if (not {'emailAddress', 'fullDaytimePhone'} <= present
+            or not ('fullName' in present or {'firstName', 'lastName'} <= present)):
+        return None
+    if isinstance(accepted_proof, dict) and accepted_proof and all(
+            isinstance(record, dict) and record.get('server_accepted') is True
+            for record in accepted_proof.values()):
+        verify_contact_review(model, accepted_proof)
+        return deepcopy(accepted_proof)
+    proof = official_review_proof(model)
+    if proof is None:
+        return None
+    verify_contact_review(model, proof)
+    return proof
+
+
+def prepared_pickup_slot_confirmed(model, details):
+    """Recognize an explicit accepted Review appointment, never build a POST.
+
+    Only structured storeId/date/timeSlotValue fields are recognized. Text-only
+    quotes, local selection and missing/unknown Review shapes prove nothing.
+    Callers must pass the fresh response, not the incrementally merged model.
+    """
+    from duo_killer import field, model_items
+    if field(model, 'checkout.d.page') != 'Review' or not isinstance(details, dict):
+        return False
+    selected = details.get('pickup_time_slot')
+    if not isinstance(selected, dict) or selected.get('store_id') != details.get('store_id'):
+        return False
+    try:
+        chosen_date = date.fromisoformat(selected['date'])
+        start, end = time.fromisoformat(selected['start']), time.fromisoformat(selected['end'])
+        now = pickup_calendar_now().astimezone(ZoneInfo('Asia/Shanghai'))
+        if (not now.date() <= chosen_date <= now.date() + timedelta(days=6) or start >= end
+                or datetime.combine(chosen_date, end, ZoneInfo('Asia/Shanghai')) <= now):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not prepared_pickup_store_confirmed(model, details):
+        return False
+    fulfillment = field(model, 'checkout.review.fulfillmentReview', {})
+    groups = [group for key, group in fulfillment.items()
+              if key.startswith('reviewGroup-') and isinstance(group, dict) and model_items(group)]
+    expected = f'{chosen_date.day}-{selected["start"]}-{selected["end"]}'
+    for group in groups:
+        pickup = field(group, 'd.pickup', {})
+        if (pickup.get('storeId') != details.get('store_id') or pickup.get('date') != selected['date']
+                or pickup.get('timeSlotValue') != expected):
+            return False
+    return bool(groups)
+
+
 def review_pickup_selection(model, selected_store):
     """Some Review models omit the store. Bind pickup-only groups to this run's
     server-confirmed store selection; never infer a store from the local preset.

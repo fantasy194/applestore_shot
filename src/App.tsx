@@ -1,7 +1,7 @@
 import { usePurchaseDraft } from "./usePurchaseDraft";
 import { DisclosureSummary } from "./DisclosureSummary";
 import { OrderProgressBar, hasUnknownSubmission } from "./OrderProgressBar";
-import { formatTaskStage } from "./taskStage";
+import { formatTaskStage, taskWaitingState } from "./taskStage";
 import {
   useEffect,
   useLayoutEffect,
@@ -136,6 +136,7 @@ function WorkspaceApp() {
     .sort((a, b) => b.created_at - a.created_at || b.updated_at - a.updated_at);
   const visibleTask =
     wireTasks.find((row) => row.id === taskTarget?.id) ||
+    wireTasks.find((row) => taskWaitingState(row) === "input") ||
     wireTasks.find((row) => row.status === "waiting") ||
     wireTasks.find(active) ||
     wireTasks[0];
@@ -265,7 +266,9 @@ function WorkspaceApp() {
           )),
     );
   const scheduledTask = tasks.find((t) => t.status === "scheduled");
-  const waiting = tasks.find((t) => t.status === "waiting");
+  const waiting =
+    tasks.find((t) => taskWaitingState(t) === "input") ||
+    tasks.find((t) => t.status === "waiting");
   const task =
     tasks.find((t) => t.id === taskTarget?.id) ||
     waiting ||
@@ -856,13 +859,13 @@ function WorkspaceApp() {
                           </button>
                         </div>
                         <p className="muted">
-                          商品未开放加购时，可先预热登录。提前准备会按下方选择的商品和数量检查购物袋、填写送货结算信息，但不创建订单。5
+                          商品未开放加购时，可先预热登录。送货提前准备会按下方选择的商品和数量检查购物袋、填写送货结算信息，但不创建订单。5
                           分钟内下单会重新核对当前结算页，不保证库存。
                         </p>
                         <p className="muted">
-                          自提准备按已保存的门店顺序、时段规则和联系人偏好执行，完成后可在当前任务点击“立即下单（已准备自提）”。准备有效期为
+                          自提准备可预填已保存的地址和自提联系人，仅在官网接受后标记完成。若尚未有货，会保留当前准备等待授权门店库存或点击购买，每
                           5
-                          分钟，等待期间该账号保留当前任务；继续时重新核对官网后提交，不保证库存。
+                          分钟向官网刷新；取消会结束准备。下单前仍会复核，不保证库存。
                         </p>
                       </section>
                       <section className="section">
@@ -1328,7 +1331,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.19</span>
+          <span>DUO Killer · 0.1.20</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (
@@ -1714,7 +1717,7 @@ function SessionMaintenance({
           账号连续10分钟没有下单操作且空闲后，执行所选流程。切换流程重新计时，正在执行的预热按原流程完成。下单优先；账号忙碌或订单结果待确认时暂缓。
         </p>
         <p>
-          登录预热不清空购物袋、不加购。自提准备使用本账号预设，不提交订单；准备记录最多复用5分钟，下单时仍会复核商品、库存、门店和时段。
+          登录预热不清空购物袋、不加购。自提准备使用本账号预设，可预填地址和联系人，官网接受后保留准备并每5分钟刷新；不提交订单，下单时仍会复核商品、库存、门店和时段。
         </p>
         <p>
           官网登录恢复保留账号和浏览器资料，使用可用凭证完成普通登录。自动预热不弹出可见浏览器；缺少密码、需要验证码或官网验证时暂停并提示处理。手动登录和官网登录恢复仍打开可见窗口。
@@ -2262,13 +2265,60 @@ function PromptForm({
   const encryptedStorage = storage?.backend === "encrypted_file";
   if (prompt.kind === "prepared_purchase") {
     const prepared = prompt.prepared;
+    const ready =
+      prepared?.preparation_stage === "review" &&
+      prepared.review_verified === true &&
+      prepared.order_ready === true;
+    const details = prepared?.checkout_details_prepared;
+    const stores = prepared?.authorized_store_ids || [];
     return (
       <section className="prompt-form" aria-label="自提准备状态">
-        <h3>{prepared?.order_ready ? "自提准备就绪" : "已保留自提准备"}</h3>
+        <h3>{ready ? "自提准备就绪" : "已保留自提准备"}</h3>
         <p>
-          尚未创建订单。发现授权门店有货或点击购买时，将优先接手本次准备。
-          {prepared?.preparation_stage === "fulfillment" &&
-            "下单时仍需确认门店及有效时段。"}
+          {prepared && (
+            <>
+              准备范围：{prepared.sku} × {prepared.quantity}
+              <br />
+            </>
+          )}
+          {stores.length > 0 && (
+            <>
+              覆盖门店：{stores.slice(0, 3).join("、")}
+              {stores.length > 3
+                ? ` 等${stores.length}家`
+                : `（共${stores.length}家）`}
+              <br />
+            </>
+          )}
+          {ready
+            ? "官网结账页已核对，尚未创建订单。"
+            : "尚未创建订单，不能直接提交；下单时仍需确认门店及有效时段。"}
+        </p>
+        {details && (
+          <>
+            <p>
+              自提联系人：
+              {details.contact_accepted === true
+                ? "官网已接受"
+                : details.local_contact_ready === true
+                  ? "本地配置就绪，尚未确认官网受理"
+                  : "尚未确认官网受理"}
+            </p>
+            <p>
+              地址：
+              {details.address_required === false
+                ? "当前自提无需送货地址"
+                : details.address_accepted === true
+                  ? "官网已接受"
+                  : details.local_address_ready === true
+                    ? "本地配置就绪，尚未确认官网受理"
+                    : "尚未确认官网受理"}
+            </p>
+          </>
+        )}
+        <p className="muted">
+          有货或点击购买后继续，仍会复核。每 5
+          分钟向官网刷新准备；刷新失败会结束并显示原因，可随时结束。
         </p>
         <button type="button" className="secondary" onClick={onCancel}>
           结束准备
@@ -2306,7 +2356,7 @@ function PromptForm({
               自提准备完成，尚未创建订单。
               {preparedExpiry
                 ? `准备有效至 ${preparedExpiry}。`
-                : "准备有效期为 5 分钟。"}
+                : "继续前将重新复核当前准备。"}
               等待期间该账号保留当前任务，继续时重新核对官网后提交。
             </p>
           )}

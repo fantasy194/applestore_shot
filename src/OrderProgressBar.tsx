@@ -3,7 +3,7 @@ import { ArrowRight, X } from "lucide-react";
 import { useAccountPrivacy } from "./AccountPrivacy";
 import { SelectField } from "./SelectField";
 import { purchaseEvidence as evidence } from "./purchaseEvidence";
-import { formatTaskStage } from "./taskStage";
+import { formatTaskStage, taskWaitingState } from "./taskStage";
 import { active, type Account, type Data, type Task } from "./types";
 
 const steps = [
@@ -225,12 +225,26 @@ function describe(task: Task, tasks: Task[]) {
       title: "下单排队中",
       detail: "等待执行名额。",
     };
-  if (task.status === "waiting")
+  if (taskWaitingState(task) === "prepared")
+    return {
+      tone: "info",
+      phase: "prepare",
+      title: "等待购买触发",
+      detail: "自提准备已保留，有货或点击购买后继续。",
+    };
+  if (taskWaitingState(task) === "input")
     return {
       tone: "warning",
       phase,
       title: "下单需要操作",
       detail: "打开当前任务，完成所需输入或确认。",
+    };
+  if (taskWaitingState(task) === "waiting")
+    return {
+      tone: "info",
+      phase,
+      title: "等待任务继续",
+      detail: "查看当前任务了解最新状态。",
     };
   const stage = task.stage?.trim() || "";
   const known: Record<string, [string, string]> = {
@@ -282,7 +296,8 @@ export function OrderProgressBar({
     .filter(active)
     .sort(
       (a, b) =>
-        Number(b.status === "waiting") - Number(a.status === "waiting") ||
+        Number(taskWaitingState(b) === "input") -
+          Number(taskWaitingState(a) === "input") ||
         b.updated_at - a.updated_at,
     );
   const latest = orders[0];

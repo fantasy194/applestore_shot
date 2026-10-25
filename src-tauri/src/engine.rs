@@ -273,6 +273,7 @@ pub struct Engine {
     accounts: Mutex<Vec<Account>>,
     // Process-lifetime only; never part of snapshots, task files, or activity logs.
     session_passwords: Mutex<HashMap<String, SessionCredential>>,
+    identity_proof_key: String,
     tasks: Mutex<HashMap<String, Task>>,
     workspace_feed: Mutex<workspace_feed::WorkspaceFeed>,
     controls: Mutex<HashMap<String, Control>>,
@@ -456,6 +457,7 @@ impl Engine {
             root,
             accounts: Mutex::new(accounts),
             session_passwords: Mutex::new(HashMap::new()),
+            identity_proof_key: format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()),
             tasks: Mutex::new(tasks),
             workspace_feed: Mutex::new(workspace_feed::WorkspaceFeed::default()),
             controls: Mutex::new(HashMap::new()),
@@ -706,6 +708,9 @@ impl Engine {
             return Err("任务参数过大".into());
         }
         let mut params = params;
+        for private in ["identity_proof_key", "_identity_proof_key"] {
+            params.as_object_mut().unwrap().remove(private);
+        }
         // Accept prefilled credentials through the same account cache, but remove
         // secrets before any business parameters can reach diagnostics/persistence.
         let supplied_password = params.as_object_mut().unwrap().remove("password");
@@ -1017,7 +1022,13 @@ impl Engine {
             let credential_remember = state.remember;
             let credential_verified = state.verified;
             let credential_rejected = state.rejected;
-            stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params,"credential":credential,"credential_remember":credential_remember,"credential_verified":credential_verified,"credential_rejected":credential_rejected})).as_bytes()).await.map_err(|e| e.to_string())?;
+            let mut request = json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params,"credential":credential,"credential_remember":credential_remember,"credential_verified":credential_verified,"credential_rejected":credential_rejected});
+            if account.id != LOCAL_ID && params["_parallel_child"] != true
+                && matches!(action.as_str(), "login" | "enroll" | "me" | "purchase" | "checkout" | "session_maintain") {
+                // This capability is private IPC, never a public task parameter.
+                request["identity_proof_key"] = json!(self.identity_proof_key);
+            }
+            stdin.write_all(format!("{request}\n").as_bytes()).await.map_err(|e| e.to_string())?;
             let mut lines = BufReader::new(stdout).lines();
             self.update(&app, &id, |t| { t.status = "running".into(); t.stage = "开始执行".into();
                 t.execution_started_at_ms = Some(now_ms()); });
@@ -1332,6 +1343,64 @@ async fn stop_process(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn purchase_identity_signing_key_is_runtime_only_and_changes_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Engine::new(directory.path().into()).unwrap();
+        assert_eq!(first.identity_proof_key.len(), 64);
+        assert!(first.identity_proof_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let key = first.identity_proof_key.clone();
+        assert!(!serde_json::to_string(&first.snapshot()).unwrap().contains(&key));
+        drop(first);
+        let second = Engine::new(directory.path().into()).unwrap();
+        assert_ne!(key, second.identity_proof_key);
+        for entry in fs::read_dir(directory.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                assert!(!String::from_utf8_lossy(&fs::read(path).unwrap()).contains(&key));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn purchase_identity_capability_uses_private_worker_header_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::new(directory.path().into()).unwrap();
+        let account = engine.add_account("identity-ipc@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending = false;
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python = project.join(if cfg!(windows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" });
+        let script = directory.path().join("identity-ipc-fixture.py");
+        fs::write(&script, r#"import json,re,sys
+r=json.loads(sys.stdin.readline())
+assert 'identity_proof_key' not in r['params'] and '_identity_proof_key' not in r['params']
+key=r.get('identity_proof_key')
+present=isinstance(key,str) and re.fullmatch(r'[0-9a-f]{64}',key) is not None
+print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type='result',result={
+ 'success':True,'logged_in':True,'scope':'account','apple_id':r['account'],'private_capability_present':present})),flush=True)
+"#).unwrap();
+        let host = TaskHost { worker: python, script: Some(script), on_update: Arc::new(|_| {}) };
+        for (owner, action, child, expected) in [
+            (account.id.clone(), "me", false, true),
+            (account.id.clone(), "bag", false, false),
+            (LOCAL_ID.to_owned(), "catalog", false, false),
+            (account.id.clone(), "me", true, false),
+        ] {
+            let id = engine.start(host.clone(), owner.clone(), action.into(), json!({
+                "_parallel_child":child,"identity_proof_key":"untrusted-public-value","_identity_proof_key":"untrusted-public-value"
+            })).unwrap();
+            for _ in 0..1000 {
+                if terminal(&engine.tasks.lock().unwrap()[&id].status) && !engine.controls.lock().unwrap().contains_key(&id) { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let task = engine.tasks.lock().unwrap()[&id].clone();
+            assert_eq!(task.status, "succeeded", "{action} child={child}: {}", task.stage);
+            assert_eq!(task.result.as_ref().unwrap()["private_capability_present"], expected);
+            assert!(!serde_json::to_string(&task).unwrap().contains(&engine.identity_proof_key));
+            let stored = scope_dir(directory.path(), &owner).join("tasks").join(&id).join("task.json");
+            assert!(!fs::read_to_string(stored).unwrap().contains(&engine.identity_proof_key));
+        }
+        assert!(!serde_json::to_string(&engine.snapshot()).unwrap().contains(&engine.identity_proof_key));
+    }
     fn task() -> Task {
         Task {
             id: "t".into(),

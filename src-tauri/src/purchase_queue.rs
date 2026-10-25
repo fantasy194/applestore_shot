@@ -896,8 +896,10 @@ impl Engine {
                     match self.start(host.clone(),account.clone(),"purchase".into(),params) {
                         Ok(task)=>{
                             for &index in &indices {queue.jobs[index].task_id=Some(task.clone());}
-                            let claimed=self.tasks.lock().unwrap().get(&task).is_some_and(|current|current.prepared_handoff.as_ref().is_some_and(|claim|claim["source"]=="queue"));
-                            runtime.coordinators.insert(account,Coordinator {task_id:task,ready:claimed,idle:false,closing:claimed});
+                            // A consumed preparation owns its first assignment. Only
+                            // an explicit queue_ready after that result can admit
+                            // later jobs to a safe live-Checkout continuation.
+                            runtime.coordinators.insert(account,Coordinator {task_id:task,ready:false,idle:false,closing:false});
                         }
                         Err(message)=>{*queue=previous;for &index in &indices {queue.jobs[index].message=message.clone();}}
                     }
@@ -2172,11 +2174,58 @@ emit('result',result={'success':False,'status':'failed','order_submitted':False}
         observe(&engine,&host,vec![target(&account,"R001",now_ms()),target(&account,"R002",now_ms())]);engine.queue_pump_once();
         assert!(bridge_wait(||root.path().join("failed-before-exit").exists()&&jobs(&engine)[0].status=="failed").await);
         engine.queue_pump_once();let delayed=jobs(&engine);assert_eq!(delayed[0].task_id.as_deref(),Some(prepared.as_str()));assert!(delayed[1].pending());assert!(delayed[1].task_id.is_none());
-        assert!(engine.queue_runtime.lock().unwrap().coordinators[&account].closing);
+        assert!(!engine.queue_runtime.lock().unwrap().coordinators[&account].closing);
+        assert!(!engine.queue_runtime.lock().unwrap().coordinators[&account].ready);
         fs::write(root.path().join("allow-prepared-exit"),b"release original worker").unwrap();
         assert!(bridge_wait(||!engine.controls.lock().unwrap().contains_key(&prepared)).await);engine.queue_pump_once();
         let next=jobs(&engine);assert!(next[1].task_id.is_some());assert_ne!(next[1].task_id.as_deref(),Some(prepared.as_str()));
         assert!(bridge_wait(||jobs(&engine)[1].status=="failed"&&!engine.controls.lock().unwrap().contains_key(next[1].task_id.as_deref().unwrap())).await);
+    }
+
+    #[tokio::test]
+    async fn claimed_preparation_explicitly_ready_continues_next_store_in_same_worker() {
+        let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python=project.join(if cfg!(windows){".venv/Scripts/python.exe"}else{".venv/bin/python"});
+        let (root,engine,_,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
+        let script=root.path().join("prepared-continuation-fixture.py");fs::write(&script,r#"import hashlib,json,os,pathlib,sys,time
+r=json.loads(sys.stdin.readline());root=pathlib.Path(sys.argv[2])
+def emit(kind,**data):
+ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type=kind,**data)),flush=True)
+assert r['action']=='session_maintain'
+raw=(root/'accounts'/r['account_id']/'checkout.json').read_bytes();now=int(time.time()*1000)
+emit('prompt',prompt={'id':'continue-lease','kind':'prepared_purchase','label':'ready','fixture_pid':os.getpid(),'prepared':{'v':1,'sku':'MLH74FE/A','quantity':1,'fulfillment':'RETAIL','config_fingerprint':'a'*64,'config_file_sha256':hashlib.sha256(raw).hexdigest(),'authorized_store_ids':['R001','R002'],'prepared_at_ms':now,'expires_at_ms':now+300000,'preparation_stage':'fulfillment','review_verified':False,'order_ready':False}})
+first=json.loads(sys.stdin.readline())['value']['params']
+identity=lambda target:{key:target[key] for key in ['queue_job_id','queue_assignment','purchase_group_id']}
+emit('queue_started',**identity(first))
+emit('queue_finished',result={'status':'failed','success':False,'order_submitted':False},**identity(first))
+emit('queue_ready')
+command=json.loads(sys.stdin.readline());assert command['type']=='queue_add'
+second=command['queue_targets'][0];assert second['queue_job_id']!=first['queue_job_id'] and second['pickup_store_id']=='R002'
+emit('queue_started',**identity(second))
+# A late ACK for the already-failed target must not complete its sibling.
+emit('queue_finished',result={'status':'succeeded','success':True,'order_submitted':False},**identity(first))
+(root/'continuation-running').write_text(str(os.getpid()))
+deadline=time.monotonic()+10
+while not (root/'allow-continuation-finish').exists():
+ assert time.monotonic()<deadline
+ time.sleep(.01)
+emit('queue_finished',result={'status':'failed','success':False,'order_submitted':False},**identity(second))
+emit('result',result={'status':'failed','success':False,'order_submitted':False})
+"#).unwrap();
+        let host=TaskHost{worker:python,script:Some(script),on_update:Arc::new(|_|{})};
+        let prepared=engine.start(host.clone(),account.clone(),"session_maintain".into(),json!({})).unwrap();
+        assert!(bridge_wait(||engine.tasks.lock().unwrap()[&prepared].prompt.is_some()).await);
+        let pid=engine.tasks.lock().unwrap()[&prepared].prompt.as_ref().unwrap()["fixture_pid"].as_u64().unwrap();
+        observe(&engine,&host,vec![target(&account,"R001",now_ms()),target(&account,"R002",now_ms())]);engine.queue_pump_once();
+        assert!(bridge_wait(||jobs(&engine)[0].status=="failed"&&engine.queue_runtime.lock().unwrap().coordinators[&account].ready).await);
+        engine.queue_pump_once();
+        assert!(bridge_wait(||root.path().join("continuation-running").exists()&&jobs(&engine)[1].status=="running").await);
+        let running=jobs(&engine);assert_eq!(running[0].status,"failed");assert_eq!(running[1].task_id.as_deref(),Some(prepared.as_str()));
+        assert_eq!(fs::read_to_string(root.path().join("continuation-running")).unwrap(),pid.to_string());
+        assert!(running.iter().all(|job|job.assignment==1&&!job.order_submitted));
+        fs::write(root.path().join("allow-continuation-finish"),b"finish new assignment").unwrap();
+        assert!(bridge_wait(||jobs(&engine)[1].status=="failed"&&!engine.controls.lock().unwrap().contains_key(&prepared)).await);
+        assert!(jobs(&engine).iter().all(|job|job.status=="failed"));
     }
 
     #[tokio::test]

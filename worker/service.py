@@ -51,6 +51,8 @@ class Service:
         self.prepared_expired = False
         self.prepared_claim_config_hash = None
         self._prepared_claim = None
+        self._preparation_targets = None
+        self._maintenance_preparation = None
         self._prepared_params = None
         self._prepared_queue_finished = False
         self._prepared_performance = {}
@@ -429,7 +431,7 @@ class Service:
                 if (self.pickup_selected and details.get('store_id')
                         and details['store_id'] != self.pickup_selected['storeId']):
                     raise ValueError('官网复核门店编号与已选门店不一致；未提交订单。')
-                if (preset.get('selection_mode') == 'priority' or preset.get('contact_mode') == 'official') and not self.pickup_contact_review_verified:
+                if not self.pickup_contact_review_verified:
                     raise ValueError('官网复核尚未确认本次取货联系人，未提交订单。')
             else:
                 if details.get('store') or not details.get('address'):
@@ -459,7 +461,7 @@ class Service:
                 raise ValueError('本次自提偏好包含不支持的字段。')
             saved = checkout_options.read_config(self.checkout).get('pickup', {})
             self.pickup_policy_override = validate_policy({**saved, **policy})
-        if any(key in params for key in ('pickup_store_id', 'pickup_store_name', 'pickup_location')) and checkout_options.read_config(self.checkout).get('pickup', {}).get('selection_mode') != 'priority':
+        if any(key in params for key in ('pickup_store_id', 'pickup_store_name', 'pickup_location')):
             store_id, name = params.get('pickup_store_id'), params.get('pickup_store_name')
             saved = checkout_options.read_config(self.checkout).get('pickup', {})
             location = params.get('pickup_location') or saved.get('search')
@@ -468,6 +470,12 @@ class Service:
                     or not isinstance(location, str) or not location.strip() or len(location) > 200):
                 raise ValueError('监控触发的自提门店或位置无效；未开始购买。')
             self.pickup_override = {'store_id':store_id, 'store_name':name.strip(), 'search':location.strip()}
+            # A queue assignment authorizes exactly this store even when the
+            # account or retained preparation contains a priority store pool.
+            scoped = {**saved, **self.pickup_override, 'selection_mode':'fixed'}
+            if saved.get('selection_mode') == 'priority':
+                scoped.update(selection_mode='priority', stores=[dict(self.pickup_override)])
+            self.pickup_policy_override = validate_policy(scoped)
         if previous is not None and previous != checkout_options.config_fingerprint(self.checkout):
             cached.unlink(missing_ok=True)
 
@@ -487,6 +495,7 @@ class Service:
     def _accept_prepared_claim(self, value, prepared, request_id):
         from purchase_retry import retry_count
         from parallel_checkout import concurrency
+        self.validate_preparation_scope()
         if not isinstance(value, dict) or set(value) != {'prepared_claim','params'}:
             raise ValueError('准备接手缺少本次购买授权；未提交订单。')
         claim, params = value['prepared_claim'], value['params']
@@ -506,13 +515,15 @@ class Service:
             raise ValueError('本次购买与准备的商品、数量或配送范围不一致。')
         if checkout_options.config_fingerprint(self.checkout) != prepared['config_fingerprint']:
             raise ValueError('有效自提配置已变化，未接手旧准备。')
+        if hashlib.sha256(self.checkout.read_bytes()).hexdigest() != prepared.get('config_file_sha256'):
+            raise ValueError('账号自提配置已变化，未接手旧准备。')
         if claim.get('config_fingerprint',prepared['config_fingerprint']) != prepared['config_fingerprint']:
             raise ValueError('准备配置指纹不匹配。')
         requested = []
         policy = params.get('pickup_policy')
         if isinstance(policy, dict):
             original_pickup=checkout_options.read_config(self.checkout).get('pickup',{})
-            for key,default in (('selection_mode','fixed'),('contact_mode','local'),('id_last4','')):
+            for key,default in (('contact_mode','local'),('id_last4','')):
                 if policy.get(key,original_pickup.get(key,default)) != original_pickup.get(key,default):
                     raise ValueError('本次购买改变了准备的取货授权规则。')
             if policy.get('selection_mode',original_pickup.get('selection_mode','fixed'))=='priority':
@@ -584,13 +595,18 @@ class Service:
             else:
                 self.prepared_handoff_unavailable=True
                 return False
+        public_policy = {key:copy.deepcopy(value) for key,value in pickup.items()
+                         if key in ('selection_mode','contact_mode','time_slot_rule','stores','store_id','store_name','search')}
         prepared={'v':1,'sku':self.purchase_selection[0],'quantity':self.purchase_selection[1],
             'fulfillment':'RETAIL','config_fingerprint':checkout_options.config_fingerprint(self.checkout),
             'config_file_sha256':hashlib.sha256(self.checkout.read_bytes()).hexdigest(),
             'authorized_store_ids':list(dict.fromkeys(store for store in stores if isinstance(store,str) and re.fullmatch(r'R\d{1,8}',store))),
             'prepared_at_ms':stamp,'expires_at_ms':stamp+int(min(300,timeout)*1000),
             'preparation_stage':result.get('preparation_stage','review'),
-            'review_verified':result.get('review_verified') is True,'order_ready':result.get('order_ready') is True}
+            'review_verified':result.get('review_verified') is True,'order_ready':result.get('order_ready') is True,
+            'effective_pickup_policy':public_policy}
+        if isinstance(result.get('checkout_details_prepared'), dict):
+            prepared['checkout_details_prepared'] = copy.deepcopy(result['checkout_details_prepared'])
         self.prepared_expired=False
         self.channel.emit('progress_result',result={**result,'prepared':prepared})
         request_id=str(uuid.uuid4())
@@ -604,7 +620,7 @@ class Service:
         self._accept_prepared_claim(accepted,prepared,request_id)
         return True
 
-    def execute_prepared_purchase(self, first_attempt):
+    def execute_prepared_purchase(self, first_attempt, *, prepared_flow=None):
         from purchase_retry import run_purchase
         from purchase_execution import execute_purchase_attempt
         if self._prepared_claim is None or self._prepared_params is None:
@@ -615,6 +631,11 @@ class Service:
             if not attempted:
                 attempted=True
                 return first_attempt()
+            if prepared_flow is not None and getattr(prepared_flow, '_session_persistence_transferred', False) is not True:
+                # A complete retry will own a different Session. Persist this
+                # one before handing off, and never save it over the newer one.
+                duo_killer.save_auth(prepared_flow.session)
+                prepared_flow._session_persistence_transferred = True
             self.prepared_order=None
             return execute_purchase_attempt(self,self._prepared_params)
         result=run_purchase(self,self._prepared_params,execute)
@@ -650,6 +671,46 @@ class Service:
             result['queue_assignment']=claim['queue_assignment'];result['purchase_group_id']=claim.get('purchase_group_id')
             self.channel.emit('queue_finished',queue_job_id=claim['queue_job_id'],queue_assignment=claim['queue_assignment'],
                 purchase_group_id=claim.get('purchase_group_id'),result=result,order_submitted=self.submitted is True)
+
+    def continue_prepared_queue(self, flow, expected, error):
+        """Finish this failed assignment before accepting any new queue lease."""
+        claim = self._prepared_claim
+        if not isinstance(claim, dict) or claim.get('source') != 'queue' or len(expected) != 1:
+            raise error
+        summary = getattr(error, 'retry_summary', None)
+        if isinstance(summary, dict) and summary.get('attempts_made') != 1:
+            # A later retry may own a newer Session; never revive or persist the
+            # first prepared flow after that distinct attempt has executed.
+            raise error
+        from live_checkout import retain_unavailable, discard
+        self._live_checkout_enabled = True
+        self._live_checkout_owner = self
+        raw_hash = hashlib.sha256(self.checkout.read_bytes()).hexdigest() if self.checkout.exists() else ''
+        if not retain_unavailable(self, flow, tuple(expected[0]), raw_hash, error):
+            self._live_checkout_enabled = False
+            raise error
+        self.finish_prepared_handoff(error=error)
+        # The first claim and all its timing/ACK state are terminal. The same
+        # process now waits for distinct assignments through the normal owner.
+        self._prepared_claim = None
+        self._prepared_params = None
+        self.prepared_claim_config_hash = None
+        self._prepared_performance = {}
+        self._purchase_clocks = {}
+        self.prepared_order = None
+        self.keep_prepared_pickup = False
+        self.preparing = False
+        self._preparation_targets = None
+        self._maintenance_preparation = None
+        duo_killer.save_auth(flow.session)
+        flow._session_persistence_transferred = True
+        from queued_checkout import run_queued_purchase
+        try:
+            return run_queued_purchase(self, {'queue_stream': True, 'queue_targets': [],
+                                             'queue_mode': 'sequential', 'queue_max_concurrency': 1})
+        finally:
+            discard(self)
+            self._live_checkout_enabled = False
 
     def payment_ready(self, result):
         if self.submitted and result.get('status') == 'pending_payment' and result.get('order_number'):
@@ -875,6 +936,9 @@ class Service:
             raise ValueError('请先保存当前账号的商品SKU，再进行自提预热。')
         if type(count) is not int or not 1 <= count <= 999:
             raise ValueError('请先保存当前账号的购买数量，再进行自提预热。')
+        preparation = self._maintenance_preparation if isinstance(self._maintenance_preparation, dict) else {}
+        self._preparation_targets = preparation.get('preparation_targets')
+        self.validate_preparation_scope(sku=sku, count=count)
         if self.action == 'session_maintain':
             from purchase_session import verify_account_session, record_action_session
             verify_account_session(self)
@@ -886,11 +950,49 @@ class Service:
         try:
             return self.run('purchase', {'sku': sku, 'quantity': count, 'fulfillment': 'RETAIL',
                                         'prepare_only': True, 'keep_ready': True, 'concurrency': 1,
-                                        'retry_count': 0})
+                                        'retry_count': 0, **preparation})
         finally:
             # Engine ownership and purchase priority remain session-maintenance scoped.
             self._purchase_session_owner = previous_owner
             self.action = 'purchase' if isinstance(getattr(self,'_prepared_claim',None),dict) else 'session_maintain'
+
+    def validate_preparation_scope(self, *, sku=None, count=None):
+        """Recheck monitor authorizations from disk, never its old result snapshot."""
+        targets = self._preparation_targets
+        if targets is None:
+            return
+        from inventory import load_config
+        if not isinstance(targets, list) or not targets:
+            raise ValueError('自提准备缺少当前监控授权，已结束准备。')
+        current = {row['id']:row for row in load_config(self.settings_dir).get('targets', [])}
+        selection = self.purchase_selection
+        sku = duo_killer.normalize_sku(sku) if sku is not None else selection[0] if selection else None
+        count = count if count is not None else selection[1] if selection else None
+        for requested in targets:
+            row = current.get(requested.get('id')) if isinstance(requested, dict) else None
+            if (not row or row.get('auto_purchase') is not True or row.get('account_id') != self.channel.account_id
+                    or duo_killer.normalize_sku(row.get('sku', '')) != sku or row.get('quantity') != count
+                    or duo_killer.normalize_sku(requested.get('sku', '')) != duo_killer.normalize_sku(row.get('sku', ''))
+                    or any(requested.get(key) != row.get(key) for key in ('quantity','store_id'))):
+                raise ValueError('监控购买授权已撤销或变化，已结束原自提准备；未下单。')
+        policy = (self._maintenance_preparation or {}).get('pickup_policy')
+        if isinstance(policy, dict):
+            stores = policy.get('stores', [])
+            by_store = {current[row['id']]['store_id']:current[row['id']] for row in targets}
+            raw = json.loads(self.checkout.read_text(encoding='utf-8')) if self.checkout.exists() else {}
+            base = raw.get('pickup', {})
+            base_stores = base.get('stores', []) if base.get('selection_mode') == 'priority' else [base]
+            base_by_id = {store.get('store_id'):store for store in base_stores if isinstance(store, dict)}
+            from pickup_options import store_name
+            def matches(store):
+                if not isinstance(store, dict) or store.get('store_id') not in by_store:
+                    return False
+                row, hint = by_store[store['store_id']], base_by_id.get(store['store_id'], {})
+                names = {store_name(row.get('store_name')), store_name(hint.get('store_name'))} - {''}
+                searches = {row.get('location'), hint.get('search')} - {None, ''}
+                return store_name(store.get('store_name')) in names and store.get('search') in searches
+            if not stores or len(stores) != len(by_store) or not all(matches(store) for store in stores):
+                raise ValueError('自提准备门店与当前监控授权不一致；未下单。')
 
     def run(self, action, params):
         self._parallel_child = params.get('_parallel_child') is True
@@ -974,6 +1076,8 @@ class Service:
             return {'success': True, 'config': config, 'message': '自提偏好已保存。' if params.get('pickup_only') is True else '快捷地址已保存，结账时可选择使用。'}
         if action == 'import_auth':
             data = validate_import(params.get('data'), self.account)
+            from purchase_identity import invalidate_identity
+            invalidate_identity(service=self)
             duo_killer.write_private_json(self.auth, data)
             return {'success': True, 'message': '会话已导入，点击检查登录以确认有效性。'}
         if action == 'forget_password':
@@ -1007,6 +1111,9 @@ class Service:
                     result = duo_killer.login(sms=params.get('sms') is True)
         elif action == 'session_maintain':
             from session_maintenance import maintain_session
+            self._maintenance_preparation = ({key:copy.deepcopy(params[key])
+                for key in ('preparation_targets','pickup_policy') if key in params}
+                if 'preparation_targets' in params else None)
             previous_idle_maintenance = self.idle_maintenance
             self.idle_maintenance = True
             previous_headless = self.headless_browser

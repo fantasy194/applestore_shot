@@ -31,46 +31,74 @@ fn effective_claim_params(params: &Value) -> Option<Value> {
     } else { Some(params.clone()) }
 }
 
-fn matching_preparation(root: &Path, account: &str, task: &Task, params: &Value, current: u64) -> bool {
+fn default_claim_policy(root:&Path,account:&str)->Option<Value> {
+    let raw=fs::read(scope_dir(root,account).join("checkout.json")).ok()?;
+    if raw.len()>262_144{return None;}
+    let config:Value=serde_json::from_slice(&raw).ok()?;
+    let pickup=config["pickup"].as_object()?;
+    let mut policy=json!({"selection_mode":"fixed","contact_mode":"local","id_last4":"",
+        "time_slot_rule":{"mode":"earliest","fallback":"earliest"},"stores":[]});
+    for key in ["selection_mode","contact_mode","search","store_id","store_name","id_last4"] {
+        if let Some(value)=pickup.get(key){policy[key]=value.clone();}
+    }
+    if !matches!(policy["selection_mode"].as_str(),Some("fixed"|"priority")){return None;}
+    if policy["selection_mode"]=="priority" {
+        let stores=pickup.get("stores")?.as_array()?;
+        let safe:Vec<_>=stores.iter().map(|store|{
+            let mut row=json!({});
+            for key in ["store_id","store_name","search"]{if let Some(value)=store.get(key){row[key]=value.clone();}}
+            row
+        }).collect();
+        policy["stores"]=json!(safe);
+    }
+    Some(policy)
+}
+
+fn preparation_miss_reason(root: &Path, account: &str, task: &Task, params: &Value, current: u64) -> Option<&'static str> {
     if !waiting_preparation(task) || task.account_id != account || params["prepare_only"] == true
         || params["fulfillment"] != "RETAIL" || params["concurrency"].as_u64().unwrap_or(1) != 1 {
-        return false;
+        return Some("task_scope");
     }
     let prompt = task.prompt.as_ref().unwrap();
     let prepared = &prompt["prepared"];
     if prepared["v"] != 1 || prepared["fulfillment"] != "RETAIL"
         || prepared["sku"].as_str().zip(params["sku"].as_str()).is_none_or(|(a,b)| canonical_sku(a)!=canonical_sku(b))
         || prepared["quantity"].as_u64().is_none_or(|quantity| quantity == 0 || Some(quantity) != params["quantity"].as_u64()) {
-        return false;
+        return Some("purchase_selection");
     }
-    let Some(started) = prepared["prepared_at_ms"].as_u64() else { return false; };
-    let Some(expires) = prepared["expires_at_ms"].as_u64() else { return false; };
+    let Some(started) = prepared["prepared_at_ms"].as_u64() else { return Some("lease_metadata"); };
+    let Some(expires) = prepared["expires_at_ms"].as_u64() else { return Some("lease_metadata"); };
     if started > current || expires <= current || expires.saturating_sub(started) > 300_000
         || !matches!(prepared["preparation_stage"].as_str(), Some("review"|"fulfillment")) {
-        return false;
+        return Some("lease_expired");
     }
     let review = prepared["preparation_stage"] == "review";
-    if prepared["review_verified"].as_bool() != Some(review) || prepared["order_ready"].as_bool() != Some(review) { return false; }
-    let Some(authorized) = store_ids(&prepared["authorized_store_ids"]) else { return false; };
+    if prepared["review_verified"].as_bool() != Some(review) || prepared["order_ready"].as_bool() != Some(review) { return Some("preparation_stage"); }
+    let Some(authorized) = store_ids(&prepared["authorized_store_ids"]) else { return Some("store_scope"); };
     let config_path = scope_dir(root, account).join("checkout.json");
-    let Ok(raw) = fs::read(config_path) else { return false; };
-    if raw.len() > 262_144 { return false; }
+    let Ok(raw) = fs::read(config_path) else { return Some("config_unreadable"); };
+    if raw.len() > 262_144 { return Some("config_unreadable"); }
     let hash = format!("{:x}", Sha256::digest(&raw));
     if prepared["config_file_sha256"] != hash
         || prepared["config_fingerprint"].as_str().is_none_or(|hash| hash.len()!=64 || !hash.chars().all(|c| c.is_ascii_hexdigit())) {
-        return false;
+        return Some("config_changed");
     }
-    let Ok(config) = serde_json::from_slice::<Value>(&raw) else { return false; };
+    let Ok(config) = serde_json::from_slice::<Value>(&raw) else { return Some("config_unreadable"); };
+    let effective = prepared.get("effective_pickup_policy").unwrap_or(&config["pickup"]);
     if let Some(policy) = params.get("pickup_policy") {
         // Compare effective rules, not the template/override representation.
         // All legacy time rules now normalize to the same seven-day earliest slot.
-        for (field, default) in [("selection_mode", "fixed"), ("contact_mode", "local"), ("id_last4", "")] {
-            if policy.get(field).is_some_and(|value| value.as_str()!=Some(config["pickup"][field].as_str().unwrap_or(default))) { return false; }
+        if policy.get("selection_mode").is_some_and(|value|!matches!(value.as_str(),Some("fixed"|"priority"))) {return Some("selection_policy");}
+        for (field, default) in [("contact_mode", "local"), ("id_last4", "")] {
+            let source=if field=="id_last4" {&config["pickup"]}else{effective};
+            if policy.get(field).is_some_and(|value| value.as_str()!=Some(source[field].as_str().unwrap_or(default))) { return Some("contact_policy"); }
         }
     }
     let requested = if let Some(id) = params["pickup_store_id"].as_str() {
         Some(HashSet::from([id.to_owned()]))
     } else {
+        // A monitoring union is preparation capability, never the default
+        // authorization of a later manual or scheduled purchase.
         let policy = params.get("pickup_policy").unwrap_or(&config["pickup"]);
         if policy["selection_mode"].as_str().unwrap_or("fixed") == "priority" {
             policy["stores"].as_array().and_then(|stores|
@@ -86,18 +114,23 @@ fn matching_preparation(root: &Path, account: &str, task: &Task, params: &Value,
             let search = pickup["search"].as_str().map(str::trim).filter(|value| !value.is_empty());
             if pickup["selection_mode"].as_str().unwrap_or("fixed") != "fixed" || authorized.len()!=1
                 || name.is_none() || search.is_none() || policy.get("store_id").is_some() {
-                return false;
+                return Some("store_identity");
             }
             let same = |value: Option<&Value>, expected: Option<&str>| value.is_none_or(|value|
                 value.as_str().map(str::trim)==expected);
             if !same(policy.get("store_name"),name) || !same(policy.get("search"),search)
                 || !same(params.get("pickup_store_name"),name) || !same(params.get("pickup_location"),search) {
-                return false;
+                return Some("store_identity");
             }
             Some(authorized.clone())
         }
     };
-    requested.is_some_and(|requested| !requested.is_empty() && requested.is_subset(&authorized))
+    if requested.is_some_and(|requested| !requested.is_empty() && requested.is_subset(&authorized)) { None }
+    else { Some("store_scope") }
+}
+
+fn matching_preparation(root: &Path, account: &str, task: &Task, params: &Value, current: u64) -> bool {
+    preparation_miss_reason(root, account, task, params, current).is_none()
 }
 
 impl Engine {
@@ -105,13 +138,26 @@ impl Engine {
     /// worker/Session/Checkout, and is immediately no longer preemptible preheat.
     pub(crate) fn try_claim_prepared(&self, host: &TaskHost, account: &str, params: &Value,
         source_task: Option<&str>) -> Result<Option<String>, String> {
-        let Some(params) = effective_claim_params(params) else { return Ok(None); };
+        let Some(mut params) = effective_claim_params(params) else { return Ok(None); };
         let current = now_ms();
         let mut tasks = self.tasks.lock().unwrap();
         if tasks.values().any(|task| task.account_id==account && (task_has_unknown_submission(task)
-            || task.schedule.is_some() && !terminal(&task.status) && Some(task.id.as_str()) != source_task)) { return Ok(None); }
-        let Some(id) = tasks.values().filter(|task| Some(task.id.as_str()) != source_task)
-            .find(|task| matching_preparation(&self.root, account, task, &params, current)).map(|task| task.id.clone()) else { return Ok(None); };
+            || task.schedule.is_some() && !terminal(&task.status) && Some(task.id.as_str()) != source_task)) {
+            self.append_event("prepared_claim_missed", &json!({"account_id":account,"reasons":["account_execution_guard"]}));
+            return Ok(None);
+        }
+        let candidates: Vec<_> = tasks.values().filter(|task| task.account_id==account && Some(task.id.as_str()) != source_task && waiting_preparation(task)).collect();
+        let Some(id) = candidates.iter()
+            .find(|task| matching_preparation(&self.root, account, task, &params, current)).map(|task| task.id.clone()) else {
+            let reasons: HashSet<_> = candidates.iter().filter_map(|task| preparation_miss_reason(&self.root, account, task, &params, current)).collect();
+            self.append_event("prepared_claim_missed", &json!({"account_id":account,"reasons":if reasons.is_empty(){vec!["no_live_preparation"]}else{let mut reasons:Vec<_>=reasons.into_iter().collect();reasons.sort();reasons}}));
+            return Ok(None);
+        };
+        if params.get("pickup_policy").is_none() && params.get("pickup_store_id").is_none() {
+            let Some(policy)=default_claim_policy(&self.root,account) else{return Ok(None)};
+            // Explicitly replace the monitor union in the original worker.
+            params["pickup_policy"]=policy;
+        }
         let task = tasks.get_mut(&id).unwrap();
         let prompt = task.prompt.as_ref().unwrap();
         let request = prompt["id"].as_str().ok_or("自提准备缺少等待标识")?.to_owned();
@@ -217,7 +263,8 @@ if r['action']=='session_maintain':
   emit('cancelled',order_submitted=True);sys.exit(0)
 else:
  assert r['action']=='purchase'
-emit('result',result={'success':True,'status':'fixture_completed','pid':os.getpid(),'order_submitted':False})
+scope=reply['value']['params'].get('pickup_policy',{}) if r['action']=='session_maintain' else {}
+emit('result',result={'success':True,'status':'fixture_completed','pid':os.getpid(),'order_submitted':False,'claim_scope':{'mode':scope.get('selection_mode'),'store_id':scope.get('store_id'),'stores':[row.get('store_id') for row in scope.get('stores',[])]}})
 "#).unwrap();
         let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let python = project.join(if cfg!(windows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" });
@@ -234,6 +281,37 @@ emit('result',result={'success':True,'status':'fixture_completed','pid':os.getpi
     }
 
     fn purchase() -> Value { json!({"sku":"MK2P4CH","quantity":1,"fulfillment":"RETAIL","concurrency":1,"retry_count":0}) }
+
+    #[tokio::test]
+    async fn monitor_union_never_expands_default_manual_or_scheduled_scope() {
+        for source in ["manual","scheduled","queue"] {
+            let (_root,engine,host,account)=fixture();
+            let prepared=engine.start(host.clone(),account.clone(),"session_maintain".into(),json!({})).unwrap();
+            wait(&engine,&prepared,true).await;
+            {
+                let mut tasks=engine.tasks.lock().unwrap();
+                let meta=&mut tasks.get_mut(&prepared).unwrap().prompt.as_mut().unwrap()["prepared"];
+                meta["authorized_store_ids"]=json!(["R001","R002"]);
+                meta["effective_pickup_policy"]=json!({"selection_mode":"priority","contact_mode":"local","stores":[{"store_id":"R001"},{"store_id":"R002"}]});
+            }
+            let mut params=purchase();
+            let target=if source=="queue" {
+                params["pickup_store_id"]=json!("R002");
+                params["pickup_policy"]=json!({"selection_mode":"priority","contact_mode":"local","stores":[{"store_id":"R002"}]});
+                params["queue_job_id"]=json!("queue-fixture");params["queue_assignment"]=json!(1);
+                engine.try_claim_prepared(&host,&account,&json!({"queue_stream":true,"queue_targets":[params]}),None).unwrap().unwrap()
+            }else{
+                if source=="scheduled"{params["scheduled_at"]=json!(now_ms()+1200);}
+                engine.start(host.clone(),account.clone(),"purchase".into(),params).unwrap()
+            };
+            wait(&engine,&target,false).await;
+            let tasks=engine.tasks.lock().unwrap();
+            let task=&tasks[&prepared];assert_eq!(task.status,"succeeded","{}",task.stage);
+            let scope=&task.result.as_ref().unwrap()["claim_scope"];
+            if source=="queue"{assert_eq!(scope["stores"],json!(["R002"]));}
+            else{assert_eq!(scope["mode"],"fixed");assert_eq!(scope["store_id"],"R001");assert_eq!(scope["stores"],json!([]));}
+        }
+    }
 
     #[tokio::test]
     async fn manual_and_scheduled_purchase_claim_same_live_worker_without_cancellation() {
@@ -325,6 +403,17 @@ emit('result',result={'success':True,'status':'fixture_completed','pid':os.getpi
         assert!(matching_preparation(&engine.root,&account,&before,&equivalent,now_ms()));
         equivalent["pickup_policy"]["contact_mode"] = json!("official");
         assert!(!matching_preparation(&engine.root,&account,&before,&equivalent,now_ms()));
+        let mut monitored=before.clone();
+        monitored.prompt.as_mut().unwrap()["prepared"]["authorized_store_ids"]=json!(["R001","R002"]);
+        monitored.prompt.as_mut().unwrap()["prepared"]["effective_pickup_policy"]=json!({"selection_mode":"priority","contact_mode":"official","stores":[{"store_id":"R001"},{"store_id":"R002"}]});
+        equivalent["pickup_store_id"]=json!("R002");
+        equivalent["pickup_policy"]=json!({"selection_mode":"fixed","contact_mode":"official","store_id":"R002"});
+        assert!(matching_preparation(&engine.root,&account,&monitored,&equivalent,now_ms()));
+        equivalent["pickup_policy"]["id_last4"]=json!("5678");
+        assert_eq!(preparation_miss_reason(&engine.root,&account,&monitored,&equivalent,now_ms()),Some("contact_policy"));
+        equivalent["pickup_policy"].as_object_mut().unwrap().remove("id_last4");
+        equivalent["pickup_store_id"]=json!("R003");
+        assert_eq!(preparation_miss_reason(&engine.root,&account,&monitored,&equivalent,now_ms()),Some("store_scope"));
         let mut unknown = before.clone();
         unknown.id = "unknown-fixture".into(); unknown.status = "interrupted".into(); unknown.order_submitted = true; unknown.result = None;
         engine.tasks.lock().unwrap().insert(unknown.id.clone(),unknown);

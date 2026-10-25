@@ -47,7 +47,7 @@ class MonitorCheckoutTests(TestCase):
                 'concurrency': 1, 'pickup_store_id': 'R580', 'pickup_store_name': '测试门店',
                 'pickup_location': '成都'})
         self.assertEqual(seen[0]['pickup'], {'search': '成都', 'store_name': '测试门店',
-            'store_id': 'R580', 'id_last4': '1234'})
+            'store_id': 'R580', 'id_last4': '1234', 'selection_mode': 'fixed'})
         self.assertEqual(seen[0]['contact'], self.config['contact'])
         self.assertEqual(self.service.checkout.read_bytes(), original)
         self.service.run('address_read', {})
@@ -78,6 +78,11 @@ class MonitorCheckoutTests(TestCase):
         with self.assertRaisesRegex(ValueError, '门店编号'):
             self.service.confirm(details)
         details['store_id'] = 'R581'
+        with self.assertRaisesRegex(ValueError, '取货联系人'):
+            self.service.confirm(details)
+        # This unit isolates the store admission guard. The actual Review
+        # parser's accepted-contact proof is exercised by pickup integration.
+        self.service.pickup_contact_review_verified = True
         self.assertTrue(self.service.confirm(details))
 
     def test_parallel_child_cannot_start_another_browser_login(self):

@@ -259,6 +259,8 @@ def run_parent_serial(context, target):
                          vault=context.parent_service.vault)
         parent = context.parent_service
         nested._purchase_session_owner = parent
+        nested._identity_proof_key = getattr(parent, '_identity_proof_key', None)
+        nested._live_checkout_owner = parent
         password = getattr(parent, 'password', None)
         nested.password = password if isinstance(password, str) else None
         nested.remember = getattr(parent, 'remember', False) is True
@@ -580,6 +582,7 @@ class QueuedCheckout:
         self.channel.emit('stage', message='本次官网自动会话恢复未完成，当前队列目标已结束。')
 
     def run(self):
+        self.service._live_checkout_enabled = True
         self.channel.checkpoint()
         self._add(self.initial)
         try:
@@ -636,6 +639,10 @@ class QueuedCheckout:
                     self._finish(identity, {'status': 'submission_unknown' if job['started'] else 'cancelled',
                                             'success': False, 'started': job['started'],
                                             'order_submitted': job['started'], 'retryable': False})
+            # No in-memory checkout may outlive the account execution owner.
+            from live_checkout import discard
+            discard(self.service)
+            self.service._live_checkout_enabled = False
 
     @staticmethod
     def _preparation_error(error):

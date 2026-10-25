@@ -10,7 +10,7 @@ log = logging.getLogger('duo_killer')
 STEPS = {
     '送货': ('Fulfillment', ('Shipping', 'Billing', 'Review'), 'fulfillment', 'continueFromFulfillmentToShipping'),
     '自提': ('Fulfillment', ('PickupContact', 'Billing', 'Review'), 'fulfillment', 'continueFromFulfillmentToPickupContact'),
-    '取货联系人': ('PickupContact', ('Billing', 'Review'), 'pickupContact', 'continueFromPickupContactToBilling'),
+    '取货联系人': ('PickupContact', ('Shipping', 'Billing', 'Review'), 'pickupContact', 'continueFromPickupContactToBilling'),
     '地址': ('Shipping', ('Billing', 'Review'), 'shipping', 'continueFromShippingToBilling'),
     '支付方式': ('Billing', ('Review',), 'billing', 'continueFromBillingToReview'),
 }
@@ -55,6 +55,10 @@ def recover_step(flow, label, operation):
                     node = checkout.get('pickupContact' if current == 'PickupContact' else current.lower())
                     if not isinstance(node, dict):
                         raise ValueError(f'{label}恢复页面状态不完整；已停止，未重试。') from error
+                    if label == '取货联系人':
+                        from checkout_options import confirm_pickup_contact_submission
+                        if not confirm_pickup_contact_submission(flow, fresh=True):
+                            raise ValueError('官网已推进结算，但未能确认本次取货联系人受理依据；未重复发送表单。') from error
                     log.info('[结算恢复] %s已完成，官网当前步骤=%s，跳过重复提交。', label, current)
                     return
                 if current != source:

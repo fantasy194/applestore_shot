@@ -121,6 +121,8 @@ def request_get(session, stage, url, method="GET", **kwargs):
     requested_url = requests.Request(method, url, params=kwargs.get("params")).prepare().url
     log.info("[%s] 开始 %s %s", stage, method, safe_url(requested_url))
     started = perf_counter()
+    from purchase_identity import begin_session_request, complete_session_request, invalidate_identity
+    identity_request = begin_session_request(session, requested_url)
     try:
         with waiting(stage):
             from checkout_retry import request as retry_request
@@ -130,6 +132,7 @@ def request_get(session, stage, url, method="GET", **kwargs):
             )) or (method.upper() == 'POST' and stage == 'checkStatus')
             response = retry_request(session, method, url, read_only=read_only, stage=stage, **kwargs)
     except requests.RequestException as error:
+        invalidate_identity(session=session)
         log.error("[%s] %.2fs 网络异常：%s", stage, perf_counter() - started, type(error).__name__)
         raise
     for reply in [*response.history, response]:
@@ -172,6 +175,7 @@ def request_get(session, stage, url, method="GET", **kwargs):
                         stage, headers_time, max(0, total_time - headers_time))
     log.info("[%s] 完成，耗时 %.2fs，跳转 %s 次", stage, total_time, len(response.history))
     remove_imported_cookie_duplicates(session)
+    complete_session_request(session, response, identity_request)
     return response
 
 
@@ -257,6 +261,8 @@ def save_auth(session, *, auth_path=None):
         raise ValueError(f"{destination} 必须是 JSON 对象，未覆盖原文件。")
     data = {**existing, **data}  # 保留账号、密码、设备信任及其他配置。
     write_private_json(destination, data)
+    from purchase_identity import advance_session_identity
+    advance_session_identity(session, auth_path=destination)
 
 
 def load_auth(session, data):
@@ -280,6 +286,9 @@ def load_auth(session, data):
              **({"HttpOnly": None} if c.get("httpOnly") is True else {}),
              **({"SameSite": c["sameSite"]} if c.get("sameSite") in ("Strict", "Lax", "None") else {})}, False))
     remove_imported_cookie_duplicates(session)
+
+    from purchase_identity import attach_session_identity
+    attach_session_identity(session, data)
 
 
 def ensure_auth_file():
@@ -475,6 +484,8 @@ def account_info(session, *, reauthenticate=True):
     flow = Checkout(session)
     flow.page("https://secure.www.apple.com.cn/shop/account/home", "读取账户")
     if "signIn" in flow.model or urlsplit(flow.url).path.startswith("/shop/signIn"):
+        from purchase_identity import invalidate_identity
+        invalidate_identity(service=interaction.handler, session=session)
         if not reauthenticate:
             return {"success": True, "logged_in": False, "scope": "account",
                     "reauthentication_required": True}
@@ -505,9 +516,12 @@ def account_info(session, *, reauthenticate=True):
         apple_id = field(flow.model, "home.devices.d.appleID")
     if not isinstance(apple_id, str) or not apple_id:
         raise ValueError("账户已打开，但未取得 Apple ID 信息。")
-    return {"success": True, "logged_in": True, "scope": "account",
+    result = {"success": True, "logged_in": True, "scope": "account",
             "name": field(flow.model, "home.d.firstName"), "apple_id": apple_id,
             "email": apple_id if "@" in apple_id else None}
+    from purchase_identity import record_verified_identity
+    record_verified_identity(interaction.handler, result, session=session)
+    return result
 
 
 def order_list(session, *, fresh=False):
@@ -818,6 +832,8 @@ class Checkout:
         headers = {**self.headers, "Accept": "*/*", "Content-Type": "application/x-www-form-urlencoded",
                    "Origin": urlunsplit((*urlsplit(self.url)[:2], "", "", "")),
                    "Referer": self.url, "X-Requested-With": "Fetch"}
+        if name.startswith('continueFrom'):
+            self._continuation_attempted = True
         response = request_get(self.session, name, self.apple_url(url), method="POST",
                                data=data or {}, headers=headers, allow_redirects=False)
         if response.status_code != 200:
@@ -968,6 +984,8 @@ def _checkout_browser_recovery(flow, handler, expected):
 def reauthenticate_checkout(flow, *, expected=None):
     if not urlsplit(flow.url).path.startswith("/shop/signIn"):
         return False
+    from purchase_identity import invalidate_identity
+    invalidate_identity(service=interaction.handler, session=flow.session)
     from apple_login import AppleStoreLogin, LoginError, load_credentials, recoverable_password_rejection
     if (getattr(flow, '_browser_authentication_recovery_attempted', False) is True
             or getattr(flow, '_http_authx_rejected', False) is True
@@ -1201,18 +1219,17 @@ def confirm_order(model, *, fresh_model=None):
         if getattr(handler, 'fulfillment_mode', 'HOME') == 'RETAIL':
             from checkout_options import read_config
             pickup = read_config(ROOT / 'checkout.json').get('pickup', {})
-            if pickup.get('selection_mode') == 'priority' or pickup.get('contact_mode') == 'official':
-                from pickup_options import verify_contact_review, official_review_proof
-                if not getattr(handler, 'pickup_contact_accepted', False) and pickup.get('contact_mode') == 'official':
-                    proof = official_review_proof(fresh_model)
-                    if proof:
-                        handler.pickup_contact_proof = proof
-                        handler.pickup_contact_accepted = True
-                if not getattr(handler, 'pickup_contact_accepted', False):
-                    raise ValueError('尚未取得官网确认的取货联系人，未提交订单。')
-                verify_contact_review(model, getattr(handler, 'pickup_contact_proof', None),
-                                      getattr(handler, 'pickup_identity_proof', None))
-                handler.pickup_contact_review_verified = True
+            from pickup_options import verify_contact_review, official_review_proof
+            if not getattr(handler, 'pickup_contact_accepted', False) and pickup.get('contact_mode') == 'official':
+                proof = official_review_proof(fresh_model)
+                if proof:
+                    handler.pickup_contact_proof = proof
+                    handler.pickup_contact_accepted = True
+            if not getattr(handler, 'pickup_contact_accepted', False):
+                raise ValueError('尚未取得官网确认的取货联系人，未提交订单。')
+            verify_contact_review(model, getattr(handler, 'pickup_contact_proof', None),
+                                  getattr(handler, 'pickup_identity_proof', None))
+            handler.pickup_contact_review_verified = True
         details = {"items": [{"name": order_text(field(item, "d.name") or field(item, "d.productName") or field(item, "d.sku")),
                               "sku": field(item, "d.sku"), "quantity": int(field(item, "itemQuantity.d.quantity")),
                               "subtotal": order_price(field(item, "d.totalPrice"))}
@@ -1385,9 +1402,12 @@ def continue_checkout(flow, expected, *, prepare_only=False):
                     'config_hash': checkout_config_hash(ROOT / 'checkout.json'), 'created_at': time()})
             interaction.handler.pickup_selected = None
             interaction.handler.pickup_slot_selected = None
+            from checkout_options import prepare_checkout_details
+            prepared_details = prepare_checkout_details(flow, ROOT / 'checkout.json', AUTH_PATH)
             result = {'success': True, 'status': 'waiting_stock', 'preparation_stage': 'fulfillment',
                       'review_verified': False, 'order_ready': False, 'blocked_reason': 'pickup_unavailable',
                       'message': '账号、购物袋及结算会话已准备；官网当前无可用自提门店或符合规则的时段。等待库存后重新选择门店与时段，未创建订单。'}
+            result['checkout_details_prepared'] = prepared_details
             log.info('[自提准备] 已保留结算阶段，等待库存；官网原因：%s', error)
             if getattr(interaction.handler, 'keep_prepared_pickup', False) is True:
                 return resume_prepared_pickup(flow, expected, result)
@@ -1489,6 +1509,7 @@ def pay_review(flow, expected, *, prepare_only=False):
                   'review_verified': True, 'order_ready': True,
                   "message": "准备完成，未创建订单。点击立即下单时重新读取官网确认页，核对后提交；会话或库存变化可能需要重新准备。"}
         prepared_details = getattr(interaction.handler, 'order_details', None) or {}
+        result['checkout_details_prepared'] = checkout_details_status(flow, ROOT / 'checkout.json', confirmed=True)
         result.update(pickup_store=prepared_details.get('store', ''),
                       pickup_store_id=prepared_details.get('store_id'),
                       pickup_time_slot=deepcopy(prepared_details.get('pickup_time_slot')))
@@ -1532,21 +1553,25 @@ def resume_prepared_pickup(flow, expected, result):
         raise ValueError('当前任务不能保留自提准备会话；未提交订单。')
     config = ROOT / 'checkout.json'
     config_hash = checkout_config_hash(config)
+    flow._prepared_config_file_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
     original_pickup = deepcopy(read_config(config).get('pickup', {}))
     approved_details = deepcopy(getattr(handler, 'order_details', None) or {})
     review_verified = result.get('review_verified') is True
     had_slot = bool(getattr(handler, 'pickup_slot_selected', None))
-    started = perf_counter()
     # Save issued cookies before waiting; the live Session/Checkout and current
     # run's selected store remain in memory and are never restored on restart.
     save_auth(flow.session)
     try:
-        if not handler.wait_prepared_pickup(result, timeout=300):
+        while True:
+            started = perf_counter()
+            if handler.wait_prepared_pickup(result, timeout=300):
+                break
             if getattr(handler, 'prepared_handoff_unavailable', False) is True:
                 return result
-            expired = getattr(handler, 'prepared_expired', False) is True
-            return {'success': True, 'status': 'preparation_expired' if expired else 'preparation_ended',
-                    'order_submitted': False, 'message': '自提准备已到期，未创建订单。' if expired else '已结束自提准备，未创建订单。'}
+            if getattr(handler, 'prepared_expired', False) is not True:
+                return {'success': True, 'status': 'preparation_ended', 'order_submitted': False,
+                        'message': '已结束自提准备，未创建订单。'}
+            result = renew_prepared_pickup(flow, expected, result, config, config_hash)
         if perf_counter() - started >= 300:
             raise ValueError('自提准备已超过五分钟，请重新准备；未提交订单。')
         claim_hash = getattr(handler, 'prepared_claim_config_hash', None)
@@ -1563,10 +1588,107 @@ def resume_prepared_pickup(flow, expected, result):
             return _resume_prepared_checkout(flow, expected, approved_details, review_verified,
                                              had_slot, config, accepted_hash, pickup)
         executor = getattr(handler, 'execute_prepared_purchase', None)
-        return executor(execute) if callable(executor) else execute()
+        try:
+            return executor(execute, prepared_flow=flow) if callable(executor) else execute()
+        except Exception as error:
+            continuation = getattr(handler, 'continue_prepared_queue', None)
+            if callable(continuation):
+                return continuation(flow, expected, error)
+            raise
     finally:
         handler.prepared_order = None
         (ROOT / 'prepared_checkout.json').unlink(missing_ok=True)
+
+
+def renew_prepared_pickup(flow, expected, previous, config, config_hash):
+    """Renew only the waiting lease, without authentication, forms or purchase."""
+    handler = interaction.handler
+    handler.channel.checkpoint()
+    handler.validate_preparation_scope()
+    raw_hash = getattr(flow, '_prepared_config_file_sha256', None)
+    if (getattr(handler, 'submitted', False) is True or checkout_config_hash(config) != config_hash
+            or isinstance(raw_hash, str) and hashlib.sha256(config.read_bytes()).hexdigest() != raw_hash):
+        raise ValueError('自提准备配置或提交状态已变化，已结束等待；未自动下单。')
+    flow.page(flow.apple_url('/shop/checkout'), '续期核对原自提结算', fresh=True)
+    if urlsplit(flow.url).path.startswith('/shop/signIn'):
+        raise ValueError('官网要求重新认证，已结束本次准备续期；未自动重试登录或下单。')
+    page = field(flow.current_response_body, 'checkout.d.page')
+    if page not in ('Fulfillment', 'PickupContact', 'Shipping', 'Billing', 'Review'):
+        raise ValueError('官网未返回可核验的原自提结算步骤，已结束准备续期。')
+    verify_prepared_physical_items(flow, expected)
+    handler.channel.checkpoint()
+    if (checkout_config_hash(config) != config_hash
+            or isinstance(raw_hash, str) and hashlib.sha256(config.read_bytes()).hexdigest() != raw_hash):
+        raise ValueError('自提配置已变化，已结束准备续期；未自动下单。')
+    handler.validate_preparation_scope()
+    save_auth(flow.session)
+    log.info('[自提准备] 原会话只读核验完成，续期等待购买；当前步骤=%s，未加购或提交。', page)
+    ready = page == 'Review' and prepared_review_ready(flow.current_response_body, expected, config)
+    renewed = {**previous, 'status': 'prepared' if ready else 'waiting_stock',
+            'preparation_stage': 'review' if ready else 'fulfillment',
+            'review_verified': ready, 'order_ready': ready,
+            'order_submitted': False,
+            'message': '原结算已刷新，继续等待购买。' if ready else '原会话已刷新并保留，购买时继续核对门店、时段与联系人。'}
+    renewed['checkout_details_prepared'] = checkout_details_status(flow, config)
+    return renewed
+
+
+def checkout_details_status(flow, config, *, confirmed=False):
+    """Public readiness metadata from this confirmation/current response only."""
+    from checkout_options import read_config, local_address_ready
+    from pickup_options import (normalize_contact_value, prepared_contact_review_proof,
+                                prepared_pickup_store_confirmed)
+    handler = interaction.handler
+    settings = read_config(config)
+    body = flow.model if confirmed else flow.current_response_body
+    page = field(body, 'checkout.d.page')
+    proof = getattr(handler, 'pickup_contact_proof', None)
+    contact_accepted = (confirmed and getattr(handler, 'pickup_contact_review_verified', False) is True
+                        or page == 'Review' and bool(prepared_contact_review_proof(body, proof)))
+    details = getattr(handler, 'order_details', None)
+    pure_pickup = (confirmed and isinstance(details, dict) and details.get('contains_delivery') is False
+                   and bool(details.get('store')) and not details.get('address'))
+    if not confirmed and page == 'Review' and isinstance(details, dict):
+        pure_pickup = prepared_pickup_store_confirmed(body, details)
+    return {'stage': page if page in ('Fulfillment','PickupContact','Shipping','Billing','Review') else 'unknown',
+            'status': 'details_accepted' if contact_accepted else 'waiting_stock' if page == 'Fulfillment' else 'unchanged',
+            'local_contact_ready': all(normalize_contact_value(key, settings.get('contact', {}).get(key)) is not None
+                for key in ('firstName','lastName','emailAddress','fullDaytimePhone')),
+            'local_address_ready': local_address_ready(settings), 'contact_accepted': bool(contact_accepted),
+            'address_accepted': False, 'address_required': not pure_pickup}
+
+
+def prepared_review_ready(body, expected, config):
+    """Read-only readiness proof; never invoke confirmation or send a form."""
+    from decimal import Decimal
+    from checkout_options import read_config
+    from pickup_options import (prepared_pickup_store_confirmed, prepared_pickup_slot_confirmed,
+                                prepared_contact_review_proof)
+    handler = interaction.handler
+    approved = getattr(handler, 'order_details', None)
+    review = field(body, 'checkout.review')
+    if (field(body, 'checkout.d.page') != 'Review' or not isinstance(review, dict)
+            or not isinstance(approved, dict)
+            or checkout_physical_items(review.get('fulfillmentReview', {})) != expected
+            or field(review, 'billingReview.alipayReview.d.alipayLabel') != 'ALIPAY'
+            or field(review, 'placeOrder.d.enableContinue') is not True
+            or selected_applecare(review.get('fulfillmentReview', {}))
+            or not prepared_pickup_store_confirmed(body, approved)):
+        return False
+    if approved.get('pickup_time_slot') and not prepared_pickup_slot_confirmed(body, approved):
+        return False
+    proof = getattr(handler, 'pickup_contact_proof', None)
+    if not (proof and prepared_contact_review_proof(body, proof)
+            or prepared_pickup_contact_confirmed(body, read_config(config))):
+        return False
+    summary = field(review, 'summary.d', {})
+    total = (summary.get('totalAfterTradeIn') if summary.get('showTotalAfterTradeinAsTotal')
+             else field(summary, 'installmentTotal.value') or summary.get('total'))
+    def amount(value):
+        matched = re.fullmatch(r'(?:RMB|CNY|CN¥|¥|￥)?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元|RMB|CNY)?', order_price(value))
+        return Decimal(matched[1].replace(',', '')) if matched else None
+    actual, previous = amount(total), amount(approved.get('total'))
+    return actual is not None and previous is not None and actual > 0 and actual == previous
 
 
 def _resume_prepared_checkout(flow, expected, approved_details, review_verified, had_slot,
@@ -1574,7 +1696,7 @@ def _resume_prepared_checkout(flow, expected, approved_details, review_verified,
     """Resume the original Checkout; never rebuild its bag to regain evidence."""
     handler = interaction.handler
     from checkout_options import read_config
-    from pickup_options import allowed_store, fresh_pickup_context, fresh_pickup_slot_payload
+    from pickup_options import allowed_store, fresh_pickup_context, fresh_pickup_slot_payload, prepared_pickup_slot_confirmed
     timing = getattr(handler, 'prepared_purchase_timing', None)
     if callable(timing):
         timing('revalidation_started')
@@ -1589,7 +1711,7 @@ def _resume_prepared_checkout(flow, expected, approved_details, review_verified,
     if same_store and pickup.get('selection_mode') == 'priority':
         same_store = allowed_store(pickup['stores'][0], approved_details.get('store'), approved_details.get('store_id'))
     force_selection = not same_store
-    if had_slot and same_store:
+    if had_slot and same_store and not prepared_pickup_slot_confirmed(flow.current_response_body, approved_details):
         context = fresh_pickup_context(flow, {'store_name': approved_details.get('store'),
                                               'store_id': approved_details.get('store_id')})
         slots = fresh_pickup_slot_payload(context, pickup.get('time_slot_rule')) if context else None
@@ -1619,12 +1741,20 @@ def _resume_prepared_checkout(flow, expected, approved_details, review_verified,
     # Retain same-store authority only when this fresh response proves it;
     # other authorized stores return to fulfillment in this exact Checkout.
     store_confirmed = False if force_selection else prepared_pickup_store_confirmed(flow.current_response_body, approved_details)
-    contact_confirmed = prepared_pickup_contact_confirmed(flow.current_response_body, read_config(config))
+    from pickup_options import prepared_contact_review_proof
+    accepted_proof = getattr(handler, 'pickup_contact_proof', None)
+    current_proof = prepared_contact_review_proof(flow.current_response_body, accepted_proof) if accepted_proof else None
+    contact_confirmed = bool(current_proof) or prepared_pickup_contact_confirmed(flow.current_response_body, read_config(config))
+    if current_proof:
+        handler.pickup_contact_proof = current_proof
+        handler.pickup_contact_accepted = True
     if not has_review:
         # A partial preparation has no Review authority. Its live current
         # physical items must still match before continuing fulfillment.
-        if current_page not in ('Fulfillment', 'PickupContact', 'Billing'):
+        if current_page not in ('Fulfillment', 'PickupContact', 'Shipping', 'Billing'):
             raise ValueError('官网未返回可继续的原自提结算步骤；未提交订单。')
+        if current_page != 'Fulfillment':
+            store_confirmed = current_pickup_store_confirmed(flow.current_response_body, pickup)
         if current_page != 'Fulfillment' and not store_confirmed:
             raise ValueError('官网未确认本次授权门店，无法继续原自提结算；未提交订单。')
     elif not store_confirmed or not contact_confirmed:
@@ -1651,6 +1781,16 @@ def _resume_prepared_checkout(flow, expected, approved_details, review_verified,
     if callable(timing):
         timing('revalidation_completed')
     return continue_checkout(flow, expected)
+
+
+def current_pickup_store_confirmed(body, pickup):
+    """A current non-Review checkout must name its authorized store explicitly."""
+    from pickup_options import allowed_store
+    actual = field(body, 'checkout.companionBar.orderDetails.fulfillmentCompanionBar.pickupSummary.d')
+    if not isinstance(actual, dict):
+        return False
+    name, store_id = actual.get('store_name') or actual.get('storeName'), actual.get('storeId')
+    return bool(isinstance(name, str) and isinstance(store_id, str) and allowed_store(pickup, name, store_id))
 
 
 def prepared_pickup_contact_confirmed(model, config):
@@ -1795,11 +1935,23 @@ def purchase_sku(part, sms=False, quantity=1, *, prepare_only=False):
     if type(quantity) is not int or quantity < 1:
         raise ValueError("加购数量必须是正整数。")
     ensure_auth_file()
-    with requests.Session() as session:
-        load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
-        refreshed = ensure_strong_login(session, sms=sms)
+    from live_checkout import purchase_flow, retain_unavailable
+    raw_config_hash = hashlib.sha256((ROOT / 'checkout.json').read_bytes()).hexdigest() if (ROOT / 'checkout.json').exists() else ''
+    with purchase_flow(interaction.handler, (part, quantity), raw_config_hash) as (session, retained_flow):
+        if retained_flow is None:
+            load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
+            refreshed = ensure_strong_login(session, sms=sms)
+        flow = retained_flow
         try:
-            flow = Checkout(session)
+            flow = retained_flow or Checkout(session)
+            if retained_flow is not None:
+                log.info('[继续结算] 使用同账号前一已失败分配保留的原会话，仅执行本次新授权目标。')
+                flow.page(flow.apple_url('/shop/checkout'), '新队列分配核对原自提结算', fresh=True)
+                reauthenticate_checkout(flow, expected=[(part, quantity)])
+                verify_prepared_physical_items(flow, [(part, quantity)])
+                if field(flow.current_response_body, 'checkout.d.page') != 'Fulfillment':
+                    raise ValueError('原自提结算已离开可重新选择门店的步骤；未加购或提交订单。')
+                return continue_checkout(flow, [(part, quantity)], prepare_only=prepare_only)
             checkpoint = ROOT / "prepared_checkout.json"
             config = ROOT / "checkout.json"
             config_hash = checkout_config_hash(config)
@@ -1868,8 +2020,13 @@ def purchase_sku(part, sms=False, quantity=1, *, prepare_only=False):
             if prepare_only:
                 return pay_bag(flow=flow, prepare_only=True)
             return pay_bag(flow=flow)
+        except Exception as error:
+            if retain_unavailable(interaction.handler, flow, (part, quantity), raw_config_hash, error):
+                log.info('[继续结算] 当前分配已失败，保留尚未继续的原自提结算供下一新授权目标核验。')
+            raise
         finally:
-            save_auth(session)
+            if getattr(flow, '_session_persistence_transferred', False) is not True:
+                save_auth(session)
 
 
 def wait_for_order_query():

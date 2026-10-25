@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 import requests
@@ -314,11 +315,20 @@ def pickup_contact(flow, config, config_path):
                    for key in ('pickup_policy_override', 'pickup_override')):
             save_config(config_path, config)
         payload.update({address + '.' + key: val for key, val in details.items()})
+        if interaction.handler is not None:
+            interaction.handler.pickup_contact_proof = {key: {'value': val} for key, val in details.items()}
     payload.update(invoice_data(flow, path))
     actions = flow.require(path).get('a', {})
     action = next((a for a in ('continueFromPickupContactToShipping', 'continueFromPickupContactToBilling') if a in actions), None)
     if not action:
         raise ValueError('当前取货联系人页面没有支持的继续操作。')
+    if interaction.handler is not None:
+        interaction.handler.pickup_contact_accepted = False
+        flow._pending_pickup_contact_submission = {
+            'handler': interaction.handler, 'source_page': value(flow.model, 'checkout.d.page'), 'action': action,
+            'store': deepcopy(getattr(interaction.handler, 'pickup_selected', None)),
+            'proof': deepcopy(getattr(interaction.handler, 'pickup_contact_proof', None)),
+            'payload': {key: val for key, val in payload.items() if key.startswith(address + '.')}}
     flow.action(path, action, payload)
     expected = 'Shipping' if action.endswith('Shipping') else 'Billing'
     if value(flow.model, 'checkout.d.page') != expected:
@@ -331,16 +341,93 @@ def pickup_contact(flow, config, config_path):
             raise ValueError('取货联系人未通过服务端校验：' + (error or '官网仍停留在联系人步骤，请核对页面提示')
                              + '；未继续结账，不重复发送联系人表单。')
     flow.require('checkout.shipping' if action.endswith('Shipping') else 'checkout.billing')
-    if interaction.handler is not None:
-        handler = interaction.handler
-        handler.pickup_contact_accepted = True
-        for key, record in (getattr(handler, 'pickup_contact_proof', None) or {}).items():
-            # Only fields actually sent in this form gain provenance for a
-            # later redacted Review display. HTTP success alone is insufficient:
-            # the next page and expected section were confirmed above.
-            if (isinstance(record, dict) and isinstance(record.get('value'), str)
-                    and payload.get(address + '.' + key) == record['value']):
-                record['server_accepted'] = True
+    confirm_pickup_contact_submission(flow)
+
+
+def confirm_pickup_contact_submission(flow, *, fresh=False):
+    """Finalize only this flow's actual form after an official step advance.
+
+    Recovery calls with fresh=True after its GET; no POST is performed here.
+    Private pending fields never become UI state or persistent contact proof.
+    """
+    handler = interaction.handler
+    pending = getattr(flow, '_pending_pickup_contact_submission', None)
+    if (handler is None or not isinstance(pending, dict) or pending.get('handler') is not handler
+            or pending.get('source_page') != 'PickupContact'
+            or pending.get('store') != getattr(handler, 'pickup_selected', None)):
+        return False
+    page = value(flow.model, 'checkout.d.page')
+    allowed = (('Shipping', 'Billing', 'Review') if pending.get('action') == 'continueFromPickupContactToShipping'
+               else ('Billing', 'Review') if pending.get('action') == 'continueFromPickupContactToBilling' else ())
+    if page not in allowed or not isinstance(value(flow.model, 'checkout.' + page.lower()), dict):
+        return False
+    if fresh and value(flow.current_response_body, 'checkout.d.page') != page:
+        return False
+    proof = getattr(handler, 'pickup_contact_proof', None)
+    if not isinstance(proof, dict) or not proof or proof != pending.get('proof'):
+        return False
+    prefix = 'checkout.pickupContact.selfPickupContact.selfContact.address.'
+    for key, record in proof.items():
+        if not isinstance(record, dict):
+            return False
+        if isinstance(record.get('value'), str):
+            if pending['payload'].get(prefix + key) != record['value']:
+                return False
+        elif record.get('bound') is not True or not isinstance(record.get('masked'), str):
+            return False
+    for record in proof.values():
+        record['server_accepted'] = True
+    handler.pickup_contact_accepted = True
+    del flow._pending_pickup_contact_submission
+    return True
+
+
+def prepare_checkout_details(flow, config_path, auth_path=None):
+    """Advance only actual current contact/address forms; never select inventory.
+
+    Fulfillment may expose no legal route to contact before stock is available.
+    Local completeness is then reported separately from official acceptance.
+    Billing/Review are retained and no payment or order action is called here.
+    """
+    from pickup_options import normalize_contact_value, prepared_contact_review_proof
+    config = read_config(config_path)
+    local_contact = all(normalize_contact_value(key, config.get('contact', {}).get(key)) is not None
+                        for key in ('firstName', 'lastName', 'emailAddress', 'fullDaytimePhone'))
+    accepted_contact = accepted_address = False
+    for _ in range(2):
+        page = value(flow.current_response_body, 'checkout.d.page')
+        if page not in ('PickupContact', 'Shipping'):
+            break
+        if value(flow.model, 'checkout.d.page') != page:
+            break
+        section = 'checkout.' + ('pickupContact' if page == 'PickupContact' else 'shipping')
+        names = (('continueFromPickupContactToShipping', 'continueFromPickupContactToBilling')
+                 if page == 'PickupContact' else ('continueFromShippingToBilling',))
+        # The merged model must expose the very action supplied by this response.
+        action = next((name for name in names
+                       if isinstance(value(flow.current_response_body, section + '.a.' + name + '.url'), str)
+                       and value(flow.current_response_body, section + '.a.' + name + '.url')
+                       and value(flow.current_response_body, section + '.a.' + name + '.url')
+                       == value(flow.model, section + '.a.' + name + '.url')), None)
+        if action is None:
+            break
+        if next((name for name in names if name in value(flow.model, section + '.a', {})), None) != action:
+            break
+        if page == 'PickupContact':
+            pickup_contact(flow, config, config_path)
+            accepted_contact = True
+        else:
+            shipping(flow, config_path, auth_path)
+            accepted_address = True
+    stage = value(flow.model, 'checkout.d.page')
+    if stage == 'Review':
+        proof = getattr(interaction.handler, 'pickup_contact_proof', None)
+        accepted_contact = prepared_contact_review_proof(flow.current_response_body, proof) is not None
+    return {'status': 'waiting_stock' if stage == 'Fulfillment' else 'details_accepted'
+            if accepted_contact or accepted_address else 'unchanged',
+            'stage': stage if stage in ('Fulfillment', 'PickupContact', 'Shipping', 'Billing', 'Review') else 'unknown',
+            'local_contact_ready': local_contact, 'local_address_ready': local_address_ready(config),
+            'contact_accepted': accepted_contact, 'address_accepted': accepted_address}
 
 
 def priority_fulfillment(flow, config, config_path, payload):

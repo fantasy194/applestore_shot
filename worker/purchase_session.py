@@ -1,4 +1,4 @@
-"""Immediate action-owned account verification; no cross-action session proof.
+"""Action ownership and runtime-keyed reuse of verified account sessions.
 
 The queue wave window is local policy, never Apple session expiry.
 """
@@ -17,6 +17,7 @@ RECENT_MS = 300_000
 def _identity(service):
     from apple_login import browser_profile_path
     return {'account': service.account.strip().casefold(), 'auth_path': str(Path(service.auth).resolve()),
+            'account_id':service.channel.account_id,
             'profile_path': str(browser_profile_path(service.auth).resolve())}
 
 
@@ -38,6 +39,10 @@ def verify_account_session(service, *, force_browser=False):
     if Path(duo_killer.AUTH_PATH).resolve() != Path(service.auth).resolve():
         raise ValueError('当前会话存储与任务账号归属不一致，未发起官网请求。')
     service.ensure_auth_file()
+    from purchase_identity import invalidate_identity
+    # An explicit new check supersedes older proof even when it fails. Never
+    # keep an older identity claim after a current refusal or account mismatch.
+    invalidate_identity(service)
     previous_failed = getattr(service, 'authentication_failed', False)
     if not force_browser:
         result = _read_or_restore(service)
@@ -175,6 +180,11 @@ def ensure_purchase_session(service):
             raise ValueError('父队列的购买会话核验已过期，未在子任务中刷新或开始购买。')
         return
     if session_ready(service):
+        return
+    from purchase_identity import identity_ready
+    if identity_ready(service):
+        record_action_session(service)
+        service.stage('复用已核验的账号会话，直接准备当前结账')
         return
     from browser_login import BrowserSessionError
     from browser_process import background_browser_scope

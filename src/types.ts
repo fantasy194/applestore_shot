@@ -58,6 +58,21 @@ export interface Prompt {
     preparation_stage: "review" | "fulfillment";
     review_verified: boolean;
     order_ready: boolean;
+    checkout_details_prepared?: {
+      status: "waiting_stock" | "details_accepted" | "unchanged";
+      stage:
+        | "Fulfillment"
+        | "PickupContact"
+        | "Shipping"
+        | "Billing"
+        | "Review"
+        | "unknown";
+      local_contact_ready: boolean;
+      local_address_ready: boolean;
+      contact_accepted: boolean;
+      address_accepted: boolean;
+      address_required?: boolean;
+    };
   };
   account?: string;
   credential_storage?: {

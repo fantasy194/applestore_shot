@@ -186,9 +186,12 @@ class PreparedHandoffTests(unittest.TestCase):
     def test_original_prompt_id_is_used_and_timeout_is_typed(self):
         output=io.StringIO();channel=Channel('account','task',output)
         with self.assertRaises(PromptExpired):channel.prompt('prepared_purchase','ready',timeout=.001,_request_id='fixed-prompt')
-        event=json.loads(output.getvalue())
+        events=[json.loads(line) for line in output.getvalue().splitlines()]
+        event=events[0]
         self.assertEqual(event['prompt']['id'],'fixed-prompt')
         self.assertNotIn('_request_id',event['prompt'])
+        self.assertEqual(events[1]['type'],'prompt_closed')
+        self.assertEqual(events[1]['request_id'],'fixed-prompt')
 
 
 if __name__=='__main__':unittest.main()

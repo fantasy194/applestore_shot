@@ -18,6 +18,7 @@ class PickupFlow(AutoOrderFlow):
     def __init__(self):
         super().__init__()
         self.mixed = False
+        self.accepted_contact = {}
 
     def action(self, module, name, data=None):
         super().action(module, name, data)
@@ -25,8 +26,17 @@ class PickupFlow(AutoOrderFlow):
             self.model = fulfillment_model(mixed=False)
         elif name == 'continueFromPickupContactToBilling':
             self.model['checkout']['billing']['billingOptions'] = {'d': {'options': [{'value': 'ALIPAY'}]}}
+            prefix = 'checkout.pickupContact.selfPickupContact.selfContact.address.'
+            self.accepted_contact = {key.removeprefix(prefix): val for key, val in (data or {}).items()
+                                     if key.startswith(prefix) and key.removeprefix(prefix) in
+                                     ('firstName', 'lastName', 'emailAddress', 'fullDaytimePhone')}
+            identity = (data or {}).get('checkout.pickupContact.selfPickupContact.nationalIdSelf.nationalIdSelf')
+            if identity:
+                self.accepted_contact['nationalIdSelf'] = identity
         elif name == 'continueFromBillingToReview':
             self.model['checkout']['d'] = {'page': 'Review'}
+            self.model['checkout']['review']['pickupContactReview'] = {
+                'pickupContactInfo': {'d': deepcopy(self.accepted_contact)}}
             self.model['checkout']['companionBar']['orderDetails'] = {
                 'fulfillmentCompanionBar': {'pickupSummary': {'d': {'store_name': 'Apple 测试门店', 'storeId': 'R580'}}}}
 
@@ -56,6 +66,7 @@ class RecoveryPickupFlow(PickupFlow):
                   else 'continueFromPickupContactToBilling' if page == 'PickupContact' else self.stage)
         section.setdefault('a', {})[action] = {'url': '/shop/checkoutx/fixture'}
         self.headers = {'x-aos-stk': f'fresh-{self.reads}'}
+        self.current_response_body = deepcopy(self.model)
 
 
 class PickupCheckoutTests(TestCase):
@@ -194,6 +205,12 @@ class PickupCheckoutTests(TestCase):
         self.assertNotIn('continueFromFulfillmentToPickupContact', [name for _, name, _ in flow.calls])
 
     def test_final_review_rejects_wrong_store_or_shipping_and_mismatched_store_id(self):
+        # Establish the prerequisite using an actually accepted synthetic contact
+        # form and its Review, rather than toggling a verification flag.
+        verified = PickupFlow()
+        self.run_flow(verified, prepare=True)
+        self.assertTrue(self.service.pickup_contact_review_verified)
+        self.assertEqual(verified.submissions, 0)
         details = {'items': [{'sku': 'MK2M4CH/A', 'quantity': 1}], 'total': 'RMB 15,999', 'address': '', 'store': 'Apple 测试门店'}
         self.assertTrue(self.service.confirm(details))
         for changes in [{'store': ''}, {'store': '其他门店'}, {'address': '残留送货地址'}, {'store_id': 'R999'}]:
@@ -716,11 +733,23 @@ class PickupReviewTests(TestCase):
                 review['fulfillmentReview'] = {'reviewGroup-1': {
                     'd': {'pickup': {'quote': '取货日期待付款完成后确定。'}}, 'item-0': item}}
                 review['summary']['d']['pickupSummary'] = True
-                review['pickupContactReview'] = {'pickupContactInfo': {'d': {}}}
                 if change:
                     change(review)
         flow.action = action
         return flow
+
+    def test_fixed_local_changed_or_missing_review_contact_stops_before_order(self):
+        for change in ('changed', 'missing'):
+            with self.subTest(change=change):
+                def mutate(review):
+                    if change == 'missing':
+                        review.pop('pickupContactReview')
+                    else:
+                        review['pickupContactReview']['pickupContactInfo']['d']['fullDaytimePhone'] = '13900000000'
+                flow = self.review_flow(mutate)
+                with self.assertRaises(ValueError):
+                    self.run_flow(flow)
+                self.assertEqual(flow.submissions, 0)
 
     def test_live_review_without_store_uses_current_server_selection_and_pickup_groups(self):
         flow = self.review_flow()

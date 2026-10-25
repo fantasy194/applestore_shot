@@ -1,3 +1,15 @@
+import type { Task } from "./types";
+
+/** A retained preparation waits for a new purchase, not for a prompt reply. */
+export function taskWaitingState(task: Pick<Task, "status" | "prompt">) {
+  if (task.status !== "waiting") return null;
+  if (task.prompt?.kind === "prepared_purchase") return "prepared";
+  return task.prompt &&
+    ["password", "code", "text", "select", "confirm"].includes(task.prompt.kind)
+    ? "input"
+    : "waiting";
+}
+
 /** Presentation only: keep protocol stages unchanged in persisted task data. */
 export function formatTaskStage(stage: string): string {
   const value = stage.trim();

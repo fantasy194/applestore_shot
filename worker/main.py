@@ -86,7 +86,11 @@ def main():
         credential_remember = request.pop('credential_remember', False) is True
         credential_verified = request.pop('credential_verified', False) is True
         credential_rejected = request.pop('credential_rejected', False) is True
+        identity_proof_key = request.pop('identity_proof_key', None)
         params = request.get('params', {})
+        if isinstance(params, dict):
+            params.pop('identity_proof_key', None)
+            params.pop('_identity_proof_key', None)
         child = isinstance(params, dict) and params.get('_parallel_child') is True
         # Parallel workers keep account/checkout files in isolated sandboxes,
         # while their business diagnostics stay queryable in the owner database.
@@ -118,6 +122,9 @@ def main():
         with task_lock, redirect_stdout(LogStream(channel)), redirect_stderr(LogStream(channel)):
             from service import Service
             service = Service(channel, root, task_dir, account)
+            if not local and not child:
+                service._identity_proof_key = identity_proof_key
+            identity_proof_key = None
             service.password_rejected = credential_rejected
             legacy_remember = params.pop('_remember_password', False) is True
             if isinstance(credential, str) and credential and len(credential.encode('utf-8')) <= 4096 and not child:

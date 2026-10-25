@@ -3,6 +3,7 @@ from copy import deepcopy
 import io
 import json
 import queue
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -94,6 +95,31 @@ class PreparedPickupTests(TestCase):
                     if call.args == ('progress_result',)]
         self.assertEqual(progress[0]['status'], 'prepared')
         self.assertEqual(progress[-1]['status'], 'pending_payment')
+        details = progress[0]['checkout_details_prepared']
+        self.assertTrue(details['contact_accepted'])
+        self.assertFalse(details['address_required'])
+        self.assertFalse(details['address_accepted'])
+        prompted = self.service.channel.prompt.call_args.kwargs['prepared']['checkout_details_prepared']
+        self.assertEqual(prompted, details)
+
+    def test_explicit_current_review_appointment_skips_fulfillment_without_its_old_model(self):
+        def appointment(model):
+            pickup = model['checkout']['review']['fulfillmentReview']['reviewGroup-1']['d']['pickup']
+            pickup.update(storeId='R580', date='2026-10-16', timeSlotValue='16-10:00-11:00')
+            model['checkout'].pop('fulfillment', None)
+        flow = self.prepared_flow(refresh=appointment)
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'continueFromBillingToReview':
+                self.service.pickup_slot_selected = {'store_id': 'R580', 'date': '2026-10-16',
+                                                     'start': '10:00', 'end': '11:00'}
+        flow.action = action
+        with patch.object(shop, 'checkout_delivery', wraps=shop.checkout_delivery) as select:
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual(select.call_count, 1)  # Initial preparation only.
 
     def test_healthy_prepared_resume_never_authenticates(self):
         flow = self.prepared_flow()
@@ -587,23 +613,34 @@ class PartialPickupPreparationTests(TestCase):
                 self.assertIsNone(self.service.pickup_identity_scope)
                 self.assertEqual(flow.submissions, 0)
 
-    def test_partial_keep_ready_retains_original_flow_until_purchase_or_expiry(self):
+    def test_partial_keep_ready_renews_original_flow_after_expiry_without_purchase(self):
         self.config['pickup']['store_id'] = 'R580'
         checkout_options.save_config(self.service.checkout, self.config)
         self.service.keep_prepared_pickup = True
         flow = self.blocked_flow()
+        waits = []
         def wait(result, timeout):
             self.assertEqual(timeout, 300)
             self.assertFalse(result['review_verified'])
             self.assertEqual(result['preparation_stage'], 'fulfillment')
             self.assertIsNone(self.service.pickup_selected)
             self.assertEqual(flow.submissions, 0)
-            self.service.prepared_expired = True
+            self.service.prepared_expired = not waits
+            waits.append(True)
             return False
+        def page(*args, **kwargs):
+            body = option_fixtures.fulfillment_model(mixed=False)
+            body['checkout']['fulfillment']['item-0'] = deepcopy(flow.item)
+            flow.model = deepcopy(body)
+            flow.current_response_body = deepcopy(body)
+            flow.url = shop.BASE_URL + '/shop/checkout'
+        flow.page = Mock(side_effect=page)
         with patch.object(self.service, 'wait_prepared_pickup', side_effect=wait), \
                 patch.object(shop, 'add_to_bag') as add:
             result = self.run_flow(flow, prepare=True)
-        self.assertEqual(result['status'], 'preparation_expired')
+        self.assertEqual(result['status'], 'preparation_ended')
+        self.assertEqual(len(waits), 2)
+        flow.page.assert_called_once()
         self.assertFalse(result['order_submitted'])
         self.assertFalse((self.root / 'prepared_checkout.json').exists())
         add.assert_not_called()
@@ -741,6 +778,171 @@ class PartialPickupPreparationTests(TestCase):
         flow.page.assert_not_called()
 
 
+class PreparedLeaseRenewalTests(TestCase):
+    setUp = pickup_fixtures.PickupCheckoutTests.setUp
+    tearDown = pickup_fixtures.PickupCheckoutTests.tearDown
+
+    def renewal_flow(self):
+        item = {'d': {'sku': 'MK2M4CH/A'}, 'itemQuantity': {'d': {'quantity': 1}}}
+        body = {'checkout': {'d': {'page': 'Fulfillment'}, 'fulfillment': {'item-0': item}}}
+        return Mock(url=shop.BASE_URL + '/shop/checkout', current_response_body=body, model=deepcopy(body))
+
+    def test_renewal_only_reads_original_checkout_and_never_authenticates(self):
+        flow = self.renewal_flow()
+        before = {'preparation_stage': 'fulfillment', 'review_verified': False, 'order_ready': False}
+        with patch.object(shop, 'save_auth'), patch.object(shop, 'reauthenticate_checkout') as auth:
+            renewed = shop.renew_prepared_pickup(flow, [('MK2M4CH/A', 1)], before,
+                self.service.checkout, shop.checkout_config_hash(self.service.checkout))
+        self.assertFalse(renewed['order_ready'])
+        self.assertFalse(renewed['order_submitted'])
+        flow.page.assert_called_once_with(flow.apple_url('/shop/checkout'), '续期核对原自提结算', fresh=True)
+        flow.action.assert_not_called()
+        auth.assert_not_called()
+
+    def test_renewal_ends_on_official_authentication_or_config_change(self):
+        for cause in ('signin', 'config'):
+            flow = self.renewal_flow()
+            if cause == 'signin':
+                flow.url = shop.BASE_URL + '/shop/signIn'
+            with self.subTest(cause=cause), patch.object(shop, 'reauthenticate_checkout') as auth:
+                with self.assertRaises(ValueError):
+                    shop.renew_prepared_pickup(flow, [('MK2M4CH/A', 1)], {}, self.service.checkout,
+                        'changed' if cause == 'config' else shop.checkout_config_hash(self.service.checkout))
+                auth.assert_not_called()
+                flow.action.assert_not_called()
+                if cause == 'config':
+                    flow.page.assert_not_called()
+
+    def test_prepared_queue_failure_is_acked_before_same_worker_waits_for_new_assignment(self):
+        from pickup_options import NoPickupSlot
+        flow = SimpleNamespace(session=Mock(), model={'checkout': {'d': {'page': 'Fulfillment'}}})
+        self.service._prepared_claim = {'source': 'queue', 'queue_job_id': 'failed-first',
+                                       'queue_assignment': 7, 'purchase_group_id': 'group'}
+        def stream(service, params):
+            events = [call for call in self.service.channel.emit.call_args_list if call.args[0] == 'queue_finished']
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].kwargs['queue_job_id'], 'failed-first')
+            self.assertEqual(events[0].kwargs['result']['status'], 'failed')
+            self.assertIsNone(service._prepared_claim)
+            self.assertIs(service._live_checkout['flow'], flow)
+            self.assertEqual(params['queue_targets'], [])
+            service.channel.emit('queue_ready')
+            return {'success': True, 'status': 'queued_complete'}
+        with patch.object(shop, 'save_auth'), patch('queued_checkout.run_queued_purchase', side_effect=stream):
+            result = self.service.continue_prepared_queue(flow, [('MK2M4CH/A', 1)], NoPickupSlot('fixture unavailable'))
+        self.assertEqual(result['status'], 'queued_complete')
+        self.assertIsNone(self.service._live_checkout)
+        flow.session.close.assert_called_once()
+
+    def test_later_retry_failure_never_transfers_the_first_prepared_flow(self):
+        from pickup_options import NoPickupSlot
+        flow = SimpleNamespace(session=Mock(), model={'checkout': {'d': {'page': 'Fulfillment'}}})
+        self.service._prepared_claim = {'source': 'queue', 'queue_job_id': 'first', 'queue_assignment': 1}
+        error = NoPickupSlot('fixture unavailable after later attempt')
+        error.retry_summary = {'attempts_made': 2}
+        with patch('queued_checkout.run_queued_purchase') as stream, patch.object(shop, 'save_auth') as save:
+            with self.assertRaises(NoPickupSlot):
+                self.service.continue_prepared_queue(flow, [('MK2M4CH/A', 1)], error)
+        stream.assert_not_called()
+        save.assert_not_called()
+
+    def test_new_retry_takes_auth_persistence_ownership_before_replacing_session(self):
+        from pickup_options import NoPickupSlot
+        flow = SimpleNamespace(session=Mock())
+        self.service._prepared_claim = {'source': 'manual'}
+        self.service._prepared_params = {'sku': 'MK2M4CH', 'quantity': 1, 'retry_count': 1}
+        self.service._prepared_requested_concurrency = 1
+        def old_save(session):
+            self.assertIs(session, flow.session)
+            self.service.auth.write_text('old snapshot', encoding='utf-8')
+        def next_attempt(*args):
+            self.assertTrue(flow._session_persistence_transferred)
+            self.service.auth.write_text('new snapshot', encoding='utf-8')
+            return {'success': True, 'status': 'fixture_complete'}
+        with patch.object(shop, 'save_auth', side_effect=old_save), \
+                patch('purchase_retry._wait'), patch('purchase_execution.execute_purchase_attempt', side_effect=next_attempt):
+            result = self.service.execute_prepared_purchase(Mock(side_effect=NoPickupSlot('fixture unavailable')),
+                                                            prepared_flow=flow)
+        self.assertEqual(result['retry_summary']['attempts_made'], 2)
+        self.assertEqual(self.service.auth.read_text(encoding='utf-8'), 'new snapshot')
+
+    def test_renewed_review_requires_current_store_contact_amount_and_payment_proof(self):
+        item = {'d': {'sku': 'MK2M4CH/A'}, 'itemQuantity': {'d': {'quantity': 1}}}
+        body = {'checkout': {'d': {'page': 'Review'}, 'review': {
+            'fulfillmentReview': {'reviewGroup-1': {'d': {'pickup': {'storeId': 'R580'}}, 'item-0': item}},
+            'pickupContactReview': {'pickupContactInfo': {'d': deepcopy(self.config['contact'])}},
+            'summary': {'d': {'pickupSummary': True, 'total': 'RMB 15,999'}},
+            'billingReview': {'alipayReview': {'d': {'alipayLabel': 'ALIPAY'}}},
+            'placeOrder': {'d': {'enableContinue': True}}}}}
+        self.service.order_details = {'store': '测试门店', 'store_id': 'R580', 'total': 'RMB 15,999'}
+        for change in ('none', 'amount', 'missing_contact', 'payment'):
+            current = deepcopy(body)
+            review = current['checkout']['review']
+            if change == 'amount':
+                review['summary']['d']['total'] = 'RMB 16,999'
+            elif change == 'missing_contact':
+                review['pickupContactReview'] = {}
+            elif change == 'payment':
+                review['billingReview'] = {}
+            flow = Mock(url=shop.BASE_URL + '/shop/checkout', current_response_body=current)
+            with self.subTest(change=change), patch.object(shop, 'save_auth'):
+                result = shop.renew_prepared_pickup(flow, [('MK2M4CH/A', 1)],
+                    {'review_verified': True, 'order_ready': True}, self.service.checkout,
+                    shop.checkout_config_hash(self.service.checkout))
+            self.assertEqual(result['order_ready'], change == 'none')
+            self.assertEqual(result['review_verified'], change == 'none')
+            self.assertIn('checkout_details_prepared', result)
+            current = result['checkout_details_prepared']
+            self.assertEqual(current['contact_accepted'], change != 'missing_contact')
+            self.assertFalse(current['address_required'])
+            self.assertFalse(current['address_accepted'])
+            flow.action.assert_not_called()
+
+    def test_monitor_preparation_checks_fresh_persisted_authorization_on_each_validation(self):
+        row = {'id': 'target', 'account_id': self.service.channel.account_id, 'auto_purchase': True,
+               'sku': 'MK2M4CH', 'quantity': 1, 'store_id': 'R580'}
+        self.service._preparation_targets = [{key:row[key] for key in ('id','sku','quantity','store_id')}]
+        self.service._preparation_targets[0]['sku'] = 'MK2M4CH/A'
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
+        with patch('inventory.load_config', side_effect=[{'targets': [row]}, {'targets': [{**row, 'auto_purchase': False}]}]) as load:
+            self.service.validate_preparation_scope()
+            with self.assertRaisesRegex(ValueError, '授权已撤销'):
+                self.service.validate_preparation_scope()
+        self.assertEqual(load.call_count, 2)
+
+    def test_new_authorized_purchase_consumes_live_checkout_without_login_bag_or_add(self):
+        import hashlib
+        from live_checkout import retain_unavailable
+        from pickup_options import NoPickupSlot
+        flow = self.renewal_flow()
+        self.service._live_checkout_enabled = True
+        self.service._live_checkout_owner = self.service
+        self.service.purchase_selection = ('MK2M4CH/A', 1)
+        raw_hash = hashlib.sha256(self.service.checkout.read_bytes()).hexdigest()
+        self.assertTrue(retain_unavailable(self.service, flow, self.service.purchase_selection, raw_hash,
+                                          NoPickupSlot('fixture unavailable')))
+        with patch.object(shop, 'ensure_auth_file'), patch.object(shop, 'ensure_strong_login') as login, \
+                patch.object(shop, 'load_auth') as load, patch.object(shop, 'save_auth'), \
+                patch.object(shop, 'add_to_bag') as add, \
+                patch.object(shop, 'continue_checkout', return_value={'success': True, 'status': 'pending_payment'}) as advance:
+            result = shop.purchase_sku('MK2M4CH', quantity=1)
+        self.assertEqual(result['status'], 'pending_payment')
+        advance.assert_called_once_with(flow, [('MK2M4CH/A', 1)], prepare_only=False)
+        login.assert_not_called()
+        load.assert_not_called()
+        add.assert_not_called()
+        flow.page.assert_called_once()
+
+    def test_explicit_queue_store_narrows_priority_preparation_to_single_store(self):
+        self.service.pickup_policy_override = {'selection_mode': 'priority', 'stores': [
+            {'store_id': 'R580', 'store_name': '测试门店', 'search': '成都'},
+            {'store_id': 'R581', 'store_name': '另一门店', 'search': '成都'}]}
+        self.service._configure_pickup_scope({'pickup_store_id': 'R581',
+            'pickup_store_name': '另一门店', 'pickup_location': '成都'})
+        pickup = checkout_options.read_config(self.service.checkout)['pickup']
+        self.assertEqual([store['store_id'] for store in pickup['stores']], ['R581'])
+
+
 class PreparedPhysicalEvidenceTests(TestCase):
     expected = [('MK2M4CH/A', 1)]
 
@@ -814,15 +1016,19 @@ class PreparedPromptDeadlineTests(TestCase):
         with patch.object(channel.responses, 'get', side_effect=queue.Empty):
             with self.assertRaisesRegex(ValueError, '超时'):
                 channel.prompt('confirm', '自提准备就绪', timeout=300)
-        self.assertNotIn('timeout', json.loads(output.getvalue())['prompt'])
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertNotIn('timeout', events[0]['prompt'])
+        self.assertEqual(events[1]['type'], 'prompt_closed')
+        self.assertEqual(events[1]['request_id'], events[0]['prompt']['id'])
 
     def test_queued_reply_arriving_after_deadline_is_rejected(self):
         channel = Channel('a', 't', io.StringIO())
         emit = channel.emit
         def reply(kind, **payload):
             emit(kind, **payload)
-            channel.receive({'type': 'reply', 'account_id': 'a', 'task_id': 't',
-                             'request_id': payload['prompt']['id'], 'value': True})
+            if kind == 'prompt':
+                channel.receive({'type': 'reply', 'account_id': 'a', 'task_id': 't',
+                                 'request_id': payload['prompt']['id'], 'value': True})
         channel.emit = reply
         with patch('protocol.time.monotonic', side_effect=[0, 299, 301]):
             with self.assertRaisesRegex(ValueError, '超时'):
