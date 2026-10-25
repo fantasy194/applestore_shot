@@ -1490,7 +1490,8 @@ def pay_review(flow, expected, *, prepare_only=False):
         raise ValueError("订单复核未通过：重新选择支付方式后商品或数量发生变化；未提交订单。")
     if field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY":
         raise ValueError("订单复核未通过：官网未确认支付方式为支付宝；未提交订单。")
-    if field(review, "placeOrder.d.enableContinue") is not True:
+    order_ready = field(review, "placeOrder.d.enableContinue") is True
+    if not prepare_only and not order_ready:
         raise ValueError("订单复核未通过：官网当前不允许提交订单；未提交订单。")
     if getattr(interaction.handler, 'automatic_checkout', False) is True:
         if selected_applecare(review.get('fulfillmentReview', {})):
@@ -1502,14 +1503,19 @@ def pay_review(flow, expected, *, prepare_only=False):
         config = ROOT / "checkout.json"
         write_private_json(ROOT / "prepared_checkout.json", {'sku': expected[0][0], 'quantity': expected[0][1],
             'fulfillment_mode': getattr(interaction.handler, 'fulfillment_mode', 'HOME'),
-            'review_verified': True,
+            'review_verified': order_ready, 'order_ready': order_ready,
+            'preparation_stage': 'review' if order_ready else 'fulfillment',
             'config_hash': checkout_config_hash(config), 'created_at': time()})
     if prepare_only:
-        result = {"success": True, "status": "prepared", 'preparation_stage': 'review',
-                  'review_verified': True, 'order_ready': True,
+        result = {"success": True, "status": "prepared" if order_ready else 'waiting_stock',
+                  'preparation_stage': 'review' if order_ready else 'fulfillment',
+                  'review_verified': order_ready, 'order_ready': order_ready,
                   "message": "准备完成，未创建订单。点击立即下单时重新读取官网确认页，核对后提交；会话或库存变化可能需要重新准备。"}
         prepared_details = getattr(interaction.handler, 'order_details', None) or {}
         result['checkout_details_prepared'] = checkout_details_status(flow, ROOT / 'checkout.json', confirmed=True)
+        if not order_ready:
+            result.update(blocked_reason='submission_not_enabled',
+                          message='官网当前未允许提交，原因尚未明确；已保留结算和受理资料，等待购买时重新核对。未创建订单。')
         result.update(pickup_store=prepared_details.get('store', ''),
                       pickup_store_id=prepared_details.get('store_id'),
                       pickup_time_slot=deepcopy(prepared_details.get('pickup_time_slot')))
@@ -1658,9 +1664,8 @@ def checkout_details_status(flow, config, *, confirmed=False):
             'address_accepted': False, 'address_required': not pure_pickup}
 
 
-def prepared_review_ready(body, expected, config):
+def prepared_review_ready(body, expected, config, *, require_enabled=True):
     """Read-only readiness proof; never invoke confirmation or send a form."""
-    from decimal import Decimal
     from checkout_options import read_config
     from pickup_options import (prepared_pickup_store_confirmed, prepared_pickup_slot_confirmed,
                                 prepared_contact_review_proof)
@@ -1671,7 +1676,7 @@ def prepared_review_ready(body, expected, config):
             or not isinstance(approved, dict)
             or checkout_physical_items(review.get('fulfillmentReview', {})) != expected
             or field(review, 'billingReview.alipayReview.d.alipayLabel') != 'ALIPAY'
-            or field(review, 'placeOrder.d.enableContinue') is not True
+            or require_enabled and field(review, 'placeOrder.d.enableContinue') is not True
             or selected_applecare(review.get('fulfillmentReview', {}))
             or not prepared_pickup_store_confirmed(body, approved)):
         return False
@@ -1684,11 +1689,14 @@ def prepared_review_ready(body, expected, config):
     summary = field(review, 'summary.d', {})
     total = (summary.get('totalAfterTradeIn') if summary.get('showTotalAfterTradeinAsTotal')
              else field(summary, 'installmentTotal.value') or summary.get('total'))
-    def amount(value):
-        matched = re.fullmatch(r'(?:RMB|CNY|CN¥|¥|￥)?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元|RMB|CNY)?', order_price(value))
-        return Decimal(matched[1].replace(',', '')) if matched else None
-    actual, previous = amount(total), amount(approved.get('total'))
+    actual, previous = prepared_amount(total), prepared_amount(approved.get('total'))
     return actual is not None and previous is not None and actual > 0 and actual == previous
+
+
+def prepared_amount(value):
+    from decimal import Decimal
+    matched = re.fullmatch(r'(?:RMB|CNY|CN¥|¥|￥)?\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*(?:元|RMB|CNY)?', order_price(value))
+    return Decimal(matched[1].replace(',', '')) if matched else None
 
 
 def _resume_prepared_checkout(flow, expected, approved_details, review_verified, had_slot,
@@ -1704,8 +1712,16 @@ def _resume_prepared_checkout(flow, expected, approved_details, review_verified,
     reauthenticate_checkout(flow, expected=expected)
     if checkout_config_hash(config) != config_hash:
         raise ValueError('自提配置已变化，请重新准备；未提交订单。')
+    if field(flow.current_response_body, 'checkout.d.page') == 'Review' and approved_details.get('total'):
+        summary = field(flow.current_response_body, 'checkout.review.summary.d', {})
+        total = (summary.get('totalAfterTradeIn') if summary.get('showTotalAfterTradeinAsTotal')
+                 else field(summary, 'installmentTotal.value') or summary.get('total'))
+        if total is not None and prepared_amount(total) != prepared_amount(approved_details['total']):
+            raise ValueError('官网金额与准备时确认的金额不同，请重新准备；未提交订单。')
     from pickup_options import prepared_pickup_store_confirmed, review_pickup_selection
-    same_store = review_verified and allowed_store(pickup, approved_details.get('store'), approved_details.get('store_id'))
+    review_evidence = review_verified or prepared_review_ready(flow.current_response_body, expected, config,
+                                                               require_enabled=False)
+    same_store = review_evidence and allowed_store(pickup, approved_details.get('store'), approved_details.get('store_id'))
     # Priority claims retain order: only the first authorized store can use
     # a Review shortcut without fresh evidence about earlier candidates.
     if same_store and pickup.get('selection_mode') == 'priority':

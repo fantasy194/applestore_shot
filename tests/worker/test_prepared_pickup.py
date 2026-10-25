@@ -21,7 +21,7 @@ class PreparedPickupTests(TestCase):
     run_flow = pickup_fixtures.PickupCheckoutTests.run_flow
     review_flow = pickup_fixtures.PickupReviewTests.review_flow
 
-    def prepared_flow(self, on_reply=None, refresh=None):
+    def prepared_flow(self, on_reply=None, refresh=None, *, initial_enabled=True):
         # Each fixture represents a new task, including subtests using one Service.
         self.service._prepared_claim = None
         self.service.prepared_claim_config_hash = None
@@ -34,6 +34,8 @@ class PreparedPickupTests(TestCase):
         original_action = flow.action
         def action(module, name, data=None):
             original_action(module, name, data)
+            if name == 'continueFromBillingToReview':
+                flow.model['checkout']['review']['placeOrder']['d']['enableContinue'] = initial_enabled
             if name == 'search':
                 flow.current_response_body = deepcopy(flow.model)
         flow.action = action
@@ -42,7 +44,7 @@ class PreparedPickupTests(TestCase):
         def reply(kind, label, **fields):
             self.assertEqual(flow.submissions, 0)
             self.assertEqual(kind, 'prepared_purchase')
-            self.assertEqual(fields['prepared']['preparation_stage'], 'review')
+            self.assertEqual(fields['prepared']['preparation_stage'], 'review' if initial_enabled else 'fulfillment')
             self.assertIn('R580', fields['prepared']['authorized_store_ids'])
             self.assertEqual(fields['timeout'], 300)
             self.wait_calls.extend(flow.calls)
@@ -127,6 +129,66 @@ class PreparedPickupTests(TestCase):
             self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
         login.assert_not_called()
         self.assertEqual(flow.submissions, 1)
+
+    def test_disabled_review_waits_with_accepted_contact_then_submits_original_flow_once(self):
+        captured = {}
+        def inspect_wait(flow):
+            captured.update(json.loads((self.root / 'prepared_checkout.json').read_text(encoding='utf-8')))
+            self.assertEqual(flow.submissions, 0)
+            self.assertTrue(self.service.pickup_contact_accepted)
+            return True
+        def enable(model):
+            model['checkout']['review']['placeOrder']['d']['enableContinue'] = True
+        flow = self.prepared_flow(on_reply=inspect_wait, refresh=enable, initial_enabled=False)
+        session = flow.session
+        with patch.object(shop, 'add_to_bag') as add:
+            result = self.run_flow(flow, prepare=True)
+        self.assertIs(flow.session, session)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual([name for _, name, _ in flow.calls[len(self.wait_calls):]], ['continueFromReviewToProcess'])
+        self.assertFalse(captured['order_ready'])
+        self.assertFalse(captured['review_verified'])
+        prompt = self.service.channel.prompt.call_args.kwargs['prepared']
+        self.assertFalse(prompt['order_ready'])
+        self.assertFalse(prompt['review_verified'])
+        self.assertTrue(prompt['checkout_details_prepared']['contact_accepted'])
+        self.assertEqual(prompt['checkout_details_prepared']['stage'], 'Review')
+        initial = next(call.kwargs['result'] for call in self.service.channel.emit.call_args_list
+                       if call.args == ('progress_result',))
+        self.assertEqual(initial['blocked_reason'], 'submission_not_enabled')
+        self.assertIn('原因尚未明确', initial['message'])
+        add.assert_not_called()
+
+    def test_disabled_review_still_disallows_actual_purchase_without_refilling(self):
+        flow = self.prepared_flow(initial_enabled=False)
+        with self.assertRaisesRegex(ValueError, '官网当前不允许提交订单'):
+            self.run_flow(flow, prepare=True)
+        self.assertEqual(flow.submissions, 0)
+        self.assertEqual(flow.calls[len(self.wait_calls):], [])
+
+    def test_disabled_preparation_never_relaxes_fresh_review_mismatch_guards(self):
+        for change in ('sku', 'quantity', 'store', 'contact', 'amount', 'payment'):
+            def mutate(model):
+                review = model['checkout']['review']
+                review['placeOrder']['d']['enableContinue'] = True
+                group = review['fulfillmentReview']['reviewGroup-1']
+                if change == 'sku':
+                    group['item-0']['d']['sku'] = 'MK2P4CH/A'
+                elif change == 'quantity':
+                    group['item-0']['itemQuantity']['d']['quantity'] = 2
+                elif change == 'store':
+                    group['d']['pickup']['storeId'] = 'R999'
+                elif change == 'contact':
+                    review['pickupContactReview']['pickupContactInfo']['d']['emailAddress'] = 'different@example.test'
+                elif change == 'amount':
+                    review['summary']['d']['total'] = 'RMB 16,999'
+                else:
+                    review['billingReview']['alipayReview']['d']['alipayLabel'] = 'OTHER'
+            flow = self.prepared_flow(refresh=mutate, initial_enabled=False)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.run_flow(flow, prepare=True)
+            self.assertEqual(flow.submissions, 0)
 
     def test_current_action_identity_proof_outranks_cookie_name_heuristic(self):
         from purchase_session import record_action_session

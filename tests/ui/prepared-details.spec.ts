@@ -7,6 +7,7 @@ async function fixture(
   ready: boolean,
   verified = ready,
   addressRequired?: boolean,
+  waitingReview = false,
 ) {
   const starts: any[] = [];
   const cancels: any[] = [];
@@ -33,10 +34,10 @@ async function fixture(
     review_verified: verified,
     checkout_details_prepared: {
       status: ready ? "details_accepted" : "waiting_stock",
-      stage: ready ? "Review" : "Fulfillment",
+      stage: ready || waitingReview ? "Review" : "Fulfillment",
       local_contact_ready: true,
       local_address_ready: true,
-      contact_accepted: ready,
+      contact_accepted: ready || waitingReview,
       address_accepted: addressRequired === false ? false : ready,
       ...(addressRequired === undefined
         ? {}
@@ -191,6 +192,21 @@ test("官网确认全自提时显示无需送货地址，不假称地址已受�
   await expect(
     page.getByRole("region", { name: "下单进度", exact: true }),
   ).toContainText("等待购买触发");
+});
+
+test("已填写但官网暂不可提交的Review保留信息等待，不自动下单", async ({
+  page,
+}) => {
+  const { status, starts } = await fixture(page, false, false, false, true);
+  await expect(status.getByRole("heading")).toHaveText("已保留自提准备");
+  await expect(status).toContainText("结算信息已保留，等待官网允许提交");
+  await expect(status).toContainText("当前不能直接提交");
+  await expect(status).toContainText("自提联系人：官网已接受");
+  await expect(status).toContainText("当前自提无需送货地址");
+  await expect(
+    page.getByRole("region", { name: "下单进度", exact: true }),
+  ).toContainText("等待购买触发");
+  expect(starts).toEqual([]);
 });
 
 test("准备等待不需人工，转入真实验证码后仍提示输入", async ({ page }) => {
