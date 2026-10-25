@@ -91,6 +91,8 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
         self.assertEqual(result, ([COOKIE], 'fixture-agent'))
         assistant.step.assert_called_once()
         self.assertIn('自动填写已停止', service.stage.call_args.args[0])
+        assistant.publish_remote_status.assert_not_called()  # No remote controller in this fixture.
+        self.assertFalse(any('验证码' in str(call.args[0]) for call in service.stage.call_args_list))
         process.terminate.assert_not_called()
 
     def test_rejected_password_is_terminal_even_if_later_network_request_succeeds(self):
@@ -99,7 +101,7 @@ class BrowserLoginAssistanceTests(unittest.TestCase):
         callbacks = {call.args[0]: call.args[1] for call in context.on.call_args_list}
         rejected = Mock(url='https://idmsa.apple.com.cn/appleauth/auth/signin/complete?private=fixture')
         callbacks['request'](rejected)
-        callbacks['response'](Mock(request=rejected, status=401))
+        callbacks['response'](Mock(request=rejected, status=401,json=lambda:{'serviceErrors':[{'code':'-20101'}]}))
         callbacks['response'](Mock(request=Mock(url=ACCOUNT), status=200))
         self.assertTrue(network['authentication_failed'])
 

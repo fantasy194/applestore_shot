@@ -132,6 +132,7 @@ class CheckoutBrowserCoordinatorTests(unittest.TestCase):
 
     def test_shadow_credential_rejection_reaches_original_owner(self):
         def reject(shadow,payload,timeout=120):
+            shadow.password_submitted()
             shadow.reject_password()
             raise ValueError('synthetic rejection')
         self.module.recover_checkout_in_browser=reject
@@ -140,6 +141,19 @@ class CheckoutBrowserCoordinatorTests(unittest.TestCase):
         self.assertTrue(self.service.password_rejected)
         self.assertIsNone(self.service.password)
         self.service.vault.invalidate.assert_called_once_with(self.account_id,'synthetic-password')
+
+    def test_shadow_password_acceptance_persists_owner_before_later_failure(self):
+        self.service.remember = True
+        def accept_then_fail(shadow, payload, timeout=120):
+            shadow.begin_password_authentication()
+            shadow.password_submitted()
+            shadow.confirm_password_authenticated()
+            raise ValueError('synthetic later shop failure')
+        self.module.recover_checkout_in_browser = accept_then_fail
+        result = self.run_batch()
+        self.assertFalse(result['pending_orders'])
+        self.service.vault.save.assert_called_once_with(self.account_id, 'synthetic-password')
+        self.service.vault.invalidate.assert_not_called()
 
     def test_child_exit_closes_browser_otp_and_does_not_leave_recovery_files(self):
         def otp(shadow,payload,timeout=120):

@@ -46,13 +46,16 @@ class BrowserPasswordTests(unittest.TestCase):
         self.vault.save.assert_not_called()
         self.assertFalse(service.auth.exists())
 
-    def test_missing_or_unavailable_password_never_prompts_during_idle_even_if_requested(self):
+    def test_missing_password_does_not_prompt_unless_requested_and_vault_failure_is_distinct(self):
         service = self.service
         service.idle_maintenance = service.headless_browser = True
-        for failure in (None, OSError('private-fixture-provider-error')):
-            with self.subTest(failure=type(failure).__name__):
-                self.vault.get.side_effect = failure
-                self.assertIsNone(service.browser_password(allow_prompt=True))
+        self.assertIsNone(service.browser_password(allow_prompt=False))
+        self.vault.get.side_effect = OSError('private-fixture-provider-error')
+        from browser_login import BrowserSessionError
+        with self.assertRaises(BrowserSessionError) as raised:
+            service.browser_password(allow_prompt=True)
+        self.assertEqual(raised.exception.code, 'CREDENTIAL_STORAGE_UNAVAILABLE')
+        self.assertNotIn('private-fixture-provider-error', str(raised.exception))
         self.channel.prompt.assert_not_called()
         self.vault.save.assert_not_called()
 
@@ -79,13 +82,16 @@ class BrowserPasswordTests(unittest.TestCase):
             with self.subTest(path=path, status=status):
                 self.service.password_rejected = False
                 self.service.password = 'private-fixture'
+                self.service.password_submitted()
                 self.channel.emit.reset_mock()
                 context = Mock()
                 network = browser_login.observe_login_network(context, self.service)
                 callbacks = {call.args[0]: call.args[1] for call in context.on.call_args_list}
                 request = Mock(url='https://idmsa.apple.com.cn' + path)
                 callbacks['request'](request)
-                callbacks['response'](Mock(request=request, status=status))
+                response = Mock(request=request, status=status)
+                response.json.return_value = {'serviceErrors': [{'code': '-20101'}]}
+                callbacks['response'](response)
                 process = Mock()
                 process.poll.return_value = None
                 with self.assertRaises((browser_login.BrowserSessionError, ValueError)):
@@ -99,6 +105,7 @@ class BrowserPasswordTests(unittest.TestCase):
     def test_rejected_credential_does_not_reload_stale_vault_password(self):
         self.service.password = 'private-rejected-fixture'
         self.vault.get.return_value = 'private-rejected-fixture'
+        self.service.password_submitted()
         self.service.reject_password()
         self.assertIsNone(self.service.browser_password(allow_prompt=False))
         self.vault.get.assert_not_called()
@@ -116,7 +123,10 @@ class BrowserPasswordTests(unittest.TestCase):
         with requests.Session() as session:
             flow = SimpleNamespace(session=session,url='https://secure8.www.apple.com.cn/shop/signIn',page_response=Mock())
             client = Mock()
-            client.login.side_effect = LoginError('private fixture',status=401,codes=['-20101'])
+            def refused(*args, **kwargs):
+                self.service.password_submitted('private-checkout-fixture')
+                raise LoginError('private fixture',status=401,codes=['-20101'])
+            client.login.side_effect = refused
             with patch('apple_login.AppleStoreLogin',return_value=client), patch('requests.Session.send',side_effect=AssertionError('network forbidden')):
                 try:
                     duo_killer.reauthenticate_checkout(flow)
@@ -134,6 +144,8 @@ class BrowserPasswordTests(unittest.TestCase):
             with self.subTest(status=status, codes=codes):
                 self.channel.emit.reset_mock()
                 self.service.password_rejected = False
+                self.service.password = 'private-fixture'
+                self.service.password_submitted()
                 try:
                     try:
                         raise LoginError('private fixture', status=status, codes=codes)
@@ -146,7 +158,7 @@ class BrowserPasswordTests(unittest.TestCase):
     def test_541_preserves_cached_password_but_explicit_rejection_invalidates(self):
         from browser_login import BrowserSessionError
         for code, status, rejected in [('APPLE_SESSION_BLOCKED', 'blocked', False),
-                                       ('BROWSER_LOGIN_AUTHENTICATION_FAILED', 'requires_login', True)]:
+                                       ('BROWSER_LOGIN_AUTHENTICATION_FAILED', 'requires_login', False)]:
             with self.subTest(code=code):
                 self.channel.emit.reset_mock()
                 self.service.password_rejected = False
@@ -170,6 +182,7 @@ class BrowserPasswordTests(unittest.TestCase):
 
     def test_explicit_password_rejection_invalidates_matching_persistence_once(self):
         self.service.password = 'rejected-fixture'
+        self.service.password_submitted()
         self.service.reject_password()
         self.vault.invalidate.assert_called_once_with('fixture-account', 'rejected-fixture')
         self.service.reject_password()
@@ -188,7 +201,9 @@ class BrowserPasswordTests(unittest.TestCase):
             self.channel.prompt.return_value = {'password': '  saved-fixture  ', 'remember': True}
             self.assertEqual(self.service.browser_password(allow_prompt=True), '  saved-fixture  ')
             self.assertIsNone(self.service.vault.get('fixture-account'))
-            with patch.object(self.service, 'check_account', return_value={'success': True, 'logged_in': True}):
+            self.service.password_submitted()
+            self.service.confirm_password_authenticated()
+            with patch('purchase_session.verify_account_session', return_value={'success': True, 'logged_in': True}):
                 self.service.run('me', {})
             next_service = Service(self.channel, root, root, 'owner@example.test', Vault())
             self.channel.prompt.reset_mock()
@@ -198,6 +213,7 @@ class BrowserPasswordTests(unittest.TestCase):
             next_service.cleanup_credentials(BrowserSessionError('APPLE_SESSION_BLOCKED', 'fixture', status='blocked'))
             self.assertEqual(Vault().get('fixture-account'), '  saved-fixture  ')
             next_service.browser_password(allow_prompt=False)
+            next_service.password_submitted()
             next_service.reject_password()
             self.assertIsNone(Vault().get('fixture-account'))
             next_service.vault.save('fixture-account', 'replacement')
@@ -211,7 +227,7 @@ class BrowserPasswordTests(unittest.TestCase):
             self.service.run('session_maintain', {})
         self.vault.save.assert_not_called()
         self.service.remember = False
-        with patch.object(self.service, 'check_account', return_value={'success': True, 'logged_in': True}):
+        with patch('purchase_session.verify_account_session', return_value={'success': True, 'logged_in': True}):
             self.service.run('me', {})
         self.vault.save.assert_not_called()
 
@@ -222,3 +238,70 @@ class BrowserPasswordTests(unittest.TestCase):
             self.service.browser_password(allow_prompt=True)
         self.vault.get.assert_not_called()
         self.channel.prompt.assert_not_called()
+
+    def test_accepted_password_is_saved_before_later_shop_or_stock_failure(self):
+        self.channel.prompt.return_value = {'password': 'accepted-fixture', 'remember': True}
+        self.service.browser_password(allow_prompt=True)
+        self.service.password_submitted()
+        self.service.confirm_password_authenticated()
+        self.service.confirm_password_authenticated()
+        self.vault.save.assert_called_once_with('fixture-account', 'accepted-fixture')
+        self.service.cleanup_credentials(ValueError('stock-unavailable'))
+        self.vault.invalidate.assert_not_called()
+
+    def test_healthy_session_or_dom_prefill_cannot_validate_an_unused_password(self):
+        self.service.password = 'unsubmitted-fixture'
+        self.service.remember = True
+        self.service.confirm_password_authenticated()
+        with patch('purchase_session.verify_account_session', return_value={'success': True, 'logged_in': True}):
+            self.service.run('me', {})
+        self.vault.save.assert_not_called()
+
+    def test_scoped_automatic_recovery_uses_app_password_prompt(self):
+        self.service.idle_maintenance = self.service.headless_browser = True
+        self.service._account_auth_active = True
+        self.channel.prompt.return_value = {'password': 'replacement-fixture', 'remember': True}
+        self.assertEqual(self.service.credentials(self.service.auth), ('owner@example.test', 'replacement-fixture'))
+        self.channel.prompt.assert_called_once()
+        self.service.password_submitted('replacement-fixture')
+        self.service.confirm_password_authenticated()
+        self.vault.save.assert_called_once_with('fixture-account', 'replacement-fixture')
+
+    def test_browser_automatic_recovery_missing_password_uses_app_prompt(self):
+        self.service.idle_maintenance = self.service.headless_browser = True
+        self.channel.prompt.return_value = {'password': 'replacement-fixture', 'remember': False}
+        self.assertEqual(self.service.browser_password(allow_prompt=True), 'replacement-fixture')
+        self.channel.prompt.assert_called_once()
+
+    def test_child_password_acceptance_uses_private_lease_event(self):
+        self.service._parallel_child = self.service._checkout_auth_active = True
+        self.service.password = 'leased-fixture'
+        self.service.remember = True
+        self.service.credentials(self.service.auth)
+        self.service.password_submitted('leased-fixture')
+        self.service.confirm_password_authenticated()
+        self.channel.emit.assert_called_once_with('credential_authenticated')
+        self.vault.save.assert_not_called()
+
+    def test_reading_credentials_is_not_proof_the_password_was_submitted(self):
+        self.service.password = 'unsubmitted-fixture'
+        self.service.remember = True
+        self.service.credentials(self.service.auth)
+        self.service.confirm_password_authenticated()
+        self.service.reject_password()
+        self.vault.save.assert_not_called()
+        self.vault.invalidate.assert_not_called()
+        self.channel.emit.assert_not_called()
+        self.assertEqual(self.service.password, 'unsubmitted-fixture')
+
+    def test_generic_auth_failure_keeps_app_prompt_password_for_next_attempt(self):
+        from browser_login import BrowserSessionError
+        self.channel.prompt.return_value = {'password': 'prompt-fixture', 'remember': True}
+        self.service.browser_password(allow_prompt=True)
+        self.service.password_submitted()
+        self.service.begin_password_authentication()
+        self.service.reject_password()  # An unrelated browser/manual auth failed.
+        self.assertEqual(self.service.browser_password(allow_prompt=False), 'prompt-fixture')
+        self.vault.invalidate.assert_not_called()
+        self.service.cleanup_credentials(BrowserSessionError('BROWSER_LOGIN_AUTHENTICATION_FAILED', 'fixture'))
+        self.channel.emit.assert_not_called()

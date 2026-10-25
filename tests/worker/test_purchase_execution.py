@@ -223,10 +223,14 @@ class CurrentCheckoutAuthenticationTests(unittest.TestCase):
         self.channel.checkout_authentication.assert_not_called()
 
     def test_explicit_password_rejection_precedes_lease_release_but_541_does_not_invalidate(self):
-        for status,codes,rejected in ((401,('-20101',),True),(541,(),False)):
+        for status,codes,submitted,rejected in ((401,('-20101',),True,True),
+                                               (401,('-20101',),False,False),
+                                               (541,(),True,False)):
             self.events.clear();self.service.password_rejected=False
             with self.assertRaises(LoginError):
                 with self.service.checkout_authentication():
+                    if submitted:
+                        self.service.password_submitted('synthetic-password')
                     raise LoginError('synthetic rejection',status=status,codes=codes)
             if rejected:
                 self.assertLess(self.events.index('credential_rejected'),self.events.index('released'))

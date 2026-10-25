@@ -840,6 +840,9 @@ class AppleStoreLogin:
         hc = {}
         if self.hc.get("X-Apple-HC-Challenge"):
             hc["X-APPLE-HC"] = hashcash(self.hc["X-Apple-HC-Bits"], self.hc["X-Apple-HC-Challenge"])
+        submitted_password = getattr(interaction.handler, 'password_submitted', None)
+        if callable(submitted_password):
+            submitted_password(password)
         response, data = self.auth("POST", "/signin/complete", allowed=(200, 409), headers=hc,
                                   params={"isRememberMeEnabled": "true"}, json={
                                       "accountName": account, "rememberMe": True, "c": challenge["c"],
@@ -851,6 +854,12 @@ class AppleStoreLogin:
             self.verify_two_factor(sms)
         elif data.get("authType") not in ("hsa2", "hsa", "sa", "non-sa"):
             raise LoginError("密码认证返回未知状态，未宣告登录成功。")
+        # Password acceptance belongs to IDMS, not later Shop authx or inventory.
+        # Persist only an app-provided password that this authentication used;
+        # a 541/stock failure afterwards must not discard the user's save intent.
+        confirmed = getattr(interaction.handler, 'confirm_password_authenticated', None)
+        if callable(confirmed):
+            confirmed()
         print("Apple 账号认证完成。")
         if signin_url is not None:
             if urlsplit(self.store_page).path == "/shop/signIn/account":

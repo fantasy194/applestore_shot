@@ -82,7 +82,7 @@ class ScheduleTests(unittest.TestCase):
 
 
 class MonitorScheduleRuntimeTests(unittest.TestCase):
-    def run_monitor(self, initial, clock, check=None, sleep=None, emit=None):
+    def run_monitor(self, initial, clock, check=None, sleep=None, emit=None, load=None):
         channel = Channel('account', 'task', io.StringIO())
         created = []
 
@@ -105,13 +105,55 @@ class MonitorScheduleRuntimeTests(unittest.TestCase):
         broker = Mock()
         broker.start.return_value = broker
         with tempfile.TemporaryDirectory() as directory, patch('inventory.InventoryClient', side_effect=client_factory), \
-                patch('inventory.StoreBroker', return_value=broker), patch('inventory.load_config', return_value=initial), \
+                patch('inventory.StoreBroker', return_value=broker), \
+                patch('inventory.load_config', side_effect=lambda root: load() if load else initial), \
                 patch('monitor_schedule.time.time', lambda: clock[0]), patch('inventory.time.sleep', lambda delay: sleep(channel, delay)), \
                 self.assertRaises(Cancelled):
             _run_owned_inventory('inventory_monitor', {}, channel, Path(directory), initial, Mock())
         self.assertTrue(broker.close.called)
         self.assertTrue(all(client.close.called for _, client in created))
         return created, [json.loads(line) for line in channel.output.getvalue().splitlines()]
+
+    def test_settings_read_crossing_wait_deadline_continues_monitor_without_negative_sleep(self):
+        current = config()
+        clock = [at('06:00:00')]
+        monotonic = [0.0]
+        waiting = [False]
+        rounds = []
+        sleeps = []
+
+        def load():
+            if waiting[0]:
+                # A private-settings read can finish after the loop predicate's
+                # deadline check, reproducing the real negative sleep failure.
+                monotonic[0] += 1.1
+                waiting[0] = False
+            return current
+
+        def check(channel, targets):
+            rounds.append(monotonic[0])
+            return {'targets': [dict(targets[0], status='unavailable')]}
+
+        def emit(channel, kind, kwargs):
+            if kind == 'inventory':
+                if len(rounds) == 1:
+                    waiting[0] = True
+                else:
+                    channel.cancelled.set()
+
+        def sleep(channel, delay):
+            if delay < 0:
+                raise ValueError('sleep length must be non-negative')
+            self.assertGreater(delay, 0)
+            self.assertLessEqual(delay, .1)
+            sleeps.append(delay)
+            monotonic[0] += delay
+
+        with patch('inventory.time.monotonic', lambda: monotonic[0]):
+            _, events = self.run_monitor(current, clock, check=check, sleep=sleep, emit=emit, load=load)
+        self.assertEqual(rounds, [0.0, 1.1])
+        self.assertEqual(sleeps, [])
+        self.assertEqual(sum(event['type'] == 'inventory' for event in events), 2)
 
     def test_paused_cancellation_no_query_no_proxy_construction(self):
         current = config()

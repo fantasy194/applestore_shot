@@ -133,12 +133,32 @@ def observe_login_network(context, service, *, page=None):
                 state['authentication_failed'] = True
                 # OTP/trust/callback rejection does not prove that the password
                 # was refused. Only the actual password completion invalidates it.
-                if urlsplit(response.request.url).path == '/appleauth/auth/signin/complete':
-                    state['credential_rejected'] = True
+                if (urlsplit(response.request.url).path == '/appleauth/auth/signin/complete'
+                        and response.status == 401):
+                    try:
+                        rejected = response.json()
+                        errors = rejected.get('serviceErrors') if isinstance(rejected, dict) else None
+                        state['credential_rejected'] = state['credential_rejected'] or (
+                            isinstance(errors, list) and any(isinstance(item, dict)
+                                and str(item.get('code')) == '-20101' for item in errors))
+                    except Exception:
+                        pass  # A status alone cannot invalidate a saved password.
                 state['error'] = f'官网浏览器的{name}未通过；本次未自动重新提交。'
             elif response.status < 400 and state.get('blocked_status') not in (403, 429, 541):
                 state['error'], state['blocked_status'] = None, None
                 path = urlsplit(response.request.url).path
+                password_accepted = path == '/appleauth/auth/2sv/trust' and response.status in (200, 204)
+                if path == '/appleauth/auth/signin/complete' and response.status == 200:
+                    try:
+                        data = response.json()
+                        password_accepted = (isinstance(data, dict) and not data.get('serviceErrors')
+                            and data.get('authType') in ('hsa2', 'hsa', 'sa', 'non-sa'))
+                    except Exception:
+                        # An incomplete body is not positive credential proof.
+                        password_accepted = False
+                confirmed_password = getattr(service, 'confirm_password_authenticated', None)
+                if password_accepted and callable(confirmed_password):
+                    confirmed_password()
                 if (not state['authentication_failed']
                         and (path == '/shop/signIn/idms/authx' and response.status == 200
                              or path == '/appleauth/auth/2sv/trust' and response.status in (200, 204))):
@@ -423,18 +443,17 @@ def wait_for_account_page(browser, process, service, timeout, network, *, remote
                         # Keep the same assistant and its reserved submissions.
                         # Only an explicit user action may resume unsubmitted input.
                         assistant.interrupted = True
-                        service.stage('没有可用的现有密码，请在官网输入密码或完成账号密码确认' if
+                        service.stage('当前任务缺少可用密码，可在应用中输入后继续认证' if
                                       error.code == 'HEADLESS_LOGIN_REQUIRES_ATTENTION' else
                                       '官网页面或输入已变化，自动填写已停止，可使用现有凭证继续或在官网手动操作')
-                        outcome = 'verification'
-                        reported_verification = True
+                        outcome = 'manual'
                     if remote is not None:
                         assistant.publish_remote_status(remote, outcome)
                     if outcome == 'verification':
                         if headless:
                             raise headless_auth_required()
                         if not reported_verification:
-                            service.stage('请在官网窗口完成 Apple 验证码或安全验证，其他登录步骤会自动继续')
+                            service.stage('需要六位验证码时请在当前应用任务输入；其他安全验证按官网当前提示完成')
                             reported_verification = True
                     break
         trust_pending = any(trust_browser_if_offered(page, accept=False) if account_read_only or (headless and assistant is None)

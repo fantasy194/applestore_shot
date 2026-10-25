@@ -7,7 +7,7 @@ import re
 import time
 from urllib.parse import urlsplit
 
-from browser_input import BrowserInputInterrupted, _navigation_guard, click_control, replace_field, validate_keyboard_text
+from browser_input import BrowserInputInterrupted, _navigation_guard, browser_error_category, click_control, replace_field, validate_keyboard_text
 
 
 ACCOUNT_NAMES = re.compile(r'^(?:Apple (?:ID|账户|账号|Account)|电子邮件(?:或电话号码)?|电子邮件地址|邮箱|账号|账户|Email(?: or phone number)?|Account name)$', re.I)
@@ -15,7 +15,8 @@ PASSWORD_NAMES = re.compile(r'^(?:密码|Password)$', re.I)
 CONTINUE_NAMES = re.compile(r'^(?:继续|Continue|下一步|Next|登录|登入|Sign in|Sign In)$', re.I)
 VERIFICATION_NAMES = re.compile(r'验证码|安全码|verification code|security code', re.I)
 CHALLENGE_TEXT = re.compile(r'验证码|安全码|双重认证|双重验证|图形验证|人机验证|verification code|security code|two.factor|captcha|verify you are human', re.I)
-PASSWORD_ERROR = re.compile(r'密码.{0,12}(?:错误|不正确|无效)|(?:账号|账户|Apple ID).{0,18}(?:密码|被锁定|被停用)|(?:incorrect|invalid).{0,20}(?:password|Apple ID)|password.{0,20}(?:incorrect|invalid)|account.{0,16}(?:locked|disabled)', re.I)
+PASSWORD_ERROR = re.compile(r'密码.{0,12}(?:错误|不正确|无效)|(?:错误|不正确|无效).{0,6}密码|(?:incorrect|invalid).{0,20}password|password.{0,20}(?:incorrect|invalid)', re.I)
+ACCOUNT_ERROR = re.compile(r'(?:账号|账户|Apple ID).{0,18}(?:被锁定|被停用|错误|不正确|无效)|account.{0,16}(?:locked|disabled)|(?:incorrect|invalid).{0,20}Apple ID', re.I)
 
 
 class _SigninDomNotReady(Exception):
@@ -142,9 +143,10 @@ def step_browser_signin(assistant, page, network, remote=None):
 class BrowserSigninAssistant:
     def __init__(self, service, *, headless=False, automatic=False):
         self.service = service
+        getattr(service, 'begin_password_authentication', lambda: None)()
         self.headless = headless
         self.automatic = automatic
-        self.otp_wait_seconds = 0.0
+        self.user_wait_seconds = 0.0
         self.authenticated_account = False
         self.submitted = set()
         self.interrupted = False
@@ -156,6 +158,18 @@ class BrowserSigninAssistant:
         self.password_input_incomplete = False
         self.account_input_incomplete = False
         self.input_phase = 'recognition'
+        self.app_password_submitted = False
+        self._filled_password = None
+
+    @property
+    def otp_wait_seconds(self):
+        # Kept for existing wait-loop consumers; all App credential waits now
+        # suspend their operation budget, rather than only six-digit prompts.
+        return self.user_wait_seconds
+
+    @otp_wait_seconds.setter
+    def otp_wait_seconds(self, value):
+        self.user_wait_seconds = value
 
     def process_remote_request(self, remote):
         """Wire every visible login entry to the same main-thread assistant."""
@@ -305,23 +319,25 @@ class BrowserSigninAssistant:
         self.deadline = self.deadline or time.monotonic() + 60
         # Keep the document and element guard alive across a manual password
         # prompt, all keystrokes and submission. A locator alone can re-resolve.
-        with _navigation_guard(page, self.service.channel.checkpoint, self.deadline, frame=frame) as check:
+        with _navigation_guard(page, self.service.channel.checkpoint, lambda: self.deadline, frame=frame) as check:
             original = password.element_handle(timeout=500)
+            rebindings = 0
             try:
                 def identity_check():
                     check()
                     if not self._identity(frame, accounts):
                         raise _error('BROWSER_LOGIN_ACCOUNT_MISMATCH', '官网账号信息已变化，已停止认证。')
                     check()
-                def bound_check():
+                def bound_check(*, allow_rebind=False):
                     identity_check()
-                    if original is None or password.evaluate('(element, original) => element === original', original) is not True:
-                        raise BrowserInputInterrupted('登录密码字段已变化，已停止输入。', reason='element_replaced', phase=self.input_phase)
+                    if original is None or password.evaluate('(element, original) => element === original && element.isConnected && element.ownerDocument === document', original) is not True:
+                        if not allow_rebind or rebind_before_input() is None:
+                            raise BrowserInputInterrupted('登录密码字段已变化，已停止输入。', reason='element_replaced', phase=self.input_phase)
                     check()
                 def rebind_before_input():
-                    nonlocal password, accounts, button, original
+                    nonlocal password, accounts, button, original, rebindings
                     check()
-                    if (self.submitted.intersection(('password', 'otp')) or not _login_page(page)
+                    if (rebindings or self.submitted.intersection(('password', 'otp')) or not _login_page(page)
                             or frame != page.main_frame and frame not in _account_auth_frames(page)):
                         return None
                     fresh_accounts, fresh_passwords = _fields(frame)
@@ -329,15 +345,19 @@ class BrowserSigninAssistant:
                     if fresh is None or not self._identity(frame, fresh_accounts):
                         return None
                     fresh_button = _button(frame, fresh)
-                    if fresh_button is None or fresh.evaluate('(element) => element === element.ownerDocument.activeElement && element.ownerDocument.hasFocus()') is not True:
+                    if fresh_button is None:
                         return None
-                    original.dispose()
+                    rebindings += 1
+                    if original is not None:
+                        original.dispose()
                     password, accounts, button = fresh, fresh_accounts, fresh_button
                     original = fresh.element_handle(timeout=500)
                     return fresh
-                bound_check()
+                bound_check(allow_rebind=True)
                 prefilled = (password.evaluate('(element) => Boolean(element.value)') is True
                              and not self.password_input_incomplete)
+                using_app_password = (prefilled and self._filled_password is not None
+                                      and password.evaluate('(element, expected) => element.value === expected', self._filled_password) is True)
                 bound_check()
                 if prefilled:
                     # Browser autofill is already in this verified account's form.
@@ -345,16 +365,26 @@ class BrowserSigninAssistant:
                     self.service.stage('正在继续官网已填写的登录表单')
                 else:
                     self.on_interaction()
-                    secret = self.service.browser_password(allow_prompt=not self.headless and not self.existing_only)
-                    bound_check()
+                    allow_prompt = self.automatic or not self.headless and not self.existing_only
+                    started = time.monotonic()
+                    try:
+                        secret = self.service.browser_password(allow_prompt=allow_prompt)
+                    finally:
+                        if allow_prompt:
+                            waited = max(0.0, time.monotonic() - started)
+                            self.user_wait_seconds += waited
+                            self.deadline += waited
+                    bound_check(allow_rebind=True)
                     if not isinstance(secret, str) or not secret:
-                        raise _error('HEADLESS_LOGIN_REQUIRES_ATTENTION', '没有可用的现有密码，请在官网输入密码或完成账号密码确认。')
+                        raise _error('HEADLESS_LOGIN_REQUIRES_ATTENTION', '当前任务未取得可用密码，请在应用中补充账号密码后继续。')
                     validate_keyboard_text(secret)
                     self.service.stage('正在填写官网密码并继续认证')
                     self.password_input_incomplete = True
                     replace_field(page, frame, password, secret, identity_check, deadline=self.deadline,
                                   rebind_before_input=rebind_before_input)
                     self.password_input_incomplete = False
+                    self._filled_password = secret
+                    using_app_password = True
                 bound_check()
                 self.authenticated_account = True
                 if password.evaluate('(element) => Boolean(element.value)') is not True:
@@ -365,6 +395,10 @@ class BrowserSigninAssistant:
                 if not prefilled and password.evaluate('(element) => element.ownerDocument.hasFocus()') is not True:
                     raise BrowserInputInterrupted('登录输入焦点已变化，已停止继续。', reason='focus_changed', phase='verify')
                 self.on_interaction()
+                if using_app_password:
+                    getattr(self.service, 'password_submitted', lambda: None)()
+                    self.app_password_submitted = True
+                self._filled_password = None
                 self.submitted.add('password')
                 self.input_phase = 'submit'
                 click_control(button)
@@ -379,7 +413,7 @@ class BrowserSigninAssistant:
             raise _error('BROWSER_LOGIN_INPUT_INTERRUPTED', '登录页面已变化，请在官网页面继续。')
         if network.get('authentication_failed') is True or any(network.get(key) == 401 for key in ('status', 'http_status', 'authentication_status', 'blocked_status')):
             self.terminal = True
-            if network.get('credential_rejected') is True:
+            if network.get('credential_rejected') is True and self.app_password_submitted:
                 self.service.reject_password()
             raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网拒绝了本次认证，请在官网确认账号和密码；未自动重试。')
         if network.get('pending') or network.get('error'):
@@ -397,8 +431,11 @@ class BrowserSigninAssistant:
                     return self._verification_step(page, frame)
                 alert = _alert_texts(frame)
                 if any(PASSWORD_ERROR.search(value[:4000]) for value in alert):
-                    self.service.reject_password()
+                    if self.app_password_submitted:
+                        self.service.reject_password()
                     raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网提示认证失败，请在官网检查；未自动重试。')
+                if any(ACCOUNT_ERROR.search(value[:4000]) for value in alert):
+                    raise _error('BROWSER_LOGIN_AUTHENTICATION_FAILED', '官网提示账号受限，本次认证无法继续；已保留保存凭据。')
             for frame in frames:
                 accounts, passwords = _fields(frame)
                 identity = self._identity(frame, accounts)
@@ -444,14 +481,19 @@ class BrowserSigninAssistant:
         except _SigninDomNotReady:
             return 'unrecognized'
         except BrowserInputInterrupted as error:
+            self._filled_password = None
+            getattr(self.service, 'password_submission_interrupted', lambda: None)()
             self.interrupted = True
             self._report_interruption(error)
             failure = _error('BROWSER_LOGIN_INPUT_INTERRUPTED', '官网输入焦点或页面已变化，已停止剩余输入，请在官网继续。')
             failure.reason, failure.phase = error.reason, error.phase
+            failure.browser_error = error.browser_error
             raise failure from None
         except Exception as error:
             from browser_login import BrowserSessionError
             if isinstance(error, BrowserSessionError):
+                self._filled_password = None
+                getattr(self.service, 'password_submission_interrupted', lambda: None)()
                 self.interrupted = True
                 self.terminal = error.code not in ('BROWSER_LOGIN_INPUT_INTERRUPTED', 'HEADLESS_LOGIN_REQUIRES_ATTENTION')
                 raise
@@ -459,10 +501,14 @@ class BrowserSigninAssistant:
             if self.input_phase == 'recognition' and isinstance(error, BrowserError) and 'Execution context was destroyed' in error.message:
                 return 'unrecognized'
             self.interrupted = True
-            diagnostic = BrowserInputInterrupted('浏览器操作未完成。', reason='cdp_error', phase=self.input_phase)
+            self._filled_password = None
+            getattr(self.service, 'password_submission_interrupted', lambda: None)()
+            diagnostic = BrowserInputInterrupted('浏览器操作未完成。', reason='cdp_error', phase=self.input_phase,
+                                                  browser_error=browser_error_category(error))
             self._report_interruption(diagnostic)
             failure = _error('BROWSER_LOGIN_INPUT_INTERRUPTED', '官网登录页面发生变化，已停止自动操作，请在官网继续。')
             failure.reason, failure.phase = diagnostic.reason, diagnostic.phase
+            failure.browser_error = diagnostic.browser_error
             raise failure from None
 
     def _report_interruption(self, error):
@@ -470,5 +516,7 @@ class BrowserSigninAssistant:
                    'page_closed':'登录窗口已关闭', 'deadline':'输入等待超时', 'focus_changed':'输入焦点已切换',
                    'element_replaced':'输入字段已被替换', 'value_changed':'输入内容已被页面改动',
                    'field_missing':'输入字段尚未就绪', 'invalid_text':'输入格式不受支持', 'cdp_error':'浏览器操作未完成'}
-        self.service.stage('官网自动输入已停止：' + reasons[error.reason],
-                           browser_input_phase=error.phase, browser_input_reason=error.reason)
+        metadata = {'browser_input_phase': error.phase, 'browser_input_reason': error.reason}
+        if error.browser_error is not None:
+            metadata['browser_input_error'] = error.browser_error
+        self.service.stage('官网自动输入已停止：' + reasons[error.reason], **metadata)

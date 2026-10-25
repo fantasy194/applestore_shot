@@ -83,6 +83,7 @@ def main():
         if request.get('account_id') != channel.account_id or request.get('task_id') != channel.task_id:
             raise ValueError('任务与账号标识不匹配。')
         credential = request.pop('credential', None)
+        credential_remember = request.pop('credential_remember', False) is True
         credential_rejected = request.pop('credential_rejected', False) is True
         params = request.get('params', {})
         child = isinstance(params, dict) and params.get('_parallel_child') is True
@@ -117,9 +118,10 @@ def main():
             from service import Service
             service = Service(channel, root, task_dir, account)
             service.password_rejected = credential_rejected
+            legacy_remember = params.pop('_remember_password', False) is True
             if isinstance(credential, str) and credential and len(credential.encode('utf-8')) <= 4096 and not child:
                 service.password = credential
-                service.remember = params.pop('_remember_password', False) is True
+                service.remember = credential_remember or legacy_remember
             credential = None
             service.enable_logging()
             result = service.run(request['action'], request.get('params', {}))

@@ -9,8 +9,9 @@ from unittest.mock import Mock, patch
 
 import alipay_qr
 import duo_killer
+from duo_killer import account_info as actual_account_info
 import interaction
-from apple_login import browser_profile_path
+from apple_login import LoginError, browser_profile_path
 from browser_login import BrowserSessionError, login_in_browser as actual_browser_login
 from protocol import Cancelled
 from purchase_session import RECENT_MS, ensure_purchase_session, record_action_session, session_ready
@@ -45,7 +46,7 @@ class PurchaseSessionTests(unittest.TestCase):
         network.start();self.addCleanup(network.stop)
         browser=patch('browser_login.login_in_browser',side_effect=self.browser_refresh)
         self.browser=browser.start();self.addCleanup(browser.stop)
-        account=patch('duo_killer.account_info',return_value={'success':True,'logged_in':False,'reauthentication_required':True})
+        account=patch('duo_killer.account_info',side_effect=LoginError('fixture Shop exchange rejected',status=541,phase='store_exchange'))
         self.account_read=account.start();self.addCleanup(account.stop)
         self.events=[]
 
@@ -116,7 +117,7 @@ class PurchaseSessionTests(unittest.TestCase):
         def signed_out(session, **options):
             session.cookies.clear('.apple.com.cn', '/', 'as_ltn_cn')
             session.cookies.set('as_rec', 'current-response', domain='.apple.com.cn', path='/')
-            return {'success':True,'logged_in':False,'reauthentication_required':True}
+            raise LoginError('fixture Shop exchange rejected',status=541,phase='store_exchange')
         self.account_read.side_effect = signed_out
         original = self.browser.side_effect
         def restore(owner, **options):
@@ -144,7 +145,9 @@ class PurchaseSessionTests(unittest.TestCase):
         from browser_login import import_browser_session
         verified={'success':True,'logged_in':True,'scope':'account','apple_id':self.service.account}
         with patch('duo_killer.account_info',return_value=verified):
-            import_browser_session([], 'fixture-agent', self.service.account)
+            import_browser_session([{'name':'as_ltn_cn','value':'verified-session',
+                'domain':'.apple.com.cn','path':'/','secure':True,'expires':int(time.time())+3600}],
+                'fixture-agent', self.service.account)
         with patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed'}) as purchase:
             self.service.run('purchase',{'sku':'MK2M4CH','quantity':1})
         purchase.assert_called_once();self.browser.assert_called_once()
@@ -159,13 +162,69 @@ class PurchaseSessionTests(unittest.TestCase):
         self.browser.assert_called_once();purchase.assert_called_once()
 
     def test_current_verified_http_session_skips_browser_despite_old_failure(self):
+        self.account_read.side_effect=None
         self.account_read.return_value={'success':True,'logged_in':True,'apple_id':self.service.account}
         duo_killer.write_private_json(self.root/'session-maintenance.json',
             {'cooldown_until_ms':int(time.time()*1000)+3_600_000,'http_status':541})
         with patch('duo_killer.purchase_sku',return_value={'success':True,'status':'pending_payment'}) as purchase:
             self.service.run('purchase',{'sku':'MK2M4CH'})
         self.browser.assert_not_called();purchase.assert_called_once()
-        self.assertFalse(self.account_read.call_args.kwargs['reauthenticate'])
+        self.assertTrue(self.account_read.call_args.kwargs['reauthenticate'])
+
+    def test_current_account_authentication_preserves_session_entry_and_response(self):
+        from purchase_session import verify_account_session
+        self.account_read.side_effect=actual_account_info
+        self.service.password='fixture-current-password'
+        current_response=object();sessions=[];flows=[]
+        class AccountFlow:
+            def __init__(inner,session):
+                inner.session=session;sessions.append(session);flows.append(inner)
+                inner.model={'signIn':{}};inner.url='https://secure6.www.apple.com.cn/shop/signIn/account?ssi=current-fixture'
+                inner.page_response=current_response
+            def page(inner,url,stage):inner.read_count=getattr(inner,'read_count',0)+1
+            def read_page(inner,response,stage):
+                inner.model={'home':{}};inner.url=response.url
+            def require(inner,name):
+                return {'d':{'signOutUrl':'/fixture-signout'},
+                    'customerAccount':{'d':{'appleId':self.service.account}}}
+        with patch('duo_killer.Checkout',AccountFlow),patch('apple_login.AppleStoreLogin') as client, \
+                patch('duo_killer.login') as full:
+            client.return_value.login.return_value=Mock(url='https://secure6.www.apple.com.cn/shop/account/home')
+            result=verify_account_session(self.service)
+        full.assert_not_called();self.browser.assert_not_called()
+        self.assertEqual(len(sessions),1)
+        self.assertEqual(flows[0].read_count,1)
+        self.assertIs(client.call_args.kwargs['session'],sessions[0])
+        args=client.return_value.login.call_args
+        self.assertEqual(args.args,(self.service.account,'fixture-current-password'))
+        self.assertEqual(args.kwargs['signin_url'],'https://secure6.www.apple.com.cn/shop/signIn/account?ssi=current-fixture')
+        self.assertIs(args.kwargs['signin_response'],current_response)
+        self.assertEqual(result['status'],'healthy')
+        self.assertFalse(self.service._account_auth_active)
+
+    def test_only_current_merchant_exchange_541_permits_browser_handoff(self):
+        from purchase_session import verify_account_session
+        for error in (LoginError('fixture rejected',status=401,codes=('-20101',)),
+                      LoginError('fixture unrelated 541',status=541),
+                      LoginError('fixture forbidden',status=403,phase='store_exchange')):
+            self.account_read.side_effect=error
+            with self.subTest(status=error.status),self.assertRaises(LoginError):
+                verify_account_session(self.service)
+            self.browser.assert_not_called()
+            self.assertFalse(self.service._account_auth_active)
+
+    def test_resolved_merchant_rejection_does_not_disable_stock_failure_retry(self):
+        def rejected(session,**options):
+            self.service.authentication_failed=True
+            raise LoginError('fixture Shop exchange rejected',status=541,phase='store_exchange')
+        self.account_read.side_effect=rejected
+        with patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed','message':'官网门店无货'}) as purchase, \
+                patch('purchase_retry._wait'):
+            result=self.service.run('purchase',{'sku':'MK2M4CH','retry_count':1})
+        self.assertEqual(purchase.call_count,2)
+        self.assertEqual(result['retry_summary']['stop_reason'],'exhausted')
+        self.browser.assert_called_once()
+        self.assertFalse(self.service.authentication_failed)
 
     def test_network_unknown_and_blocked_read_never_trigger_credential_login(self):
         import requests
@@ -179,19 +238,25 @@ class PurchaseSessionTests(unittest.TestCase):
         self.assertTrue(self.service.auth.exists())
 
     def test_inconclusive_account_result_does_not_claim_expiry(self):
+        self.account_read.side_effect=None
         for result in (None,{}, {'success':False}, {'success':True,'logged_in':False}):
             self.account_read.return_value=result
             with self.subTest(result=result),patch('duo_killer.purchase_sku') as purchase:
                 with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})
                 purchase.assert_not_called();self.browser.assert_not_called()
 
-    def test_missing_session_recovers_once_without_meaningless_account_probe(self):
+    def test_missing_session_uses_first_login_then_one_identity_probe(self):
         auth=json.loads(self.service.auth.read_text(encoding='utf-8'))
         auth['cookies']={key:[] for key in auth['cookies']}
         duo_killer.write_private_json(self.service.auth,auth)
-        with patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed'}) as purchase:
+        self.account_read.side_effect=None
+        self.account_read.return_value={'success':True,'logged_in':True,'apple_id':self.service.account}
+        with patch('duo_killer.purchase_sku',return_value={'success':False,'status':'failed'}) as purchase, patch('duo_killer.login') as login:
             self.service.run('purchase',{'sku':'MK2M4CH'})
-        self.account_read.assert_not_called();self.browser.assert_called_once();purchase.assert_called_once()
+        login.assert_called_once_with()
+        self.account_read.assert_called_once()
+        self.assertFalse(self.account_read.call_args.kwargs['reauthenticate'])
+        self.browser.assert_not_called();purchase.assert_called_once()
 
     def test_another_service_global_auth_binding_is_rejected_before_network(self):
         duo_killer.AUTH_PATH=self.root/'other-account'/'auth.json'
@@ -201,6 +266,7 @@ class PurchaseSessionTests(unittest.TestCase):
         self.account_read.assert_not_called();self.browser.assert_not_called();purchase.assert_not_called()
 
     def test_current_wrong_account_stops_without_browser_or_purchase(self):
+        self.account_read.side_effect=None
         self.account_read.return_value={'success':True,'logged_in':True,'apple_id':'other@example.test'}
         with patch('duo_killer.purchase_sku') as purchase:
             with self.assertRaises(BrowserSessionError):self.service.run('purchase',{'sku':'MK2M4CH'})

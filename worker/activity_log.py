@@ -25,8 +25,15 @@ DETAIL_FIELDS = frozenset((
     'concurrency', 'retry_count', 'attempts_made', 'retries_used', 'stop_reason', 'order_submitted', 'fulfillment',
     'success', 'prompt_kind', 'prepared', 'auto_purchase', 'operation', 'transport', 'browser_mode', 'configured',
     'queue_job_id', 'queue_assignment', 'sequence', 'enqueued_at_ms', 'mode', 'max_concurrency', 'queued_count', 'running_count', 'source',
+    'browser_input_reason', 'browser_input_phase', 'browser_input_error',
 ))
 IDENTIFIER = re.compile(r'[A-Za-z0-9_.:-]{1,100}')
+INPUT_DIAGNOSTICS = {
+    'browser_input_reason': {'document_changed', 'frame_detached', 'page_closed', 'deadline',
+        'focus_changed', 'element_replaced', 'value_changed', 'field_missing', 'invalid_text', 'cdp_error'},
+    'browser_input_phase': {'recognition', 'before_input', 'focus', 'clear', 'type', 'verify', 'submit', 'navigation', 'input'},
+    'browser_input_error': {'timeout', 'detached_context', 'target_closed', 'protocol_error', 'other'},
+}
 SENSITIVE_ASSIGNMENT = re.compile(
     r'''(?ix)(["']?(?:password|passwd|pwd|token|access_token|refresh_token|id_token|authorization|cookie|set-cookie|otp|verification_code|验证码|密码|x-aos-stk|x-as-actk|csrf|secret|api_?key)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}]+)''')
 
@@ -60,6 +67,10 @@ def safe_details(details):
     result = {}
     for key, value in details.items():
         if key not in DETAIL_FIELDS:
+            continue
+        if key in INPUT_DIAGNOSTICS:
+            if isinstance(value, str) and value in INPUT_DIAGNOSTICS[key]:
+                result[key] = value
             continue
         if value is None or type(value) is bool:
             result[key] = value
@@ -270,7 +281,8 @@ class ActivityLog:
         queue_context = {key: payload[key] for key in ('queue_job_id', 'queue_assignment') if key in payload}
         if kind in ('stage', 'log'):
             self.record('task_' + kind, payload.get('message', ''),
-                        details={**queue_context, 'order_submitted': payload.get('order_submitted') is True},
+                        details={**queue_context, **{key: payload[key] for key in INPUT_DIAGNOSTICS if key in payload},
+                                 'order_submitted': payload.get('order_submitted') is True},
                         category='queue' if queue_context else None)
         elif kind == 'prompt':
             prompt = payload.get('prompt') if isinstance(payload.get('prompt'), dict) else {}

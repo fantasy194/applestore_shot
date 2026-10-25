@@ -25,38 +25,47 @@ class AccountCheckTests(unittest.TestCase):
         self.stack.enter_context(patch.object(interaction, 'handler', None))
         self.service = Service(Channel('a', 't', io.StringIO()), root, root, 'a@example.test', Mock())
         self.service.ensure_auth_file()
-        self.person = {'success': True, 'logged_in': True, 'scope': 'account', 'apple_id': 'a@example.test'}
+        self.session_cookies(True)
+        self.person = {'success': True, 'logged_in': True, 'scope': 'account', 'apple_id': 'a@example.test', 'status': 'healthy'}
         self.info = self.stack.enter_context(patch.object(duo_killer, 'account_info', return_value=self.person))
         self.login = self.stack.enter_context(patch.object(duo_killer, 'login'))
         self.save = self.stack.enter_context(patch.object(duo_killer, 'save_auth'))
         self.stack.enter_context(patch.object(duo_killer, 'load_auth'))
 
+    def session_cookies(self, present):
+        self.service.auth.write_text(json.dumps({'account': 'a@example.test', 'cookies': {
+            'account_session': [{'name': 'fixture', 'value': 'fixture'}] if present else []}}), encoding='utf-8')
+
     def test_valid_account_is_queried_without_login(self):
-        self.assertEqual(self.service.run('me', {}), self.person)
+        self.assertEqual(self.service.run('me', {}), {**self.person, 'device_trust_saved': False})
         self.info.assert_called_once()
         self.login.assert_not_called()
 
-    def test_failed_query_performs_one_login_then_queries_current_person(self):
-        self.info.side_effect = [ValueError('未取得账号信息'), self.person]
-        self.assertEqual(self.service.run('me', {}), self.person)
-        self.login.assert_called_once_with()
-        self.assertEqual(self.info.call_count, 2)
+    def test_inconclusive_query_preserves_session_without_new_login(self):
+        self.info.side_effect = ValueError('未取得账号信息')
+        with self.assertRaisesRegex(ValueError, '未取得账号信息'):
+            self.service.run('me', {})
+        self.login.assert_not_called()
+        self.assertEqual(self.info.call_count, 1)
 
-    def test_missing_identity_also_triggers_login(self):
-        self.info.side_effect = [{'success': True, 'logged_in': False}, self.person]
-        self.assertEqual(self.service.run('me', {}), self.person)
-        self.login.assert_called_once_with()
+    def test_missing_identity_does_not_trigger_speculative_login(self):
+        self.info.return_value = {'success': True, 'logged_in': False}
+        with self.assertRaisesRegex(ValueError, '无法核验'):
+            self.service.run('me', {})
+        self.login.assert_not_called()
+        self.assertEqual(self.info.call_count, 1)
 
     def test_account_page_reauthentication_is_not_followed_by_another_login(self):
-        def reauthenticate(session):
+        def reauthenticate(session, *, reauthenticate):
+            self.assertTrue(reauthenticate)
             self.service.authentication_requested = True
             return self.person
         self.info.side_effect = reauthenticate
-        self.assertEqual(self.service.run('me', {}), self.person)
+        self.assertEqual(self.service.run('me', {}), {**self.person, 'device_trust_saved': False})
         self.login.assert_not_called()
 
     def test_wrong_password_or_otp_does_not_retry_login(self):
-        def rejected(session):
+        def rejected(session, *, reauthenticate):
             self.service.authentication_requested = True
             raise ValueError('401 -20101')
         self.info.side_effect = rejected
@@ -66,6 +75,7 @@ class AccountCheckTests(unittest.TestCase):
         self.service.vault.save.assert_not_called()
 
     def test_failed_relogin_retains_account_and_credentials(self):
+        self.session_cookies(False)
         self.info.return_value = {'logged_in': False}
         self.login.side_effect = ValueError('认证失败')
         with self.assertRaises(ValueError) as caught:
@@ -77,11 +87,12 @@ class AccountCheckTests(unittest.TestCase):
         self.login.assert_called_once()
 
     def test_identity_still_missing_after_relogin_retains_account(self):
+        self.session_cookies(False)
         self.info.return_value = {'success': True, 'logged_in': False}
         with self.assertRaises(ValueError) as caught:
             self.service.run('me', {})
         self.assertFalse(self.service.should_remove_account(caught.exception))
-        self.assertEqual(self.info.call_count, 2)
+        self.assertEqual(self.info.call_count, 1)
         self.login.assert_called_once()
 
     def test_network_or_server_failure_after_relogin_keeps_account(self):
@@ -89,7 +100,8 @@ class AccountCheckTests(unittest.TestCase):
         for error in [requests.Timeout('离线'), ValueError('服务暂不可用')]:
             if isinstance(error, ValueError):
                 error.__cause__ = LoginError('服务暂不可用', status=503)
-            self.info.side_effect = [ValueError('未确认登录'), error]
+            self.session_cookies(False)
+            self.info.side_effect = error
             with self.assertRaises(type(error)) as caught:
                 self.service.run('me', {})
             self.assertFalse(self.service.should_remove_account(caught.exception))
@@ -127,6 +139,7 @@ class AccountCheckTests(unittest.TestCase):
                     self.assertFalse(self.service.should_remove_account(caught.exception))
 
     def test_failed_fallback_does_not_restore_old_cookies(self):
+        self.session_cookies(False)
         self.info.return_value = {'logged_in': False}
         self.login.side_effect = ValueError('登录失败')
         with self.assertRaisesRegex(ValueError, '登录失败'):

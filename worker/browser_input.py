@@ -7,11 +7,27 @@ class BrowserInputInterrupted(ValueError):
     REASONS = {'document_changed', 'frame_detached', 'page_closed', 'deadline',
                'focus_changed', 'element_replaced', 'value_changed', 'field_missing', 'invalid_text', 'cdp_error'}
     PHASES = {'recognition', 'before_input', 'focus', 'clear', 'type', 'verify', 'submit', 'navigation', 'input'}
+    ERRORS = {'timeout', 'detached_context', 'target_closed', 'protocol_error', 'other'}
 
-    def __init__(self, message, *, reason='cdp_error', phase='input'):
+    def __init__(self, message, *, reason='cdp_error', phase='input', browser_error=None):
         super().__init__(message)
         self.reason = reason if reason in self.REASONS else 'cdp_error'
         self.phase = phase if phase in self.PHASES else 'input'
+        self.browser_error = browser_error if browser_error in self.ERRORS else None
+
+
+def browser_error_category(error):
+    """Classify privately; never return exception text, URLs or supplied values."""
+    if type(error).__name__ == 'TimeoutError':
+        return 'timeout'
+    message = str(error)
+    if any(fragment in message for fragment in ('Execution context was destroyed', 'Cannot find context', 'Frame was detached', 'Element is not attached')):
+        return 'detached_context'
+    if any(fragment in message for fragment in ('Target closed', 'Target page, context or browser has been closed', 'Browser has been closed')):
+        return 'target_closed'
+    if 'Protocol error' in message:
+        return 'protocol_error'
+    return 'other'
 
 
 def click_control(locator, *, timeout=1500):
@@ -60,7 +76,8 @@ def _navigation_guard(page, checkpoint, deadline, *, frame=None):
             checkpoint()
             if invalidated or page.is_closed():
                 raise BrowserInputInterrupted('页面已变化，已停止剩余输入。', reason='page_closed' if page.is_closed() else 'frame_detached', phase='navigation')
-            if deadline is not None and time.monotonic() >= deadline:
+            current_deadline = deadline() if callable(deadline) else deadline
+            if current_deadline is not None and time.monotonic() >= current_deadline:
                 raise BrowserInputInterrupted('输入已超时，已停止剩余输入。', reason='deadline', phase='input')
             if frame is not None and frame.is_detached():
                 raise BrowserInputInterrupted('登录页面已变化，已停止剩余输入。', reason='frame_detached', phase='navigation')
@@ -103,8 +120,8 @@ def type_keyboard_text(page, text, checkpoint=lambda: None, *, deadline=None):
                     raise BrowserInputInterrupted('输入窗口焦点已变化，已停止输入。', reason='focus_changed', phase='type')
     except BrowserInputInterrupted:
         raise
-    except Exception:
-        raise BrowserInputInterrupted('浏览器输入中断，请确认当前页面后重试。') from None
+    except Exception as error:
+        raise BrowserInputInterrupted('浏览器输入中断，请确认当前页面后重试。', browser_error=browser_error_category(error)) from None
 
 
 def replace_field(page, frame, locator, text, checkpoint, *, deadline=None, rebind_before_input=None):
@@ -124,16 +141,21 @@ def replace_field(page, frame, locator, text, checkpoint, *, deadline=None, rebi
             click_control(locator)
             check()
 
-            def focused():
-                return locator.evaluate('(element, original) => element === original && element === element.ownerDocument.activeElement && element.ownerDocument.hasFocus()', original) is True
+            def require_field(phase, expected=None):
+                # Use the captured handle, not a Locator that may auto-wait for
+                # a replacement. One CDP read checks identity/liveness, focus
+                # and the expected prefix together without returning the value.
+                reason = original.evaluate('''(element, expected) => {
+                    const __duo_input_state = true;
+                    if (!element.isConnected || element.ownerDocument !== document) return 'element_replaced';
+                    if (element !== document.activeElement || !document.hasFocus()) return 'focus_changed';
+                    if (expected !== null && element.value !== expected) return 'value_changed';
+                    return null;
+                }''', expected)
+                if reason in ('element_replaced', 'focus_changed', 'value_changed'):
+                    raise BrowserInputInterrupted('登录输入目标或内容已变化，已停止输入。', reason=reason, phase=phase)
 
-            def require_focus(phase):
-                if not focused():
-                    same = locator.evaluate('(element, original) => element === original', original) is True
-                    raise BrowserInputInterrupted('登录输入目标已变化，已停止输入。',
-                        reason='focus_changed' if same else 'element_replaced', phase=phase)
-
-            if locator.evaluate('(element, original) => element === original', original) is not True:
+            if locator.evaluate('(element, original) => element === original && element.isConnected && element.ownerDocument === document', original) is not True:
                 if rebind_before_input is None:
                     raise BrowserInputInterrupted('登录输入字段已变化，已停止输入。', reason='element_replaced', phase='before_input')
                 replacement = rebind_before_input()
@@ -142,33 +164,34 @@ def replace_field(page, frame, locator, text, checkpoint, *, deadline=None, rebi
                 original.dispose()
                 locator = replacement
                 original = locator.element_handle(timeout=500)
+                if original is None:
+                    raise BrowserInputInterrupted('登录输入字段已变化，已停止输入。', reason='field_missing', phase='before_input')
+                click_control(locator)
+                check()
 
-            require_focus('focus')
+            require_field('focus')
             phase = 'clear'
             page.keyboard.press('ControlOrMeta+A')
             check()
-            require_focus('clear')
+            require_field('clear')
             page.keyboard.press('Backspace')
             prefix = ''
             phase = 'type'
             for char in text:
                 check()
-                require_focus('type')
-                if locator.input_value(timeout=500) != prefix:
-                    raise BrowserInputInterrupted('登录输入内容已变化，已停止剩余输入。', reason='value_changed', phase='type')
+                require_field('type', prefix)
                 page.keyboard.type(char)
                 prefix += char
                 check()
-                require_focus('type')
-                if locator.input_value(timeout=500) != prefix:
-                    raise BrowserInputInterrupted('登录输入内容已变化，已停止剩余输入。', reason='value_changed', phase='type')
+                require_field('type', prefix)
     except BrowserInputInterrupted:
         raise
     except Exception as error:
         from browser_login import BrowserSessionError
         if isinstance(error, BrowserSessionError):
             raise
-        raise BrowserInputInterrupted('浏览器登录输入中断，请确认页面后重试。', reason='cdp_error', phase=phase) from None
+        raise BrowserInputInterrupted('浏览器登录输入中断，请确认页面后重试。', reason='cdp_error', phase=phase,
+                                      browser_error=browser_error_category(error)) from None
     finally:
         if original is not None:
             try:

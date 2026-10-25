@@ -27,56 +27,98 @@ def record_action_session(service, *, now_ms=None):
 
 
 def verify_account_session(service, *, force_browser=False):
-    """One current read, then at most one official browser authentication.
+    """Use the current Session and official authentication entry once.
 
     A maintenance record is scheduling metadata, never a purchase veto.
-    The read is authenticated with this account's current HTTP session and
-    cannot submit credentials or a purchase.
+    A healthy account read never submits credentials. An actual account login
+    response uses the same protocol and saved trust as first enrollment; only
+    an explicit merchant authx rejection delegates to the original browser.
     """
     service.channel.checkpoint()
     if Path(duo_killer.AUTH_PATH).resolve() != Path(service.auth).resolve():
         raise ValueError('当前会话存储与任务账号归属不一致，未发起官网请求。')
     service.ensure_auth_file()
+    previous_failed = getattr(service, 'authentication_failed', False)
     if not force_browser:
-        return _read_or_restore(service)
-    return _restore_browser(service)
+        result = _read_or_restore(service)
+    else:
+        result = _restore_browser(service)
+    # A current merchant rejection resolved by the bounded browser takeover is
+    # no longer an authentication failure for the purchase that follows it.
+    # Do not erase a failure that predated this restoration scope.
+    service.authentication_failed = previous_failed
+    return result
 
 
 def _read_or_restore(service):
     from browser_login import BrowserSessionError
     auth=json.loads(Path(service.auth).read_text(encoding='utf-8'))
     cookies=auth.get('cookies') if isinstance(auth,dict) else None
-    if isinstance(cookies,dict) and not any(isinstance(rows,list) and rows for rows in cookies.values()):
-        return _restore_browser(service)
-    with requests.Session() as session:
-        duo_killer.load_auth(session,auth)
-        # Timeouts, TLS failures, blocked responses and unknown account models
-        # provide no evidence that the existing login expired. Never turn those
-        # failures into a credential submission.
-        result=duo_killer.account_info(session,reauthenticate=False)
-        if isinstance(result,dict) and result.get('success') is True and result.get('logged_in') is True:
-            if str(result.get('apple_id','')).strip().casefold()!=service.account.strip().casefold():
-                raise BrowserSessionError('APPLE_ACCOUNT_MISMATCH',
-                    '官网当前登录账号与任务账号不一致，未开始购买。',status='failed',requires_login=False)
-            duo_killer.save_auth(session)
-            return {**result,'status':'healthy'}
-        if (isinstance(result,dict) and result.get('success') is True
-                and result.get('logged_in') is False and result.get('reauthentication_required') is True):
-            # The official redirect may have rotated or deleted merchant keys.
-            # Recovery must consume this response state, not revive the export
-            # that existed before the account check. Browser-only trust remains.
-            duo_killer.save_auth(session)
-            previous = getattr(service, '_http_session_rejected', False)
-            service._http_session_rejected = True
+    previous_auth = getattr(service, '_account_auth_active', False)
+    service._account_auth_active = True
+    try:
+        if isinstance(cookies,dict) and not any(isinstance(rows,list) and rows for rows in cookies.values()):
+            # There is no account session to authenticate in place. Reuse the
+            # first-login routine, including its existing device-trust export.
+            service.stage('尚无商城会话，使用首次登录流程和已保存设备信任自动登录')
             try:
-                # Even without Set-Cookie deletion, this HTTP snapshot was
-                # rejected. Let the original browser assess its own session.
-                return _restore_browser(service)
-            finally:
-                service._http_session_rejected = previous
+                duo_killer.login()
+            except Exception as error:
+                if _merchant_exchange_rejected(error):
+                    return _restore_after_rejection(service)
+                raise
+            auth=json.loads(Path(service.auth).read_text(encoding='utf-8'))
+            authenticate_current=False
+        else:
+            authenticate_current=True
+        with requests.Session() as session:
+            duo_killer.load_auth(session,auth)
+            try:
+                # account_info only requests credentials after this exact GET
+                # returned an official account authentication entry. It retains
+                # that response's Session, SSI/STK, dynamic URL and saved trust.
+                result=duo_killer.account_info(session,reauthenticate=authenticate_current)
+            except Exception as error:
+                if not _merchant_exchange_rejected(error):
+                    raise
+                # Persist current response rotations/deletions before browser
+                # handoff. Never revive the pre-request HTTP snapshot.
+                duo_killer.save_auth(session)
+                return _restore_after_rejection(service)
+            if isinstance(result,dict) and result.get('success') is True and result.get('logged_in') is True:
+                if str(result.get('apple_id','')).strip().casefold()!=service.account.strip().casefold():
+                    raise BrowserSessionError('APPLE_ACCOUNT_MISMATCH',
+                        '官网当前登录账号与任务账号不一致，未开始购买。',status='failed',requires_login=False)
+                duo_killer.save_auth(session)
+                return {**result,'status':'healthy'}
+    finally:
+        service._account_auth_active = previous_auth
     raise BrowserSessionError('PURCHASE_SESSION_UNVERIFIED',
         '官网当前会话暂时无法核验，已保留登录状态；未重新登录或开始购买。',
         status='failed',requires_login=False)
+
+
+def _merchant_exchange_rejected(error):
+    """Only a completed IDMS exchange rejected by Shop permits one handoff."""
+    from apple_login import LoginError
+    seen=set()
+    for _ in range(8):
+        if error is None or id(error) in seen:
+            break
+        seen.add(id(error))
+        if isinstance(error,LoginError) and error.status==541 and error.phase=='store_exchange':
+            return True
+        error=getattr(error,'__cause__',None)
+    return False
+
+
+def _restore_after_rejection(service):
+    previous = getattr(service, '_http_session_rejected', False)
+    service._http_session_rejected = True
+    try:
+        return _restore_browser(service)
+    finally:
+        service._http_session_rejected = previous
 
 
 def _restore_browser(service):

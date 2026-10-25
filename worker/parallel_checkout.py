@@ -438,13 +438,17 @@ class PurchaseBatch:
                 or event.get('task_id') != item['task_id']):
             return False
         kind = event.get('type')
-        if kind not in ('checkout_auth_release', 'credential_rejected', 'checkout_auth_failed', 'checkout_browser_consumed'):
+        if kind not in ('checkout_auth_release', 'credential_rejected', 'credential_authenticated', 'checkout_auth_failed', 'checkout_browser_consumed'):
             return False
         with _AUTHENTICATION_LOCK:
             if self._owns_authentication(item, event.get('checkout_auth_lease')):
                 if kind == 'credential_rejected':
                     self.service.authentication_failed = True
+                    self.credential_owner.password_submitted()
                     self.credential_owner.reject_password()
+                elif kind == 'credential_authenticated':
+                    self.credential_owner.password_submitted()
+                    self.credential_owner.confirm_password_authenticated()
                 elif kind == 'checkout_auth_failed':
                     self.service.authentication_failed = True
                 elif kind == 'checkout_browser_consumed':
@@ -549,6 +553,10 @@ class PurchaseBatch:
                 shadow._checkout_auth_active = False
                 shadow.browser_password = owner.browser_password
                 shadow.reject_password = owner.reject_password
+                shadow.password_submitted = owner.password_submitted
+                shadow.begin_password_authentication = owner.begin_password_authentication
+                shadow.password_submission_interrupted = owner.password_submission_interrupted
+                shadow.confirm_password_authenticated = owner.confirm_password_authenticated
                 previous_requested = owner.authentication_requested
                 with shadow.checkout_authentication():
                     result = shadow.recover_checkout_authentication(payload)

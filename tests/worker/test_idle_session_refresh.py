@@ -35,6 +35,9 @@ class IdleSessionRefreshTests(unittest.TestCase):
         channel = Mock(account_id='fixture-account', task_id='fixture-task')
         self.service = Service(channel, root, root, 'owner@example.test', Mock())
         self.service.ensure_auth_file()
+        data=json.loads(self.service.auth.read_text(encoding='utf-8'))
+        data['cookies']['with_expiry']=[{'name':'as_ltn_cn','value':'fixture-current-session','domain':'.apple.com.cn','path':'/','expires':int(time.time())+3600}]
+        duo_killer.write_private_json(self.service.auth,data)
         self.service.action = 'session_maintain'
         self.service.headless_browser = True
 
@@ -58,30 +61,30 @@ class IdleSessionRefreshTests(unittest.TestCase):
         events = []
 
         def browser(service, **kwargs):
-            self.assertIs(service, self.service)
-            self.assertEqual(kwargs, {'timeout':120,'maintenance':True,'storefront':True,'recover':True,'automatic':True})
-            self.assertTrue(service.headless_browser)
-            events.append('browser-refreshed-and-verified')
-            return {'success': True, 'logged_in': True, 'status': 'healthy', 'scope': 'account','apple_id':service.account,'browser_started':True}
+            self.assertIsInstance(service, __import__('requests').Session)
+            self.assertEqual(kwargs, {'reauthenticate':True})
+            self.assertTrue(self.service.headless_browser)
+            events.append('session-verified')
+            return {'success': True, 'logged_in': True, 'status': 'healthy', 'scope': 'account','apple_id':self.service.account}
 
         def bag():
-            self.assertEqual(events, ['browser-refreshed-and-verified'])
+            self.assertEqual(events, ['session-verified'])
             events.append('bag-read')
             return True
 
         with ExitStack() as stack:
             forbidden = self.forbid_auth_and_purchase(stack)
-            browser_call = stack.enter_context(patch('browser_login.login_in_browser', side_effect=browser))
+            browser_call = stack.enter_context(patch('duo_killer.account_info', side_effect=browser))
             bag_call = stack.enter_context(patch('duo_killer.warm_empty_bag', side_effect=bag))
             result = self.service.warm_login()
         browser_call.assert_called_once()
         bag_call.assert_called_once()
         for call in forbidden:
             call.assert_not_called()
-        self.assertTrue(result['browser_context_refreshed'])
+        self.assertFalse(result['browser_context_refreshed'])
         self.assertTrue(result['warm_login'])
         self.assertTrue(result['empty_bag_ready'])
-        self.assertEqual(events, ['browser-refreshed-and-verified', 'bag-read'])
+        self.assertEqual(events, ['session-verified', 'bag-read'])
 
     def test_failed_or_requires_login_browser_result_returns_unchanged_without_bag_read(self):
         for result in ({'success': False, 'status': 'requires_login', 'requires_login': True},
@@ -90,7 +93,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
                        {'success': True, 'logged_in': False, 'status': 'healthy'}):
             with self.subTest(result=result), ExitStack() as stack:
                 self.forbid_auth_and_purchase(stack)
-                stack.enter_context(patch('browser_login.login_in_browser', return_value=result))
+                stack.enter_context(patch('duo_killer.account_info', return_value=result))
                 bag = stack.enter_context(patch('duo_killer.warm_empty_bag'))
                 with self.assertRaises(BrowserSessionError):
                     self.service.warm_login()
@@ -101,7 +104,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
             status='requires_login', requires_login=True)
         with ExitStack() as stack:
             self.forbid_auth_and_purchase(stack)
-            stack.enter_context(patch('browser_login.login_in_browser', side_effect=failure))
+            stack.enter_context(patch('duo_killer.account_info', side_effect=failure))
             bag = stack.enter_context(patch('duo_killer.warm_empty_bag'))
             with self.assertRaises(BrowserSessionError) as raised:
                 self.service.warm_login()
@@ -111,7 +114,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
     def test_known_541_marker_does_not_suppress_current_automatic_browser_refresh(self):
         profile=browser_profile_path(self.service.auth);profile.mkdir(parents=True)
         marker=profile/'.authx-541';marker.touch()
-        with patch('browser_login.login_in_browser',return_value={
+        with patch('duo_killer.account_info',return_value={
                 'success':True,'logged_in':True,'status':'healthy','apple_id':self.service.account}) as browser, \
                 patch('duo_killer.warm_empty_bag',return_value=True):
             self.service.warm_login()
@@ -121,10 +124,10 @@ class IdleSessionRefreshTests(unittest.TestCase):
     def test_manual_warm_login_uses_same_automatic_flow_in_visible_window(self):
         self.service.action='login';self.service.headless_browser=False
         def refresh(owner,**options):
-            self.assertFalse(owner.headless_browser)
-            self.assertTrue(options['automatic'])
-            return {'success':True,'logged_in':True,'apple_id':owner.account}
-        with patch('browser_login.login_in_browser',side_effect=refresh) as browser, \
+            self.assertFalse(self.service.headless_browser)
+            self.assertTrue(options['reauthenticate'])
+            return {'success':True,'logged_in':True,'apple_id':self.service.account}
+        with patch('duo_killer.account_info',side_effect=refresh) as browser, \
                 patch('duo_killer.warm_empty_bag',return_value=True) as bag:
             self.service.warm_login()
         browser.assert_called_once();bag.assert_called_once()
@@ -168,7 +171,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
         def browser(*args, **kwargs):
             events.append('browser')
             self.assertTrue(service.idle_maintenance)
-            return {'success': True, 'logged_in': True, 'status': 'healthy','apple_id':service.account}
+            return {'success': True, 'logged_in': True, 'status': 'healthy','apple_id':self.service.account}
 
         def prepare(sku, *, quantity, prepare_only):
             events.append('prepare')
@@ -178,7 +181,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
             return {'success': True, 'status': 'waiting_stock', 'preparation_stage': 'fulfillment',
                     'order_ready': False, 'review_verified': False}
 
-        with patch('browser_login.login_in_browser', side_effect=browser), \
+        with patch('duo_killer.account_info', side_effect=browser), \
                 patch.object(service, 'prepare_purchase_session'), \
                 patch('duo_killer.purchase_sku', side_effect=prepare), \
                 patch('requests.Session.request', side_effect=AssertionError('HTTP forbidden')):
@@ -198,7 +201,7 @@ class IdleSessionRefreshTests(unittest.TestCase):
                           'error_code': 'APPLE_SESSION_BLOCKED' if status == 'blocked' else 'OFFICIAL_SIGNIN_REQUIRED'}
                 if status == 'blocked':
                     result['http_status'] = 541
-                with patch('browser_login.login_in_browser', return_value=result), \
+                with patch('duo_killer.account_info', side_effect=BrowserSessionError(result['error_code'],'fixture failure',status=status,requires_login=result['requires_login'],http_status=result.get('http_status'))), \
                         patch('duo_killer.purchase_sku') as purchase:
                     checked = maintain_session(self.service, now=lambda: 100, warm_only=True,
                         preheat_flow='pickup_prepare', sku='MK2P4CH', count=2)

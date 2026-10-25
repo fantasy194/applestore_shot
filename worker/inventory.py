@@ -570,7 +570,12 @@ def _run_owned_inventory(action, params, channel, root, config, activity):
                 channel.checkpoint()
                 if schedule_state(config['schedule'])['paused'] or load_config(root) != config:
                     break
-                time.sleep(min(.1, deadline - time.monotonic()))
+                # Settings IO/checkpoints may consume the last part of this
+                # interval. Sample once after that work and never sleep <= 0.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(.1, remaining))
     finally:
         if broker:
             broker.close()

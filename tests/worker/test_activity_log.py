@@ -205,6 +205,18 @@ class ActivityTests(unittest.TestCase):
         for value in ('123456', 'secret-password', 'secret-screen', 'secret-pay'):
             self.assertNotIn(value, serialized)
 
+    def test_input_diagnostics_survive_stage_transport_with_only_bounded_values(self):
+        channel = Channel('account-a', 'task-a', io.StringIO())
+        channel.activity = self.log
+        channel.emit('stage', message='官网自动输入已停止。', browser_input_phase='type',
+                     browser_input_reason='cdp_error', browser_input_error='detached_context',
+                     password='never-record-this')
+        details = self.log.query()['entries'][0]['details']
+        self.assertEqual(details, {'order_submitted': False, 'browser_input_phase': 'type',
+                                  'browser_input_reason': 'cdp_error', 'browser_input_error': 'detached_context'})
+        self.assertEqual(safe_details({'browser_input_phase': 'never-record-this',
+            'browser_input_reason': ['private'], 'browser_input_error': True}), {})
+
     def test_real_queue_progress_shape_records_retry_and_job_metadata_without_private_result(self):
         channel = Channel('account-a', 'task-a', io.StringIO())
         channel.activity = self.log

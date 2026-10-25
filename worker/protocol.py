@@ -35,6 +35,7 @@ _CHECKOUT_BROWSER_ERRORS = {
     'CHECKOUT_BROWSER_ACCOUNT_UNVERIFIED': '官网登录账号尚未核验，未继续结账。',
     'CHECKOUT_BROWSER_ACCOUNT_MISMATCH': '官网登录账号与当前账号不一致，未继续结账。',
     'BROWSER_LOGIN_AUTHENTICATION_FAILED': '官网未接受当前结账凭据。',
+    'CREDENTIAL_STORAGE_UNAVAILABLE': '已保存凭据暂时无法读取，请检查凭据保险库；未删除或覆盖原凭据。',
     'BROWSER_LOGIN_REJECTED': '官网未完成当前结账认证。',
     'BROWSER_LOGIN_ACCOUNT_MISMATCH': '官网登录账号与当前账号不一致，已停止认证。',
     'BROWSER_LOGIN_SECURITY_CHALLENGE': '官网要求安全验证，当前自动认证无法继续。',
@@ -163,7 +164,7 @@ class Channel:
         self._checkout_auth_lease = None
 
     def emit(self, kind, **payload):
-        if kind == 'credential_rejected' and self._checkout_auth_lease is not None:
+        if kind in ('credential_rejected', 'credential_authenticated') and self._checkout_auth_lease is not None:
             payload['checkout_auth_lease'] = self._checkout_auth_lease
         if self.activity is not None:
             try:

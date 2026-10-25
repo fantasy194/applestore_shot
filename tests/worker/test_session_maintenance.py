@@ -65,10 +65,10 @@ class SessionMaintenanceTests(unittest.TestCase):
             from browser_process import _background_browser
             self.assertTrue(_background_browser.get())
             return {'success': True, 'logged_in': True, 'status': 'healthy','apple_id':owner.account}
-        with patch('browser_login.login_in_browser', side_effect=recover) as browser, \
+        with patch('purchase_session.verify_account_session', side_effect=recover) as browser, \
                 patch.object(service, 'warm_login') as warm, patch('duo_killer.purchase_sku') as purchase:
             result = service.run('session_maintain', {'warm_only': True, 'preheat_flow': 'browser_login'})
-        browser.assert_called_once_with(service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
+        browser.assert_called_once_with(service)
         warm.assert_not_called()
         purchase.assert_not_called()
         self.assertEqual(result['preheat_flow'], 'browser_login')
@@ -104,7 +104,7 @@ class SessionMaintenanceTests(unittest.TestCase):
             return {'success': True, 'logged_in': True}
         with patch.object(service, 'warm_login', side_effect=visible):
             service.run('login', {'warm_only': True})
-        with patch('browser_login.login_in_browser', side_effect=visible):
+        with patch('purchase_session.verify_account_session', side_effect=visible):
             service.run('login', {'browser_login': True})
         self.assertFalse(service.headless_browser)
 
@@ -144,10 +144,10 @@ class SessionMaintenanceTests(unittest.TestCase):
         self.assertEqual(service.channel.prompt.call_count, 2)
 
     def test_healthy_browser_read_is_saved_without_credentials(self):
-        with patch('browser_login.login_in_browser', return_value={
+        with patch('purchase_session.verify_account_session', return_value={
                 'logged_in': True, 'status': 'healthy', 'message': 'fixture verified'}) as browser:
             result = maintain_session(self.service, now=lambda: 100)
-        browser.assert_called_once_with(self.service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
+        browser.assert_called_once_with(self.service)
         self.assertEqual(result['status'], 'healthy')
         self.assertEqual(result['checked_at_ms'], 100000)
         self.assertEqual(result['cooldown_until_ms'], 0)
@@ -158,7 +158,7 @@ class SessionMaintenanceTests(unittest.TestCase):
         self.assertEqual(recorded.kwargs['category'], 'authentication')
 
     def test_541_enters_cooldown_without_profile_reset_or_login_loop(self):
-        with patch('browser_login.login_in_browser', side_effect=ValueError('HTTP 541 private fixture')) as browser:
+        with patch('purchase_session.verify_account_session', side_effect=ValueError('HTTP 541 private fixture')) as browser:
             first = maintain_session(self.service, now=lambda: 100)
             second = maintain_session(self.service, now=lambda: 101)
         browser.assert_called_once()
@@ -170,7 +170,7 @@ class SessionMaintenanceTests(unittest.TestCase):
     def test_failure_retries_next_ten_minute_cycle_instead_of_old_hour_cooldown(self):
         failure={'status':'blocked','requires_login':True,'http_status':541}
         healthy={'success':True,'logged_in':True,'status':'healthy'}
-        with patch('browser_login.login_in_browser',side_effect=[failure,healthy]) as browser:
+        with patch('purchase_session.verify_account_session',side_effect=[failure,healthy]) as browser:
             first=maintain_session(self.service,now=lambda:100)
             maintain_session(self.service,now=lambda:101)
             recovered=maintain_session(self.service,now=lambda:700)
@@ -182,14 +182,14 @@ class SessionMaintenanceTests(unittest.TestCase):
     def test_old_hour_record_is_only_ten_minute_background_schedule(self):
         (self.service.root/'session-maintenance.json').write_text(json.dumps({
             'status':'blocked','checked_at_ms':100000,'cooldown_until_ms':3700000}),encoding='utf-8')
-        with patch('browser_login.login_in_browser',return_value={
+        with patch('purchase_session.verify_account_session',return_value={
                 'success':True,'logged_in':True,'status':'healthy'}) as browser:
             result=maintain_session(self.service,now=lambda:701)
         browser.assert_called_once()
         self.assertTrue(result['success'])
 
     def test_missing_login_never_starts_automatic_authentication(self):
-        with patch('browser_login.login_in_browser', return_value={
+        with patch('purchase_session.verify_account_session', return_value={
                 'status': 'requires_login', 'requires_login': True}), patch('duo_killer.login') as login:
             result = maintain_session(self.service, now=lambda: 100)
         login.assert_not_called()
@@ -204,7 +204,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                 (self.service.root / 'session-maintenance.json').unlink(missing_ok=True)
                 error = BrowserSessionError(code, 'fixture public diagnostic',
                                             browser_started=True, browser_connected=False)
-                with patch('browser_login.login_in_browser', side_effect=error):
+                with patch('purchase_session.verify_account_session', side_effect=error):
                     result = maintain_session(self.service, now=lambda: 100)
                 self.assertEqual(result['status'], 'failed')
                 self.assertFalse(result['requires_login'])
@@ -220,7 +220,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                             (ValueError('private-fixture unexpected response'), 'SESSION_CHECK_INCOMPLETE')):
             with self.subTest(code=code):
                 (self.service.root / 'session-maintenance.json').unlink(missing_ok=True)
-                with patch('browser_login.login_in_browser', side_effect=error):
+                with patch('purchase_session.verify_account_session', side_effect=error):
                     result = maintain_session(self.service, now=lambda: 100)
                 self.assertEqual(result['status'], 'failed')
                 self.assertFalse(result['requires_login'])
@@ -231,7 +231,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                 self.assertNotIn('private-fixture', str(recorded))
 
     def test_explicit_browser_diagnostics_are_preserved(self):
-        with patch('browser_login.login_in_browser', return_value={
+        with patch('purchase_session.verify_account_session', return_value={
                 'status': 'requires_login', 'error_code': 'OFFICIAL_SIGNIN_REQUIRED',
                 'browser_started': True, 'browser_connected': True}):
             result = maintain_session(self.service, now=lambda: 100)
@@ -241,7 +241,7 @@ class SessionMaintenanceTests(unittest.TestCase):
 
     def test_idle_preheat_reuses_login_warm_flow_without_browser_read_or_purchase(self):
         self.service.warm_login.return_value = {'success': True, 'logged_in': True, 'warm_login': True}
-        with patch('browser_login.login_in_browser') as browser, patch('duo_killer.purchase_sku') as purchase:
+        with patch('purchase_session.verify_account_session') as browser, patch('duo_killer.purchase_sku') as purchase:
             result = maintain_session(self.service, now=lambda: 100, warm_only=True)
         self.service.warm_login.assert_called_once_with()
         browser.assert_not_called()
@@ -273,7 +273,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                 (self.service.root / 'session-maintenance.json').unlink(missing_ok=True)
                 self.service.warm_pickup_prepare.reset_mock()
                 self.service.warm_pickup_prepare.return_value = prepared
-                with patch('browser_login.login_in_browser') as browser:
+                with patch('purchase_session.verify_account_session') as browser:
                     result = maintain_session(self.service, now=lambda: 100, warm_only=True,
                                               preheat_flow='pickup_prepare', sku='MK2P4CH', count=2)
                 self.service.warm_pickup_prepare.assert_called_once_with('MK2P4CH', 2)
@@ -327,11 +327,11 @@ class SessionMaintenanceTests(unittest.TestCase):
         service.ensure_auth_file()
         profile=browser_profile_path(service.auth);profile.mkdir(parents=True)
         (profile/'.authx-541').touch()
-        with patch('browser_login.login_in_browser',return_value={
+        with patch('purchase_session.verify_account_session',return_value={
                 'success':True,'logged_in':True,'status':'healthy','apple_id':service.account}) as browser, \
                 patch.object(service,'run',return_value={'success':True,'status':'waiting_stock'}) as run:
             service.warm_pickup_prepare('MK2P4CH',1)
-        browser.assert_called_once_with(service,timeout=120,maintenance=True,storefront=True,recover=True,automatic=True)
+        browser.assert_called_once_with(service)
         run.assert_called_once()
         self.assertTrue((profile/'.authx-541').exists())
 
@@ -363,12 +363,12 @@ class SessionMaintenanceTests(unittest.TestCase):
                         'order_ready': False, 'review_verified': False}
             with patch('duo_killer.purchase_sku', side_effect=offline_prepare) as purchase, \
                     patch.object(service, 'prepare_purchase_session'), \
-                    patch('browser_login.login_in_browser', return_value={
+                    patch('purchase_session.verify_account_session', return_value={
                         'success': True, 'logged_in': True, 'status': 'healthy', 'apple_id':service.account}) as browser, \
                     patch('requests.Session.request', side_effect=AssertionError('network forbidden')):
                 result = service.run('session_maintain', {'warm_only': True,
                     'preheat_flow': 'pickup_prepare', 'sku': 'MK2P4CH', 'quantity': 2})
-            browser.assert_called_once_with(service, timeout=120, maintenance=True, storefront=True, recover=True, automatic=True)
+            browser.assert_called_once_with(service)
             purchase.assert_called_once()
             self.assertEqual(result['status'], 'waiting_stock')
             self.assertEqual(result['browser_mode'], 'background')
@@ -430,10 +430,10 @@ class SessionMaintenanceTests(unittest.TestCase):
         qr_root = alipay_qr.ROOT
         try:
             service = Service(Mock(), self.service.root, self.service.root, 'fixture@example.test', Mock())
-            with patch('browser_login.login_in_browser', return_value={'success': True, 'logged_in': True}) as browser, \
+            with patch('purchase_session.verify_account_session', return_value={'success': True, 'logged_in': True}) as browser, \
                     patch('duo_killer.login') as login:
                 result = service.run('login', {'browser_login': True})
-            browser.assert_called_once_with(service, automatic=True, recover=True)
+            browser.assert_called_once_with(service)
             login.assert_not_called()
             self.assertTrue(result['logged_in'])
             self.assertTrue(service.auth.exists())

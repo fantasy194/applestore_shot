@@ -489,9 +489,16 @@ class AutoCheckoutTests(unittest.TestCase):
         self.assertTrue(event['qr_loading'])
 
     def test_warm_login_never_adds_checks_out_or_submits(self):
-        with patch('browser_login.login_in_browser', return_value={
+        self.service.ensure_auth_file()
+        auth=json.loads(self.service.auth.read_text(encoding='utf-8'))
+        auth['cookies']['with_expiry']=[{'name':'as_ltn_cn','value':'fixture-current-session',
+            'domain':'.apple.com.cn','path':'/','expires':4102444800}]
+        duo_killer.write_private_json(self.service.auth,auth)
+        with patch('duo_killer.account_info', return_value={
                 'success': True, 'logged_in': True, 'status': 'healthy',
-                'apple_id': self.service.account, 'browser_started': True}) as browser, \
+                'apple_id': self.service.account}) as account, \
+                patch('browser_login.login_in_browser') as browser, \
+                patch.object(self.service, 'credentials') as credentials, \
                 patch.object(self.service, 'warm_start_context') as warm, \
                 patch.object(duo_killer, 'warm_empty_bag', return_value=True) as bag, \
                 patch.object(self.service, 'check_account') as check, \
@@ -499,11 +506,14 @@ class AutoCheckoutTests(unittest.TestCase):
                 patch.object(duo_killer, 'purchase_sku') as purchase, patch.object(duo_killer, 'pay_bag') as checkout, \
                 patch('requests.Session.request', side_effect=AssertionError('Synthetic warm fixture forbids real network')):
             result = self.service.run('login', {'warm_only': True})
-        browser.assert_called_once_with(self.service, timeout=120, maintenance=True,
-                                        storefront=True, recover=True, automatic=True)
+        account.assert_called_once()
+        self.assertTrue(account.call_args.kwargs['reauthenticate'])
+        browser.assert_not_called(); credentials.assert_not_called()
         check.assert_not_called(); warm.assert_not_called(); bag.assert_called_once_with()
         login.assert_not_called(); add.assert_not_called(); purchase.assert_not_called(); checkout.assert_not_called()
         self.assertTrue(result['warm_login'])
+        self.assertFalse(result['browser_context_refreshed'])
+        self.assertTrue(result['empty_bag_ready'])
         self.assertFalse(self.service.submitted)
 
     def test_stale_billing_response_refreshes_review_without_replaying_posts(self):

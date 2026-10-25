@@ -5,6 +5,35 @@ import browser_login
 
 
 class BrowserLoginTests(unittest.TestCase):
+    def test_password_checkpoint_requires_positive_owned_authentication_response(self):
+        for status,body,confirmed in ((200,{'authType':'hsa2'},True),
+                (200,{'authType':'unexpected'},False),
+                (200,{'serviceErrors':[{'code':'fixture'}],'authType':'hsa2'},False),
+                (409,{'authType':'hsa2'},False),(401,{},False)):
+            with self.subTest(status=status,body=body):
+                context=Mock();service=Mock()
+                browser_login.observe_login_network(context,service)
+                events={call.args[0]:call.args[1] for call in context.on.call_args_list}
+                request=Mock(url='https://idmsa.apple.com.cn/appleauth/auth/signin/complete')
+                events['request'](request)
+                events['response'](Mock(request=request,status=status,json=lambda:body))
+                self.assertEqual(service.confirm_password_authenticated.call_count,int(confirmed))
+
+    def test_generic_auth_401_and_otp_rejection_do_not_invalidate_password(self):
+        for path,body in (('/signin/complete',{}),
+                ('/signin/complete',{'serviceErrors':[{'code':'-21669'}]}),
+                ('/verify/trusteddevice/securitycode',{'serviceErrors':[{'code':'-20101'}]})):
+            with self.subTest(path=path,body=body):
+                context=Mock();service=Mock()
+                state=browser_login.observe_login_network(context,service)
+                events={call.args[0]:call.args[1] for call in context.on.call_args_list}
+                request=Mock(url='https://idmsa.apple.com.cn/appleauth/auth'+path)
+                events['request'](request)
+                events['response'](Mock(request=request,status=401,json=lambda:body))
+                self.assertTrue(state['authentication_failed'])
+                self.assertFalse(state['credential_rejected'])
+                service.confirm_password_authenticated.assert_not_called()
+
     def scoped_network(self):
         context=Mock()
         page=Mock(url='https://secure9.www.apple.com.cn/shop/signIn')
@@ -47,7 +76,7 @@ class BrowserLoginTests(unittest.TestCase):
         page.frames.append(auth)
         request=Mock(frame=auth,url='https://idmsa.apple.com.cn/appleauth/auth/signin/complete')
         events['request'](request)
-        events['response'](Mock(request=request,status=401))
+        events['response'](Mock(request=request,status=401,json=lambda:{'serviceErrors':[{'code':'-20101'}]}))
         auth.frame_element.assert_not_called()
         self.assertFalse(state['authentication_failed'])
         state['refresh']()
@@ -85,7 +114,7 @@ class BrowserLoginTests(unittest.TestCase):
                     state['refresh']()  # Current official frame is visibly active.
                     request=Mock(frame=frame,url='https://idmsa.apple.com.cn/appleauth/auth/signin/complete')
                     events['request'](request)
-                    events['response'](Mock(request=request,status=status))
+                    events['response'](Mock(request=request,status=status,json=lambda:{'serviceErrors':[{'code':'-20101'}]}))
                     frame.frame_element.return_value.is_visible.return_value=False
                     frame.is_detached.return_value=detached
                     state['refresh']()

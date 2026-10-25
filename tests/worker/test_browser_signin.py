@@ -36,10 +36,20 @@ class Field:
         return True
 
     def evaluate(self, script, original=None):
+        if '__duo_input_state' in script:
+            if self not in self.frame.fields and self.frame.fields:
+                return 'element_replaced'
+            if not self.frame.page.document_focus or self.frame.page.focus is not self:
+                return 'focus_changed'
+            return 'value_changed' if original is not None and self.value != original else None
+        if 'isConnected' in script and self.frame.fields and self not in self.frame.fields:
+            return False
         if 'hasFocus()' in script and not self.frame.page.document_focus:
             return False
         if 'Boolean(element.value)' in script:
             return bool(self.value)
+        if 'element.value === expected' in script:
+            return self.value == original
         if original is not None:
             return self is original and ('activeElement' not in script or self.frame.page.focus is self)
         return self.frame.page.focus is self
@@ -232,6 +242,30 @@ class BrowserInputTests(unittest.TestCase):
         self.assertTrue(all(delay == 0 for _, delay in page.events))
         self.assertTrue(all(not callbacks for callbacks in page.listeners.values()))
 
+    def test_each_character_checks_bound_state_without_reading_password_value(self):
+        page = Page()
+        field = Field(page.auth, 'password')
+        original = field.evaluate
+        field.evaluate = Mock(side_effect=original)
+        field.input_value = Mock(side_effect=AssertionError('Password value must stay inside browser checks'))
+        text = 'synthetic-guard-contract'
+        replace_field(page, page.auth, field, text, lambda: None)
+        self.assertEqual(field.value, text)
+        field.input_value.assert_not_called()
+        # Bound state is one read before and after each key, rather than
+        # separate re-resolving Locator identity, focus and value reads.
+        self.assertLessEqual(field.evaluate.call_count, 2 * len(text) + 4)
+
+    def test_removed_field_stops_without_waiting_for_a_replacement(self):
+        page = Page()
+        field = Field(page.auth, 'password')
+        page.auth.fields = [field]
+        page.after_type = lambda: setattr(page.auth, 'fields', [Field(page.auth, 'password')])
+        with self.assertRaises(BrowserInputInterrupted) as failure:
+            replace_field(page, page.auth, field, 'synthetic', lambda: None)
+        self.assertEqual((failure.exception.reason, failure.exception.phase), ('element_replaced', 'type'))
+        self.assertEqual(len(page.events), 1)
+
     def test_same_url_reload_interrupts_after_first_character(self):
         page = Page()
         field = Field(page.auth, 'password')
@@ -289,6 +323,18 @@ class BrowserInputTests(unittest.TestCase):
         with self.assertRaises(BrowserInputInterrupted) as raised:
             type_keyboard_text(page, 'private-fixture')
         self.assertNotIn('private-fixture', str(raised.exception))
+        self.assertEqual(raised.exception.browser_error, 'other')
+
+    def test_browser_error_diagnostic_is_allowlisted_and_never_contains_text(self):
+        for exception, category in ((TimeoutError('private-fixture'), 'timeout'),
+                                    (RuntimeError('Protocol error: private-fixture'), 'protocol_error'),
+                                    (RuntimeError('Execution context was destroyed: private-fixture'), 'detached_context')):
+            page = Page()
+            page.keyboard.type = Mock(side_effect=exception)
+            with self.subTest(category=category), self.assertRaises(BrowserInputInterrupted) as failure:
+                type_keyboard_text(page, 'private-fixture')
+            self.assertEqual(failure.exception.browser_error, category)
+            self.assertNotIn('private-fixture', str(failure.exception))
 
 
 class BrowserSigninTests(unittest.TestCase):
@@ -659,6 +705,27 @@ class BrowserSigninTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 'BROWSER_LOGIN_INPUT_INTERRUPTED')
         self.assertEqual(self.page.events, [])
 
+    def test_password_redraw_during_app_prompt_is_rebound_before_first_key(self):
+        account, button = self.form(account=self.service.account, password=True)
+        replacement = Field(self.page.auth, 'password', name='Password')
+        def redraw(**_):
+            self.page.auth.fields = [account, button, replacement]
+            self.page.focus = None
+            return 'private-fixture'
+        self.service.browser_password.side_effect = redraw
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.assertEqual(replacement.value, 'private-fixture')
+        self.assertEqual((replacement.clicks, button.clicks), (1, 1))
+
+    def test_password_redraw_on_focus_is_rebound_once_before_first_key(self):
+        account, button = self.form(account=self.service.account, password=True)
+        password = self.page.auth.fields[-1]
+        replacement = Field(self.page.auth, 'password', name='Password')
+        password.on_click = lambda: setattr(self.page.auth, 'fields', [account, button, replacement])
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+        self.assertEqual((password.value, replacement.value), ('', 'private-fixture'))
+        self.assertEqual((replacement.clicks, button.clicks), (1, 1))
+
     def test_replacement_iframe_never_repeats_account_or_password_submission(self):
         for stage in ('account', 'password'):
             with self.subTest(stage=stage):
@@ -762,15 +829,116 @@ class BrowserSigninTests(unittest.TestCase):
 
     def test_failed_password_is_never_retried(self):
         _, button = self.form(account=self.service.account, password=True)
+        self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
         self.page.auth.alerts = ['Incorrect password']
         with self.assertRaises(BrowserSessionError) as raised:
             self.assistant.step(self.page, self.network)
         self.assertEqual(raised.exception.code, 'BROWSER_LOGIN_AUTHENTICATION_FAILED')
         self.service.reject_password.assert_called_once()
-        self.assertEqual(button.clicks, 0)
+        self.assertEqual(button.clicks, 1)
         with self.assertRaises(BrowserSessionError):
             self.assistant.step(self.page, {'http_status': 401})
+        self.service.browser_password.assert_called_once()
+
+    def test_old_or_browser_prefilled_rejection_does_not_discard_app_password(self):
+        for initial in (True, False):
+            with self.subTest(initial=initial):
+                self.setUp()
+                self.form(account=self.service.account, password=True)
+                if not initial:
+                    self.page.auth.fields[-1].value = 'browser-prefilled-fixture'
+                    self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+                self.page.auth.alerts = ['Incorrect password']
+                with self.assertRaises(BrowserSessionError):
+                    self.assistant.step(self.page, self.network)
+                self.service.reject_password.assert_not_called()
+
+    def test_long_app_password_wait_preserves_budget_and_rebinds_without_replaying(self):
+        clock = [100.0]
+        self.assistant = BrowserSigninAssistant(self.service, automatic=True)
+        account, button = self.form(account=self.service.account, password=True)
+        replacement = Field(self.page.auth, 'password', name='Password')
+        def prompt(**_):
+            clock[0] += 90.0
+            self.page.auth.fields = [account, button, replacement]
+            return 'private-fixture'
+        self.service.browser_password.side_effect = prompt
+        with patch('time.monotonic', side_effect=lambda: clock[0]):
+            self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+            self.assertEqual(self.assistant.step(self.page, self.network), 'waiting')
+        self.assertEqual(self.assistant.user_wait_seconds, 90.0)
+        self.assertEqual(self.assistant.otp_wait_seconds, 90.0)
+        self.assertEqual(self.assistant.deadline, 250.0)
+        self.assertEqual((replacement.value, button.clicks), ('private-fixture', 1))
+
+    def test_second_preinput_redraw_does_not_loop_rebind_or_type(self):
+        account, button = self.form(account=self.service.account, password=True)
+        replacement = Field(self.page.auth, 'password', name='Password')
+        second = Field(self.page.auth, 'password', name='Password')
+        replacement.on_click = lambda: setattr(self.page.auth, 'fields', [account, button, second])
+        def prompt(**_):
+            self.page.auth.fields = [account, button, replacement]
+            return 'private-fixture'
+        self.service.browser_password.side_effect = prompt
+        with self.assertRaises(BrowserSessionError):
+            self.assistant.step(self.page, self.network)
+        self.assertEqual(self.page.events, [])
+        self.assertEqual(button.clicks, 0)
+
+    def test_normal_account_password_alert_does_not_discard_saved_credentials(self):
+        for text in ('请输入您的 Apple ID 和密码。', '使用账户密码登录', 'Enter your Apple ID and password.'):
+            with self.subTest(text=text):
+                self.setUp()
+                _, button = self.form(account=self.service.account, password=True)
+                self.page.auth.alerts = [text]
+                self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+                self.service.reject_password.assert_not_called()
+                self.assertEqual(button.clicks, 1)
+
+    def test_locked_account_does_not_invalidate_a_password(self):
+        self.form(account=self.service.account, password=True)
+        self.page.auth.alerts = ['Your account has been locked']
+        with self.assertRaises(BrowserSessionError):
+            self.assistant.step(self.page, self.network)
+        self.service.reject_password.assert_not_called()
         self.service.browser_password.assert_not_called()
+
+    def test_automatic_missing_password_uses_app_prompt_in_all_browser_modes(self):
+        for headless in (False, True):
+            with self.subTest(headless=headless):
+                self.setUp()
+                self.form(account=self.service.account, password=True)
+                self.assistant = BrowserSigninAssistant(self.service, headless=headless, automatic=True)
+                self.assistant.request_existing_credentials()
+                self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+                self.service.browser_password.assert_called_once_with(allow_prompt=True)
+
+    def test_only_app_supplied_submitted_password_marks_credential_for_persistence(self):
+        for prefilled in (False, True):
+            with self.subTest(prefilled=prefilled):
+                self.setUp()
+                self.form(account=self.service.account, password=True)
+                self.service.password_submitted = Mock()
+                if prefilled:
+                    self.page.auth.fields[-1].value = 'browser-prefilled-fixture'
+                self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+                self.assertEqual(self.service.password_submitted.call_count, 0 if prefilled else 1)
+
+    def test_app_filled_password_waiting_for_button_retains_submission_provenance(self):
+        for manual_changed in (False, True):
+            with self.subTest(manual_changed=manual_changed):
+                self.setUp()
+                _, button = self.form(account=self.service.account, password=True)
+                self.service.password_submitted = Mock()
+                button.is_enabled = lambda: False
+                self.assertEqual(self.assistant.step(self.page, self.network), 'waiting')
+                self.service.password_submitted.assert_not_called()
+                if manual_changed:
+                    self.page.auth.fields[-1].value = 'different-browser-filled-value'
+                button.is_enabled = lambda: True
+                self.assertEqual(self.assistant.step(self.page, self.network), 'acted')
+                self.assertEqual(button.clicks, 1)
+                self.assertEqual(self.service.password_submitted.call_count, 0 if manual_changed else 1)
 
     def test_interrupted_fill_never_resumes_after_navigation(self):
         self.form(account=self.service.account, password=True)

@@ -30,6 +30,10 @@ class Service:
         self.password = None
         self.remember = False
         self.password_rejected = False
+        self._password_submitted = None
+        self._password_authenticated = None
+        self._password_persisted = None
+        self._account_auth_active = False
         self.authentication_requested = False
         self.authentication_failed = False
         self.idle_maintenance = False
@@ -135,14 +139,8 @@ class Service:
                 '并发子任务需要重新认证，请先完成当前账号的官网登录。',
                 status='requires_login', requires_login=True)
         self.authentication_requested = True
-        if not self.password and not self.password_rejected:
-            try:
-                stored = self.vault.get(self.channel.account_id)
-                self.password = stored if isinstance(stored, str) and stored else None
-            except Exception:
-                self.password = None
-        if (not self.password and allow_prompt and self.headless_browser is not True
-                and self.idle_maintenance is not True):
+        self._load_saved_password()
+        if not self.password and allow_prompt:
             value = self.channel.prompt('password', '输入 Apple 账号密码，将自动填入当前官网登录页面',
                                         account=self.account, credential_storage=self.credential_storage())
             if not isinstance(value, dict) or not isinstance(value.get('password'), str) or not value['password']:
@@ -151,6 +149,44 @@ class Service:
             self.password_rejected = False
             self.remember = value.get('remember') is True
         return self.password
+
+    def _load_saved_password(self):
+        """Distinguish an absent password from an unreadable encrypted vault."""
+        if self.password or self.password_rejected:
+            return
+        try:
+            stored = self.vault.get(self.channel.account_id)
+        except Exception:
+            from browser_login import BrowserSessionError
+            raise BrowserSessionError('CREDENTIAL_STORAGE_UNAVAILABLE',
+                '已保存凭据暂时无法读取，请检查凭据保险库；未删除或覆盖原凭据。',
+                status='requires_login', requires_login=True) from None
+        self.password = stored if isinstance(stored, str) and stored else None
+
+    def begin_password_authentication(self):
+        self._password_submitted = None
+
+    def password_submission_interrupted(self):
+        self._password_submitted = None
+
+    def password_submitted(self, password=None):
+        """Record only an app-provided password used by this authentication."""
+        if (isinstance(self.password, str) and self.password and not self.password_rejected
+                and (password is None or password == self.password)):
+            self._password_submitted = self.password
+
+    def confirm_password_authenticated(self):
+        """An accepted password survives later shop, stock or checkout failures."""
+        if (not self.password or self.password_rejected
+                or self._password_submitted != self.password):
+            return
+        if self._password_authenticated == self.password:
+            return
+        self._password_authenticated = self.password
+        if self._parallel_child:
+            self.channel.emit('credential_authenticated')
+        else:
+            self.persist_password()
 
     @contextmanager
     def checkout_authentication(self):
@@ -232,18 +268,14 @@ class Service:
                 raise ValueError('当前结账认证缺少已保存密码，未提交认证。')
             return self.account, self.password
         self.authentication_requested = True
-        if not self.password and not self.password_rejected:
-            try:
-                self.password = self.vault.get(self.channel.account_id)
-            except Exception:
-                self.stage('凭据保险库不可用，请输入本次登录密码')
-        if self.idle_maintenance is True and not self._checkout_auth_active:
+        self._load_saved_password()
+        if self.idle_maintenance is True and not (self._checkout_auth_active or self._account_auth_active):
             from browser_login import BrowserSessionError
             raise BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
                 '当前后台会话需要通过官网登录恢复认证，未另行提交协议密码。',
                 status='requires_login', requires_login=True)
         if not self.password:
-            if getattr(self, 'headless_browser', False) is True:
+            if getattr(self, 'headless_browser', False) is True and not self._account_auth_active:
                 from browser_login import BrowserSessionError
                 raise BrowserSessionError('HEADLESS_LOGIN_REQUIRES_ATTENTION',
                     '后台预热缺少已保存密码，请在账号工作台完成登录后继续。',
@@ -607,13 +639,20 @@ class Service:
         self.channel.emit('stage', message=stage, **fields)
 
     def persist_password(self):
-        if self.remember and self.password and not self._parallel_child:
+        if (self.remember and self.password and not self._parallel_child
+                and self._password_authenticated == self.password
+                and self._password_persisted != self.password):
             try:
                 self.vault.save(self.channel.account_id, self.password)
+                self._password_persisted = self.password
             except Exception:
                 self.stage('凭据保险库未保存密码；当前服务运行期间仍可复用，重启后需重新输入')
 
     def reject_password(self):
+        # Browser autofill/manual input can reject a different password. Only
+        # this authentication's actual app-provided value can invalidate cache.
+        if not self.password or self._password_submitted != self.password:
+            return
         if not self.password_rejected:
             if not self._parallel_child:
                 try:
@@ -623,6 +662,7 @@ class Service:
             self.channel.emit('credential_rejected')
         self.password_rejected = True
         self.password = None
+        self._password_submitted = self._password_authenticated = None
 
     def cleanup_credentials(self, error=None):
         # Preserve account identity, trust/address/order configuration. Only an
@@ -642,14 +682,14 @@ class Service:
             if cause is None or id(cause) in seen:
                 break
             seen.add(id(cause))
-            if (getattr(cause, 'code', None) == 'BROWSER_LOGIN_AUTHENTICATION_FAILED'
-                    or getattr(cause, 'status', None) == 401 and '-20101' in (getattr(cause, 'codes', None) or ())):
+            if (getattr(cause, 'status', None) == 401 and '-20101' in (getattr(cause, 'codes', None) or ())):
                 rejected = True
                 break
             cause = getattr(cause, '__cause__', None)
         if rejected:
             self.reject_password()
         self.password = None
+        self._password_submitted = self._password_authenticated = self._password_persisted = None
 
     def should_remove_account(self, error):
         # Removal requires an explicit user action; task errors must retain it.
@@ -725,7 +765,7 @@ class Service:
         """Refresh idle browser sessions; retain explicit manual preheat behavior."""
         self.stage('预热登录：检查账号会话和设备信任，不加购、不下单')
         from purchase_session import verify_account_session
-        result = verify_account_session(self, force_browser=True)
+        result = verify_account_session(self)
         refreshed = result.get('browser_started') is True
         empty_bag_ready = duo_killer.warm_empty_bag()
         result.update(warm_login=True, browser_context_refreshed=refreshed,
@@ -751,7 +791,7 @@ class Service:
             raise ValueError('请先保存当前账号的购买数量，再进行自提预热。')
         if self.action == 'session_maintain':
             from purchase_session import verify_account_session, record_action_session
-            verify_account_session(self, force_browser=True)
+            verify_account_session(self)
             record_action_session(self)
         self.stage('空闲自提预热：使用当前账号商品和自提偏好，不创建订单')
         previous_owner = self._purchase_session_owner
@@ -857,7 +897,10 @@ class Service:
             from shop_catalog import query_store, query_duo
             return query_duo(duo_killer.request_get) if params.get('mode') == 'duo' else query_store(duo_killer.request_get, phone_only=params.get('mode') == 'phone')
         self.ensure_auth_file()
-        if action in ('enroll', 'me'):
+        if action == 'me':
+            from purchase_session import verify_account_session
+            result = verify_account_session(self)
+        elif action == 'enroll':
             if action == 'enroll' and params.get('browser_login') is True:
                 from browser_login import login_in_browser
                 result = login_in_browser(self, automatic=True, recover=True)
@@ -865,8 +908,8 @@ class Service:
                 result = self.check_account(enrolling=action == 'enroll')
         elif action == 'login':
             if params.get('browser_login') is True:
-                from browser_login import login_in_browser
-                result = login_in_browser(self, automatic=True, recover=True)
+                from purchase_session import verify_account_session
+                result = verify_account_session(self)
                 result['message'] = '官网登录与会话核对完成，账号和浏览器资料已保留。'
             elif params.get('warm_only') is True:
                 result = self.warm_login()

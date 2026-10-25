@@ -262,6 +262,7 @@ struct Control {
 #[derive(Clone, Default)]
 struct SessionCredential {
     password: Option<String>,
+    remember: bool,
     generation: u64,
     rejected: bool,
 }
@@ -863,8 +864,8 @@ impl Engine {
                 supplied_password.and_then(|value| value.as_str().map(str::to_owned))
             };
             state.rejected = false;
+            state.remember = action != "forget_password" && remember_password;
         }
-        if remember_password { params["_remember_password"] = json!(true); }
         self.update(&app, &id, |_| {});
         let engine = self.clone();
         let task_id = id.clone();
@@ -904,7 +905,7 @@ impl Engine {
             .try_send(message)
             .map_err(|_| "无法发送输入，任务可能已退出")?;
         if let Some(password) = password {
-            credentials.insert(account_id.into(), SessionCredential {password:Some(password),generation,rejected:false});
+            credentials.insert(account_id.into(), SessionCredential {password:Some(password),remember:value["remember"]==true,generation,rejected:false});
         }
         drop(credentials);
         task.prompt = None;
@@ -1011,8 +1012,9 @@ impl Engine {
             let state = self.session_passwords.lock().unwrap().get(&account.id).cloned().unwrap_or_default();
             let mut credential_generation = state.generation;
             let credential = state.password;
+            let credential_remember = state.remember;
             let credential_rejected = state.rejected;
-            stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params,"credential":credential,"credential_rejected":credential_rejected})).as_bytes()).await.map_err(|e| e.to_string())?;
+            stdin.write_all(format!("{}\n", json!({"account_id":account.id,"task_id":id,"account":account.email,"action":action,"params":params,"credential":credential,"credential_remember":credential_remember,"credential_rejected":credential_rejected})).as_bytes()).await.map_err(|e| e.to_string())?;
             let mut lines = BufReader::new(stdout).lines();
             self.update(&app, &id, |t| { t.status = "running".into(); t.stage = "开始执行".into();
                 t.execution_started_at_ms = Some(now_ms()); });
@@ -1041,6 +1043,7 @@ impl Engine {
                             let state = credentials.entry(account.id.clone()).or_default();
                             if state.generation == credential_generation {
                                 state.password = None;
+                                state.remember = false;
                                 state.rejected = true;
                             }
                             continue;
@@ -2063,10 +2066,14 @@ r=json.loads(sys.stdin.readline())
 def emit(kind, **data):
  print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type=kind,**data)),flush=True)
 assert 'password' not in r['params']
+assert '_remember_password' not in r['params']
 if r['params'].get('ask'):
  emit('prompt',prompt={'id':'fixture-password','kind':'password','label':'fixture'})
  reply=json.loads(sys.stdin.readline())
  assert reply['value']['password']=='fixture-secret-never-on-disk'
+ if r['params'].get('generic_failure'):
+  emit('error',message='fixture generic authentication failure')
+  sys.exit(0)
 if r['params'].get('reject_delay'):
  import time
  emit('stage',message='fixture-before-reject')
@@ -2074,27 +2081,30 @@ if r['params'].get('reject_delay'):
  emit('credential_rejected')
 if r['params'].get('reject'):
  emit('credential_rejected')
-emit('result',result={'success':True,'has_credential':r.get('credential')=='fixture-secret-never-on-disk','rejected':r.get('credential_rejected',False)})
+emit('result',result={'success':True,'has_credential':r.get('credential')=='fixture-secret-never-on-disk','rejected':r.get('credential_rejected',False),'remember':r.get('credential_remember',False)})
 "#).unwrap();
         let host = TaskHost { worker: python, script: Some(script), on_update: Arc::new(|_| {}) };
-        let id = engine.start(host.clone(), account.id.clone(), "bag".into(), json!({"ask":true})).unwrap();
+        let id = engine.start(host.clone(), account.id.clone(), "bag".into(), json!({"ask":true,"generic_failure":true})).unwrap();
         for _ in 0..500 {
             if engine.tasks.lock().unwrap()[&id].status=="waiting" { break; }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(engine.reply(&host,&another.id,&id,"fixture-password",json!({"password":"fixture-secret-never-on-disk"})).is_err());
         assert!(engine.session_passwords.lock().unwrap().is_empty());
-        engine.reply(&host,&account.id,&id,"fixture-password",json!({"password":"fixture-secret-never-on-disk","remember":false})).unwrap();
+        engine.reply(&host,&account.id,&id,"fixture-password",json!({"password":"fixture-secret-never-on-disk","remember":true})).unwrap();
         for _ in 0..500 {
             if terminal(&engine.tasks.lock().unwrap()[&id].status) && !engine.controls.lock().unwrap().contains_key(&id) { break; }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        for (owner, params, has_credential, rejected) in [
-            (account.id.clone(),json!({}),true,false),
-            (another.id.clone(),json!({}),false,false),
-            (account.id.clone(),json!({"reject":true}),true,false),
-            (account.id.clone(),json!({}),false,true),
-            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk"}),true,false),
+        assert_eq!(engine.tasks.lock().unwrap()[&id].status,"failed");
+        for (owner, params, has_credential, rejected, remember) in [
+            (account.id.clone(),json!({}),true,false,true),
+            (another.id.clone(),json!({}),false,false,false),
+            (account.id.clone(),json!({"reject":true}),true,false,true),
+            (account.id.clone(),json!({}),false,true,false),
+            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk"}),true,false,false),
+            (account.id.clone(),json!({"password":"fixture-secret-never-on-disk","remember":true}),true,false,true),
+            (account.id.clone(),json!({}),true,false,true),
         ] {
             let id=engine.start(host.clone(),owner,"bag".into(),params).unwrap();
             for _ in 0..500 {
@@ -2105,6 +2115,7 @@ emit('result',result={'success':True,'has_credential':r.get('credential')=='fixt
             assert_eq!(task.status,"succeeded","{}",task.stage);
             assert_eq!(task.result.as_ref().unwrap()["has_credential"],has_credential);
             assert_eq!(task.result.as_ref().unwrap()["rejected"],rejected);
+            assert_eq!(task.result.as_ref().unwrap()["remember"],remember);
             let disk=fs::read_to_string(scope_dir(temp.path(),&task.account_id).join("tasks").join(&id).join("task.json")).unwrap();
             assert!(!disk.contains("fixture-secret-never-on-disk"));
             assert!(!serde_json::to_string(&engine.snapshot()).unwrap().contains("fixture-secret-never-on-disk"));

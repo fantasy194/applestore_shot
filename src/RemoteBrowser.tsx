@@ -485,14 +485,18 @@ export function RemoteBrowser({
                   ? "正在使用现有凭证登录…"
                   : "使用现有凭证登录"}
               </button>
-              {(status.signin_status === "manual" ||
-                status.signin_status === "missing_credentials") && (
+              {status.signin_status === "manual" && (
                 <p className="muted">
-                  没有可用的登录凭证，请在官网窗口输入密码。
+                  自动输入已暂停。确认当前页面后，可使用现有凭证继续尚未提交的步骤。
+                </p>
+              )}
+              {status.signin_status === "missing_credentials" && (
+                <p className="muted">
+                  当前账号没有可复用的密码，请在当前任务中输入，并按需选择保存。
                 </p>
               )}
               {status.signin_status === "verification" && (
-                <p className="muted">请在官网窗口完成验证。</p>
+                <p className="muted">需要六位验证码时，请在当前任务中输入。</p>
               )}
             </div>
           )}

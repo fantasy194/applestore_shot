@@ -39,7 +39,8 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
             result = {**previous, 'preheat_flow': preheat_flow, 'browser_mode': browser_mode, 'cooldown_until_ms': checked_at + 600_000, 'message': '等待下一次空闲会话维护；购买可立即自动核验。'}
             record_maintenance_result(service, result, cooling=True, warm_only=warm_only)
             return result
-    from browser_login import login_in_browser, BrowserSessionError
+    from browser_login import BrowserSessionError
+    from purchase_session import verify_account_session
     try:
         if preheat_flow == 'pickup_prepare':
             prepared = service.warm_pickup_prepare(sku, count)
@@ -64,9 +65,9 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
                           'error_code', 'pickup_store', 'pickup_store_id', 'pickup_time_slot') if key in prepared}}
         else:
             if preheat_flow == 'browser_login':
-                checked = login_in_browser(service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
+                checked = verify_account_session(service)
             else:
-                checked = service.warm_login() if warm_only else login_in_browser(service, timeout=120, maintenance=True, recover=True, automatic=True, storefront=True)
+                checked = service.warm_login() if warm_only else verify_account_session(service)
             status = checked.get('status', 'healthy' if checked.get('logged_in') is True else 'requires_login')
             status = status if status in ('healthy', 'requires_login', 'blocked', 'failed') else 'failed'
             result = {'success': status == 'healthy', 'status': status,

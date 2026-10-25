@@ -760,6 +760,43 @@ test("实时心跳允许静止画面持续操作且不受服务器时钟影响",
   ).toEqual(["document_id", "sequence", "type"]);
 });
 
+test("输入中断不会误报凭据丢失，验证码使用当前任务", async ({ page }) => {
+  await streamFixture(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  const signin = page.getByRole("button", {
+    name: "使用现有凭证登录",
+    exact: true,
+  });
+  await expect(signin).toBeEnabled();
+  async function status(value: string) {
+    await page.evaluate((value) => {
+      const root = window as any;
+      root.remoteStreamState.paused = true;
+      root.remotePush({
+        active: true,
+        connected: true,
+        frame_current: true,
+        frame_updated: false,
+        frame: null,
+        document_id: "document-one",
+        revision: 1000,
+        signin_available: true,
+        signin_status: value,
+      });
+    }, value);
+  }
+  const hints = page.locator(".remote-browser-signin");
+  await status("manual");
+  await expect(hints).toContainText("自动输入已暂停");
+  await expect(hints).not.toContainText("没有可复用");
+  await status("missing_credentials");
+  await expect(hints).toContainText("请在当前任务中输入");
+  await expect(hints).not.toContainText("请在官网窗口输入密码");
+  await status("verification");
+  await expect(hints).toContainText("需要六位验证码时，请在当前任务中输入");
+  await expect(hints).not.toContainText("请在官网窗口完成验证");
+});
+
 test("实时连接中断禁用官网操作并保留草稿恢复", async ({ page }) => {
   await streamFixture(page);
   await page.goto("/", { waitUntil: "domcontentloaded" });

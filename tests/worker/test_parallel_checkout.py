@@ -64,7 +64,7 @@ if mode in ('checkout_auth', 'session_auth'):
         emit('error', message=str(error), order_submitted=False)
         sys.exit(0)
     raise AssertionError('child credential guard was bypassed')
-if mode in ('ipc_auth', 'ipc_otp', 'ipc_eof', 'ipc_reject', 'ipc_cancel', 'ipc_otp_exit_then_valid', 'ipc_auth_failed', 'ipc_plain_failure'):
+if mode in ('ipc_auth', 'ipc_otp', 'ipc_eof', 'ipc_reject', 'ipc_accept', 'ipc_cancel', 'ipc_otp_exit_then_valid', 'ipc_auth_failed', 'ipc_plain_failure'):
     sys.path[:0] = [params['fixture_worker_path']]
     import threading
     from protocol import Channel
@@ -90,6 +90,10 @@ if mode in ('ipc_auth', 'ipc_otp', 'ipc_eof', 'ipc_reject', 'ipc_cancel', 'ipc_o
                 channel.checkpoint(); time.sleep(.02)
         if mode == 'ipc_reject':
             channel.emit('credential_rejected')
+        if mode == 'ipc_accept':
+            # Dispatching a forged stale lease must not validate the owner.
+            emit('credential_authenticated', checkout_auth_lease='stale-fixture')
+            channel.emit('credential_authenticated')
         if mode == 'ipc_auth_failed':
             raise ValueError('synthetic authentication failure')
         time.sleep(.15)
@@ -211,6 +215,14 @@ class ParallelPurchaseTests(unittest.TestCase):
         self.assertEqual(len(result['pending_orders']), 3)
         self.assertEqual(transitions, ['grant','reject'] * 3)
         self.assertNotIn('credential_rejected', self.channel.output.getvalue())
+
+    def test_password_acceptance_ack_is_lease_bound_and_never_public(self):
+        result = self.run_batch('ipc_accept', count=2)
+        self.assertEqual(len(result['pending_orders']), 2)
+        self.assertEqual(self.service.password_submitted.call_count, 2)
+        self.assertEqual(self.service.confirm_password_authenticated.call_count, 2)
+        self.assertNotIn('credential_authenticated', self.channel.output.getvalue())
+        self.assertNotIn('ipc-private-fixture', self.channel.output.getvalue())
 
     def test_two_batches_same_account_share_authentication_lease(self):
         first = PurchaseBatch(self.service, {'fulfillment':'RETAIL','concurrency':1,
