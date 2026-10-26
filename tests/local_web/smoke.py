@@ -145,7 +145,7 @@ def main(package):
             assert queue_state['mode'] == 'parallel' and queue_state['max_concurrency'] == 2
             call('queue_command', operation='configure', params={'mode': 'sequential', 'max_concurrency': 1})
             maintenance = call('maintenance_command', operation='status', params={})
-            assert maintenance['enabled'] is True and maintenance['interval_minutes'] == 10
+            assert maintenance['enabled'] is True and maintenance['interval_minutes'] == 5
             assert maintenance['mode'] == 'idle_warm_login'
             assert maintenance['flow'] == 'login'
             assert maintenance['last_runs'] == []
@@ -160,8 +160,12 @@ def main(package):
                                params={'enabled': False, 'interval_minutes': 10})
             assert maintenance['enabled'] is False and maintenance['interval_minutes'] == 10
             request('/api/maintenance_command', {'operation': 'configure',
-                    'params': {'enabled': True, 'interval_minutes': 45}}, expected=400)
+                    'params': {'enabled': True, 'interval_minutes': 61}}, expected=400)
             assert call('maintenance_command', operation='status', params={})['enabled'] is False
+            for minutes in (1, 60):
+                updated = call('maintenance_command', operation='configure', params={'interval_minutes': minutes})
+                assert updated['interval_minutes'] == minutes and updated['enabled'] is False
+                assert updated['interval_configured'] is True
             call('maintenance_command', operation='configure', params={'enabled': True, 'interval_minutes': 10})
             logs = call('activity_logs', params={'category': 'queue', 'limit': 100})
             assert any(entry['event'] == 'queue_configure' for entry in logs['entries'])

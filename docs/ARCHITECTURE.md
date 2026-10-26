@@ -1,5 +1,7 @@
 # 架构与运行约定
 
+0.1.22 区分官网明确结账过期与未知页面，在同一授权内复用当前购物袋恢复一次，见 [过期结账恢复](EXPIRED-CHECKOUT-RECOVERY.md)。
+
 0.1.21 的上午下单复盘、认证范围与返回主机轮换、当前 Cookie 保留及准备续期恢复，见 [上午维护复盘](MORNING-MAINTENANCE-REVIEW.md)。
 
 0.1.20 的监控准备范围、原会话续期、明确无货后的队列续用、私有身份证明和手动联系人准备，见 [活结账优化](LIVE-CHECKOUT-PERFORMANCE.md)。

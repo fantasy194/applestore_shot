@@ -12,7 +12,7 @@ fn services() -> &'static Mutex<HashMap<PathBuf, Arc<Maintenance>>> {
 }
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 fn default_enabled() -> bool { true }
-fn default_interval() -> u32 { 10 }
+fn default_interval() -> u32 { 5 }
 fn warm_mode() -> String { "idle_warm_login".into() }
 fn default_flow() -> String { "login".into() }
 fn valid_flow(flow: &str) -> bool { matches!(flow, "login" | "pickup_prepare" | "browser_login") }
@@ -27,6 +27,18 @@ fn configure_flow(settings: &mut Settings, value: &Value, current: u64) -> Resul
     }
     Ok(())
 }
+fn configure_interval(settings:&mut Settings,value:&Value)->Result<(),String> {
+    let minutes=value.as_u64().filter(|value|(1..=60).contains(value))
+        .ok_or("空闲预热间隔必须是1至60之间的整数分钟")? as u32;
+    settings.interval_minutes=minutes;
+    settings.interval_configured=true;
+    Ok(())
+}
+fn configure_prepared_inventory_interval(settings:&mut Settings,value:&Value)->Result<(),String> {
+    settings.prepared_inventory_interval_minutes=value.as_u64().filter(|value|(1..=60).contains(value))
+        .ok_or("准备内库存刷新间隔必须是1至60之间的整数分钟")? as u32;
+    Ok(())
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
@@ -39,12 +51,17 @@ struct Settings {
     #[serde(default = "default_interval")]
     interval_minutes: u32,
     #[serde(default)]
+    interval_configured: bool,
+    #[serde(default = "default_interval")]
+    prepared_inventory_interval_minutes: u32,
+    #[serde(default)]
     enabled_at_ms: u64,
     #[serde(default)]
     last_runs: Vec<Run>,
 }
 impl Default for Settings {
-    fn default() -> Self { Self { flow: default_flow(), mode: warm_mode(), enabled: true, interval_minutes: 10,
+    fn default() -> Self { Self { flow: default_flow(), mode: warm_mode(), enabled: true, interval_minutes: default_interval(), interval_configured: false,
+        prepared_inventory_interval_minutes:default_interval(),
         enabled_at_ms: 0, last_runs: Vec::new() } }
 }
 
@@ -102,14 +119,19 @@ fn load(root: &Path) -> (Settings, Option<String>) {
     let path = root.join("settings/session-maintenance.json");
     if !path.exists() { return (Settings::default(), None); }
     match fs::read(path).ok().and_then(|raw| serde_json::from_slice::<Settings>(&raw).ok()) {
-        Some(mut settings) if (5..=240).contains(&settings.interval_minutes)
+        Some(mut settings) if (1..=60).contains(&settings.interval_minutes)
+            && (1..=60).contains(&settings.prepared_inventory_interval_minutes)
             && settings.last_runs.len() <= 1000 && valid_flow(&settings.flow)
             && settings.last_runs.iter().all(|run| valid_flow(&run.flow)) => {
                 // Historical authentication failures are diagnostics, not a permanent
                 // manual-recovery gate. Automatic retries follow the idle interval.
                 for run in &mut settings.last_runs { run.cooldown_until_ms = 0; }
                 settings.mode = warm_mode();
-                settings.interval_minutes = 10;
+                if !settings.interval_configured && settings.interval_minutes==10 {
+                    settings.interval_minutes=default_interval();
+                } else if settings.interval_minutes!=default_interval() {
+                    settings.interval_configured=true;
+                }
                 (settings, None)
             },
         _ => (Settings { enabled: false, ..Settings::default() },
@@ -210,7 +232,7 @@ impl Maintenance {
                 settings.last_runs.push(Run { flow: flow.clone(), account_id: account.id.clone(), preparation_stage: None, order_ready: false, status: "waiting".into(),
                     last_checked_at_ms: 0, last_warm_at_ms: 0,
                     next_check_at_ms: self.started_at_ms + u64::from(interval) * 60_000,
-                    message: format!("下单空闲10分钟后执行{}。", flow_label(&flow)), requires_login: false,
+                    message: format!("下单空闲{}分钟后执行{}。", interval, flow_label(&flow)), requires_login: false,
                     cooldown_until_ms: 0, task_id: None });
             }
         }
@@ -294,8 +316,10 @@ impl Maintenance {
                 else { "账号正在执行任务，稍后再预热" }.into());
         }
         // Freeze this dispatch. Changing the configured flow never relabels an active task.
-        let flow = self.settings.lock().unwrap().flow.clone();
-        let mut params = json!({"maintenance_trigger":true,"warm_only":true,"preheat_flow":flow});
+        let configured=self.settings.lock().unwrap().clone();
+        let flow = configured.flow;
+        let mut params = json!({"maintenance_trigger":true,"warm_only":true,"preheat_flow":flow,"interval_minutes":configured.interval_minutes,
+            "prepared_inventory_interval_minutes":configured.prepared_inventory_interval_minutes});
         if flow == "pickup_prepare" {
             params["sku"] = json!(account.preset_sku);
             params["quantity"] = json!(account.preset_quantity);
@@ -381,7 +405,10 @@ pub async fn command(engine: Arc<Engine>, host: TaskHost, operation: &str, param
             }
             if let Some(flow) = params.get("flow") { configure_flow(&mut next, flow, now_ms())?; }
             if let Some(interval) = params.get("interval_minutes") {
-                if interval.as_u64() != Some(10) { return Err("登录预热在下单空闲10分钟后执行".into()); }
+                configure_interval(&mut next,interval)?;
+            }
+            if let Some(interval)=params.get("prepared_inventory_interval_minutes") {
+                configure_prepared_inventory_interval(&mut next,interval)?;
             }
             save(&service.root, &next)?;
             *service.settings.lock().unwrap() = next;
@@ -397,6 +424,17 @@ pub async fn command(engine: Arc<Engine>, host: TaskHost, operation: &str, param
         _ => return Err("不支持的会话维护操作".into()),
     }
     Ok(service.status(&engine))
+}
+
+/// Freeze the same server-owned setting for manual and idle preparations.
+pub(crate) fn prepared_inventory_interval(root:&Path)->Result<u32,String> {
+    if let Some(service)=services().lock().unwrap().get(root).cloned() {
+        if let Some(error)=service.settings_error.lock().unwrap().clone(){return Err(error);}
+        return Ok(service.settings.lock().unwrap().prepared_inventory_interval_minutes);
+    }
+    let (settings,error)=load(root);
+    if let Some(error)=error{return Err(error);}
+    Ok(settings.prepared_inventory_interval_minutes)
 }
 
 pub fn stop(root: &Path) {
@@ -426,6 +464,108 @@ mod tests {
             "action":action,"status":status,"stage":"fixture","created_at":updated_at,
             "updated_at":updated_at,"execution_started_at_ms":updated_at*1000,
             "prompt":null,"result":null,"order_submitted":false,"logs":[]})).unwrap()
+    }
+
+    #[test]
+    fn idle_interval_defaults_migrates_and_preserves_explicit_configuration() {
+        let temporary=tempfile::tempdir().unwrap();let root=temporary.path();
+        assert_eq!(load(root).0.interval_minutes,5);
+        fs::create_dir_all(root.join("settings")).unwrap();
+        for (stored,expected) in [(json!({"interval_minutes":10}),5),
+            (json!({"interval_minutes":30}),30),
+            (json!({"interval_minutes":10,"interval_configured":true}),10),
+            (json!({"interval_minutes":1,"interval_configured":true}),1),
+            (json!({"interval_minutes":60,"interval_configured":true}),60)] {
+            fs::write(root.join("settings/session-maintenance.json"),serde_json::to_vec(&stored).unwrap()).unwrap();
+            let (loaded,error)=load(root);assert!(error.is_none());assert_eq!(loaded.interval_minutes,expected);
+            save(root,&loaded).unwrap();assert_eq!(load(root).0.interval_minutes,expected);
+        }
+        let mut settings=Settings{enabled_at_ms:1000,..Settings::default()};
+        for invalid in [json!(0),json!(61),json!(1.5),json!("5"),json!(true),Value::Null] {
+            assert!(configure_interval(&mut settings,&invalid).is_err());assert_eq!(settings.interval_minutes,5);
+        }
+        configure_interval(&mut settings,&json!(10)).unwrap();
+        assert_eq!(settings.enabled_at_ms,1000);assert!(settings.interval_configured);
+        save(root,&settings).unwrap();assert_eq!(load(root).0.interval_minutes,10);
+        assert_eq!(prepared_inventory_interval(root).unwrap(),5);
+        for minutes in [1,60] {
+            configure_prepared_inventory_interval(&mut settings,&json!(minutes)).unwrap();
+            save(root,&settings).unwrap();assert_eq!(prepared_inventory_interval(root).unwrap(),minutes);
+        }
+        for invalid in [json!(0),json!(61),json!(1.5),json!("5"),json!(true),Value::Null] {
+            assert!(configure_prepared_inventory_interval(&mut settings,&invalid).is_err());
+            assert_eq!(settings.prepared_inventory_interval_minutes,60);
+        }
+    }
+
+    #[test]
+    fn changing_idle_interval_recalculates_future_due_without_changing_live_preparation() {
+        let temporary=tempfile::tempdir().unwrap();let (engine,account)=fixture_engine(temporary.path());
+        let service=fixture_service(temporary.path(),1000);let mut snapshot=engine.snapshot();
+        let mut task=fixture_task(&account,"session_maintain","waiting",200);
+        task.prompt=Some(json!({"id":"lease","kind":"prepared_purchase","prepared":{"expires_at_ms":500000}}));
+        let lease=task.prompt.clone();
+        crate::engine::apply_event(&mut task,&json!({"type":"stage","message":"准备内库存刷新"}));
+        assert_eq!(task.status,"waiting");assert_eq!(task.prompt,lease);assert!(waiting_preparation(&task));
+        snapshot.tasks.push(task.clone());service.refresh(&snapshot);
+        {
+            let mut settings=service.settings.lock().unwrap();
+            let run=&mut settings.last_runs[0];run.status="running".into();run.task_id=Some(task.id.clone());
+            configure_interval(&mut settings,&json!(1)).unwrap();
+            configure_prepared_inventory_interval(&mut settings,&json!(1)).unwrap();
+        }
+        service.refresh(&snapshot);
+        let settings=service.settings.lock().unwrap();
+        assert_eq!(settings.enabled_at_ms,0);assert_eq!(settings.last_runs[0].status,"running");
+        assert_eq!(settings.last_runs[0].next_check_at_ms,61000);
+        assert_eq!(snapshot.tasks[0].prompt.as_ref().unwrap()["prepared"]["expires_at_ms"],500000);
+        assert_eq!(snapshot.tasks[0].status,"waiting");
+        drop(settings);
+        assert_eq!(service.status(&engine)["interval_minutes"],1);
+        assert_eq!(service.status(&engine)["prepared_inventory_interval_minutes"],1);
+    }
+
+    #[tokio::test]
+    async fn manual_and_idle_preparation_freeze_the_same_server_refresh_setting() {
+        let temporary=tempfile::tempdir().unwrap();let root=temporary.path();let (engine,account)=fixture_engine(root);
+        let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python=project.join(if cfg!(windows){".venv/Scripts/python.exe"}else{".venv/bin/python"});
+        let script=root.join("prepared-refresh-setting-fixture.py");
+        fs::write(&script,r#"import json,sys,time
+r=json.loads(sys.stdin.readline());minutes=r['params']['prepared_inventory_interval_minutes']
+assert minutes==(2 if r['action']=='purchase' else 1)
+print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type='result',result={'success':True,'status':'healthy','observed_refresh_minutes':minutes})),flush=True)
+"#).unwrap();
+        let host=TaskHost{worker:python,script:Some(script),on_update:Arc::new(|_|{})};
+        let mut settings=Settings::default();configure_prepared_inventory_interval(&mut settings,&json!(2)).unwrap();save(root,&settings).unwrap();
+        let params=json!({"sku":"MK2P4CH","quantity":1,"fulfillment":"RETAIL","prepare_only":true,"keep_ready":true});
+        for invalid in [json!(0),json!(61),json!(1.5),json!("5"),json!(true),Value::Null] {
+            let mut bad=params.clone();bad["prepared_inventory_interval_minutes"]=invalid;
+            assert!(engine.start(host.clone(),account.clone(),"purchase".into(),bad).is_err());
+            assert!(engine.snapshot().tasks.is_empty());
+        }
+        let task=engine.start(host.clone(),account.clone(),"purchase".into(),params).unwrap();
+        for _ in 0..400 {
+            if engine.snapshot().tasks.iter().any(|task|task.status=="succeeded"){break;}
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.snapshot().tasks.iter().find(|row|row.id==task).unwrap().result.as_ref().unwrap()["observed_refresh_minutes"],2);
+        // An explicit dispatch value stays frozen even if the saved setting is 2.
+        let service=fixture_service(root,now_ms());service.refresh(&engine.snapshot());
+        configure_prepared_inventory_interval(&mut service.settings.lock().unwrap(),&json!(1)).unwrap();
+        for _ in 0..400 {
+            match service.run_account(&engine,&host,&account) {
+                Ok(())=>break,
+                Err(_)=>tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        configure_prepared_inventory_interval(&mut service.settings.lock().unwrap(),&json!(2)).unwrap();
+        for _ in 0..400 {
+            if engine.snapshot().tasks.iter().any(|task|task.action=="session_maintain"&&task.status=="succeeded"){break;}
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.snapshot().tasks.iter().find(|row|row.action=="session_maintain").unwrap().result.as_ref().unwrap()["observed_refresh_minutes"],1);
+        engine.shutdown().await;
     }
 
     #[test]
@@ -543,7 +683,7 @@ mod tests {
         assert_eq!(settings.last_runs[0].status,"handed_off");
         assert!(settings.last_runs[0].message.contains("真实购买"));
         assert!(!settings.last_runs[0].requires_login);
-        assert_eq!(settings.last_runs[0].next_check_at_ms,1_500_000);
+        assert_eq!(settings.last_runs[0].next_check_at_ms,1_200_000);
     }
 
     #[test]
@@ -560,11 +700,11 @@ mod tests {
         run.last_checked_at_ms = 901_000;
         run.last_warm_at_ms = 901_000;
         let mut snapshot = engine.snapshot();
-        assert_eq!(next_check(&snapshot,&run,&settings,1000),601_000);
+        assert_eq!(next_check(&snapshot,&run,&settings,1000),301_000);
         snapshot.tasks.push(fixture_task(&account,"purchase","succeeded",900));
-        assert_eq!(next_check(&snapshot,&run,&settings,1000),1_500_000);
+        assert_eq!(next_check(&snapshot,&run,&settings,1000),1_200_000);
         run.status = "failed".into();
-        assert_eq!(next_check(&snapshot,&run,&settings,1000),1_501_000);
+        assert_eq!(next_check(&snapshot,&run,&settings,1000),1_201_000);
     }
 
     #[test]
@@ -576,15 +716,15 @@ mod tests {
         service.refresh(&snapshot);
         let mut run = service.settings.lock().unwrap().last_runs[0].clone();
         snapshot.tasks.push(fixture_task(&account, "bag", "succeeded", 1000));
-        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 601_000);
+        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 301_000);
         for action in ["purchase", "checkout"] {
             snapshot.tasks = vec![fixture_task(&account, action, "failed", 200)];
-            assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 800_000);
+            assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 500_000);
         }
         run.last_warm_at_ms = 400_000;
-        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 1_000_000);
+        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 700_000);
         let settings = Settings { enabled_at_ms:500_000, ..Settings::default() };
-        assert_eq!(next_check(&snapshot, &run, &settings, 1000), 1_100_000);
+        assert_eq!(next_check(&snapshot, &run, &settings, 1000), 800_000);
     }
 
     #[test]
@@ -627,7 +767,7 @@ mod tests {
             snapshot.tasks = vec![task];
             assert_eq!(blocked_reason(&snapshot, &account), if status=="queued" {Some("account_busy")} else {None});
             assert_eq!(last_order_activity(&snapshot, &account), 0);
-            assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 601_000);
+            assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 301_000);
         }
     }
 
@@ -645,7 +785,7 @@ mod tests {
         let (settings, error) = load(temporary.path());
         assert!(error.is_none());
         assert_eq!(settings.mode, "idle_warm_login");
-        assert_eq!(settings.interval_minutes, 10);
+        assert_eq!(settings.interval_minutes, 30);
         assert!(settings.last_runs[0].requires_login);
         assert_eq!(settings.last_runs[0].cooldown_until_ms, 0);
         assert!(settings.last_runs[1].requires_login);
@@ -662,23 +802,23 @@ mod tests {
         let mut snapshot = engine.snapshot();
         let run = Run { flow: default_flow(), account_id: "fixture-account".into(), preparation_stage: None, order_ready: false, status:"waiting".into(), last_checked_at_ms:0, last_warm_at_ms:0,
             next_check_at_ms:0,message:String::new(),requires_login:false,cooldown_until_ms:0,task_id:None };
-        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 601_000);
+        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 301_000);
         let mut task: crate::engine::Task = serde_json::from_value(json!({"id":"fixture-task",
             "account_id":"fixture-account","action":"purchase","status":"succeeded","stage":"",
             "created_at":200,"updated_at":200,"execution_started_at_ms":200000,
             "prompt":null,"result":null,"order_submitted":false,"logs":[]})).unwrap();
         snapshot.tasks.push(task.clone());
-        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 800_000);
+        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 500_000);
         task.account_id = "another-account".into();
         snapshot.tasks = vec![task];
-        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 601_000);
+        assert_eq!(next_check(&snapshot, &run, &Settings::default(), 1000), 301_000);
     }
 
     #[test]
     fn cooldown_and_configuration_survive_restart_without_resetting_bad_settings() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
-        let settings = Settings { interval_minutes:10, enabled:false, ..Settings::default() };
+        let settings = Settings { interval_minutes:10, interval_configured:true, enabled:false, ..Settings::default() };
         save(root, &settings).unwrap();
         save(root, &settings).unwrap(); // Replacing an existing file also works on Windows.
         assert_eq!(load(root).0.interval_minutes, 10);
@@ -723,7 +863,7 @@ mod tests {
         assert_eq!(blocked.status, "blocked");
         assert_eq!(blocked.last_checked_at_ms, 200700);
         assert_eq!(blocked.cooldown_until_ms, 0);
-        assert_eq!(blocked.next_check_at_ms, 801000);
+        assert_eq!(blocked.next_check_at_ms, 501000);
         login.created_at = 202;
         login.updated_at = 203;
         snapshot.tasks = vec![maintenance, login];
@@ -749,7 +889,7 @@ mod tests {
         service.refresh(&engine.snapshot());
         let run = service.settings.lock().unwrap().last_runs[0].clone();
         assert_eq!(run.cooldown_until_ms, 0);
-        assert_eq!(run.next_check_at_ms, 601_000);
+        assert_eq!(run.next_check_at_ms, 301_000);
         assert!(run.requires_login);
         let status = service.status(&engine);
         assert!(status["last_runs"][0]["blocked_reason"].is_null());
@@ -766,7 +906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authentication_failure_retries_after_ten_minutes_but_waiting_otp_never_duplicates() {
+    async fn authentication_failure_retries_after_configured_idle_but_waiting_otp_never_duplicates() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         let (engine, account) = fixture_engine(root);
@@ -800,7 +940,7 @@ else:
         assert_eq!(failed.status, "blocked");
         assert!(failed.requires_login);
         assert_eq!(failed.cooldown_until_ms, 0);
-        assert_eq!(failed.next_check_at_ms, failed.last_warm_at_ms + 600_000);
+        assert_eq!(failed.next_check_at_ms, failed.last_warm_at_ms + 300_000);
         service.tick_at(&engine, &host, failed.next_check_at_ms - 1);
         assert_eq!(engine.snapshot().tasks.len(), 1);
         service.tick_at(&engine, &host, failed.next_check_at_ms);
@@ -831,7 +971,7 @@ else:
         let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let python = project.join(if cfg!(windows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" });
         let script = root.join("pickup-maintenance-fixture.py");
-        fs::write(&script, "import json,sys,time\nr=json.loads(sys.stdin.readline())\nassert r['action']=='session_maintain'\nassert r['params']=={'maintenance_trigger':True,'warm_only':True,'preheat_flow':'pickup_prepare','sku':'MK2P4CH','quantity':2}\nresult={'success':True,'status':'waiting_stock','preparation_stage':'fulfillment','review_verified':False,'order_ready':False,'requires_login':False,'cooldown_until_ms':0,'checked_at_ms':int(time.time()*1000),'message':'Offline partial preparation; no order'}\nprint(json.dumps({'v':1,'account_id':r['account_id'],'task_id':r['task_id'],'type':'result','result':result}),flush=True)\n").unwrap();
+        fs::write(&script, "import json,sys,time\nr=json.loads(sys.stdin.readline())\nassert r['action']=='session_maintain'\nassert r['params']=={'maintenance_trigger':True,'warm_only':True,'preheat_flow':'pickup_prepare','interval_minutes':5,'prepared_inventory_interval_minutes':5,'sku':'MK2P4CH','quantity':2}\nresult={'success':True,'status':'waiting_stock','preparation_stage':'fulfillment','review_verified':False,'order_ready':False,'requires_login':False,'cooldown_until_ms':0,'checked_at_ms':int(time.time()*1000),'message':'Offline partial preparation; no order'}\nprint(json.dumps({'v':1,'account_id':r['account_id'],'task_id':r['task_id'],'type':'result','result':result}),flush=True)\n").unwrap();
         let host = TaskHost { worker: python, script: Some(script), on_update: Arc::new(|_|{}) };
         let service = fixture_service(root, now_ms());
         service.refresh(&engine.snapshot());
@@ -866,7 +1006,7 @@ else:
         let python = project.join(if cfg!(windows) { ".venv/Scripts/python.exe" } else { ".venv/bin/python" });
         assert!(python.is_file(), "prepare the worker environment before testing");
         let script = root.join("read-only-maintenance-fixture.py");
-        fs::write(&script, "import json,sys,time\nr=json.loads(sys.stdin.readline())\nassert r['action']=='session_maintain'\nassert r['params']=={'maintenance_trigger':True,'warm_only':True,'preheat_flow':'login'}\nresult={'success':True,'status':'healthy','requires_login':False,'cooldown_until_ms':0,'checked_at_ms':int(time.time()*1000),'message':'Read-only offline fixture'}\nprint(json.dumps({'v':1,'account_id':r['account_id'],'task_id':r['task_id'],'type':'result','result':result}),flush=True)\n").unwrap();
+        fs::write(&script, "import json,sys,time\nr=json.loads(sys.stdin.readline())\nassert r['action']=='session_maintain'\nassert r['params']=={'maintenance_trigger':True,'warm_only':True,'preheat_flow':'login','interval_minutes':5,'prepared_inventory_interval_minutes':5}\nresult={'success':True,'status':'healthy','requires_login':False,'cooldown_until_ms':0,'checked_at_ms':int(time.time()*1000),'message':'Read-only offline fixture'}\nprint(json.dumps({'v':1,'account_id':r['account_id'],'task_id':r['task_id'],'type':'result','result':result}),flush=True)\n").unwrap();
         let host = TaskHost { worker: python, script: Some(script), on_update: Arc::new(|_|{}) };
         let current = now_ms();
         engine.start(host.clone(), account.clone(), "purchase".into(), json!({
@@ -889,7 +1029,7 @@ else:
         let run = service.settings.lock().unwrap().last_runs[0].clone();
         assert_eq!(run.status, "healthy");
         assert_eq!(run.task_id.as_deref(), Some(warm.id.as_str()));
-        assert!(run.next_check_at_ms >= current + 9 * 60_000);
+        assert!(run.next_check_at_ms >= current + 4 * 60_000);
         service.tick_at(&engine, &host, run.next_check_at_ms - 1);
         assert_eq!(engine.snapshot().tasks.len(), 2);
         engine.shutdown().await;

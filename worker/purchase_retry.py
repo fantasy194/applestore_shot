@@ -180,7 +180,7 @@ def run_purchase(service, params, attempt, *, backoff_seconds=1):
         authentication = _auth_required(service, result, error)
         failed = error is not None or isinstance(result, dict) and (
             result.get('success') is False or result.get('status') in ('failed', 'error', 'purchase_failed'))
-        non_retryable = any(node.get('retryable') is False or node.get('status') == 'cancelled'
+        non_retryable = getattr(error, 'retryable', True) is False or any(node.get('retryable') is False or node.get('status') == 'cancelled'
                             for node in _nodes(result))
         reason = ('submitted' if submitted else 'authentication' if authentication and failed
                   else 'non_retryable' if non_retryable and failed

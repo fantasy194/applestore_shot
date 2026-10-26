@@ -1,5 +1,6 @@
 """Account-local pickup preferences; select only an exact official store match."""
 import re
+from time import monotonic
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from html import unescape
@@ -159,6 +160,28 @@ def select_store(stores, preset):
     if selected.get('storeDisabled') is not False or not re.fullmatch(r'R\d+', str(selected.get('storeId', ''))):
         raise ValueError('所选自提门店当前不可取货；未改用其他门店或送货，未提交订单。')
     return selected
+
+
+def pickup_search_payload(flow, search, *, show_all=True):
+    """The same official store query form for purchase and prepared refresh."""
+    from duo_killer import field
+    locator='checkout.fulfillment.pickupTab.pickup.storeLocator'
+    region=locator+'.address.stateCitySelectorForCheckout'
+    payload={locator+'.showAllStores':'true' if show_all else 'false',
+             locator+'.selectStore':'',locator+'.searchInput':search}
+    payload.update({region+'.'+key:field(flow.model,region+'.d.'+key,'')
+                    for key in ('state','city','district','provinceCityDistrict','countryCode')})
+    return payload
+
+
+def query_pickup_stores(flow, search, *, show_all=True):
+    """Issue one current Checkout search; never select, continue or retry."""
+    payload=pickup_search_payload(flow,search,show_all=show_all)
+    # Record an actual query, including an unknown/failed outcome. Only the
+    # maintenance helper uses this timestamp as a gate; purchasing never does.
+    flow._prepared_inventory_queried_at=monotonic()
+    flow.action('checkout.fulfillment.pickupTab.pickup.storeLocator','search',payload)
+    return payload
 
 
 def search_results(node):

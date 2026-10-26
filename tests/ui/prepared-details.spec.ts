@@ -116,7 +116,7 @@ for (const width of [320, 1180]) {
       );
       await expect(status).toContainText("MLH74FE × 2");
       await expect(status).toContainText("R001、R002、R003 等4家");
-      await expect(status).toContainText("每 5 分钟向官网刷新准备");
+      await expect(status).toContainText("门店库存按本轮设置的间隔查询");
       await expect(status).toContainText("尚未创建订单");
       const progress = page.getByRole("region", {
         name: "下单进度",

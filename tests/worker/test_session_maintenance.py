@@ -164,29 +164,103 @@ class SessionMaintenanceTests(unittest.TestCase):
         browser.assert_called_once()
         self.assertEqual(first['status'], 'blocked')
         self.assertTrue(first['requires_login'])
-        self.assertEqual(second['cooldown_until_ms'], 700000)
+        self.assertEqual(second['cooldown_until_ms'], 400000)
         self.assertNotIn('private fixture', json.dumps(second))
 
-    def test_failure_retries_next_ten_minute_cycle_instead_of_old_hour_cooldown(self):
+    def test_failure_retries_next_five_minute_cycle_instead_of_old_hour_cooldown(self):
         failure={'status':'blocked','requires_login':True,'http_status':541}
         healthy={'success':True,'logged_in':True,'status':'healthy'}
         with patch('purchase_session.verify_account_session',side_effect=[failure,healthy]) as browser:
             first=maintain_session(self.service,now=lambda:100)
             maintain_session(self.service,now=lambda:101)
-            recovered=maintain_session(self.service,now=lambda:700)
-        self.assertEqual(first['cooldown_until_ms'],700000)
+            recovered=maintain_session(self.service,now=lambda:400)
+        self.assertEqual(first['cooldown_until_ms'],400000)
         self.assertEqual(browser.call_count,2)
         self.assertTrue(recovered['success'])
         self.assertEqual(recovered['cooldown_until_ms'],0)
 
-    def test_old_hour_record_is_only_ten_minute_background_schedule(self):
+    def test_old_hour_record_is_only_five_minute_background_schedule(self):
         (self.service.root/'session-maintenance.json').write_text(json.dumps({
             'status':'blocked','checked_at_ms':100000,'cooldown_until_ms':3700000}),encoding='utf-8')
         with patch('purchase_session.verify_account_session',return_value={
                 'success':True,'logged_in':True,'status':'healthy'}) as browser:
-            result=maintain_session(self.service,now=lambda:701)
+            result=maintain_session(self.service,now=lambda:401)
         browser.assert_called_once()
         self.assertTrue(result['success'])
+
+    def test_configured_interval_uses_current_request_and_ignores_previous_deadline(self):
+        path=self.service.root/'session-maintenance.json'
+        for minutes in (1,5,10,60):
+            with self.subTest(minutes=minutes):
+                # An old persisted deadline cannot override the new request's
+                # schedule, whether the user shortens or lengthens it.
+                path.write_text(json.dumps({'status':'failed','checked_at_ms':100000,
+                    'cooldown_until_ms':101000}),encoding='utf-8')
+                with patch('purchase_session.verify_account_session',return_value={
+                        'success':True,'logged_in':True,'status':'healthy'}) as browser:
+                    waiting=maintain_session(self.service,now=lambda:100+minutes*60-1,
+                                             interval_minutes=minutes)
+                    browser.assert_not_called()
+                    self.assertEqual(waiting['cooldown_until_ms'],100000+minutes*60000)
+                    recovered=maintain_session(self.service,now=lambda:100+minutes*60,
+                                               interval_minutes=minutes)
+                    browser.assert_called_once()
+                    self.assertEqual(recovered['cooldown_until_ms'],0)
+
+    def test_invalid_interval_rejects_before_network_or_cooldown_read(self):
+        for minutes in (True,False,1.0,5.5,0,61,'5',None):
+            with self.subTest(minutes=minutes),patch('purchase_session.verify_account_session') as browser:
+                with self.assertRaisesRegex(ValueError,'整数分钟'):
+                    maintain_session(self.service,interval_minutes=minutes)
+                browser.assert_not_called()
+                self.assertFalse((self.service.root/'session-maintenance.json').exists())
+
+    def test_service_forwards_frozen_interval_and_default_for_legacy_callers(self):
+        service=self.real_service()
+        for params,expected in (({'warm_only':True},5),
+                                ({'warm_only':True,'interval_minutes':1},1),
+                                ({'warm_only':True,'interval_minutes':60},60)):
+            with self.subTest(expected=expected),patch('session_maintenance.maintain_session',
+                    return_value={'success':True,'status':'healthy'}) as maintain:
+                service.run('session_maintain',params)
+                self.assertEqual(maintain.call_args.kwargs['interval_minutes'],expected)
+
+    def test_prepared_inventory_interval_is_independent_frozen_and_propagates_into_nested_prepare(self):
+        service=self.real_service()
+        for minutes in (1,5,60):
+            params={'warm_only':True,'interval_minutes':1 if minutes==60 else 60,
+                    'prepared_inventory_interval_minutes':minutes}
+            def maintain(owner,**kwargs):
+                self.assertEqual(owner.prepared_inventory_interval_minutes,minutes)
+                self.assertEqual(kwargs['interval_minutes'],params['interval_minutes'])
+                params['prepared_inventory_interval_minutes']=30
+                self.assertEqual(owner.prepared_inventory_interval_minutes,minutes)
+                return {'success':True,'status':'healthy'}
+            with patch('session_maintenance.maintain_session',side_effect=maintain):
+                service.run('session_maintain',params)
+            service.action='purchase'
+            with patch.object(service,'run',return_value={}) as nested:
+                service.warm_pickup_prepare('MK2M4CH',1)
+            self.assertEqual(nested.call_args.args[1]['prepared_inventory_interval_minutes'],minutes)
+
+    def test_prepared_inventory_interval_rejects_invalid_values_before_action_or_auth(self):
+        service=self.real_service()
+        for action in ('session_maintain','purchase'):
+            for value in (True,False,0,61,1.0,5.5,'5',None):
+                with self.subTest(action=action,value=value),patch.object(service,'ensure_auth_file') as auth:
+                    with self.assertRaisesRegex(ValueError,'准备内库存查询间隔'):
+                        service.run(action,{'prepared_inventory_interval_minutes':value})
+                    auth.assert_not_called()
+
+    def test_failure_deadline_uses_task_interval_even_if_source_configuration_changes(self):
+        params={'interval_minutes':7}
+        def fail(owner):
+            params['interval_minutes']=1
+            raise requests.Timeout('private fixture')
+        with patch('purchase_session.verify_account_session',side_effect=fail):
+            result=maintain_session(self.service,now=lambda:100,**params)
+        self.assertEqual(result['cooldown_until_ms'],520000)
+        self.assertEqual(params['interval_minutes'],1)
 
     def test_missing_login_never_starts_automatic_authentication(self):
         with patch('purchase_session.verify_account_session', return_value={
@@ -194,7 +268,7 @@ class SessionMaintenanceTests(unittest.TestCase):
             result = maintain_session(self.service, now=lambda: 100)
         login.assert_not_called()
         self.assertFalse(result['success'])
-        self.assertEqual(result['cooldown_until_ms'], 700000)
+        self.assertEqual(result['cooldown_until_ms'], 400000)
 
     def test_local_browser_failures_are_not_login_expiry(self):
         from browser_login import BrowserSessionError
@@ -211,7 +285,7 @@ class SessionMaintenanceTests(unittest.TestCase):
                 self.assertEqual(result['error_code'], code)
                 self.assertTrue(result['browser_started'])
                 self.assertFalse(result['browser_connected'])
-                self.assertEqual(result['cooldown_until_ms'], 700000)
+                self.assertEqual(result['cooldown_until_ms'], 400000)
 
     def test_network_and_unknown_errors_do_not_leak_or_expire_session(self):
         for error, code in ((requests.ConnectionError('https://fixture.test/?token=private-fixture'),
@@ -259,7 +333,7 @@ class SessionMaintenanceTests(unittest.TestCase):
         self.service.warm_login.assert_called_once_with()
         self.assertTrue(result['requires_login'])
         self.assertEqual(result['error_code'], 'WARM_LOGIN_REQUIRES_ATTENTION')
-        self.assertEqual(again['cooldown_until_ms'], 700000)
+        self.assertEqual(again['cooldown_until_ms'], 400000)
         self.assertNotIn('private-fixture', json.dumps(again))
 
     def test_pickup_preheat_preserves_full_and_partial_preparation_without_healthy_claim(self):
@@ -309,12 +383,14 @@ class SessionMaintenanceTests(unittest.TestCase):
 
     def test_pickup_preheat_reuses_manual_prepare_only_with_no_wait_or_purchase_retry(self):
         result = {'success': True, 'status': 'waiting_stock'}
+        self.service.prepared_inventory_interval_minutes = 5
         self.service.run.return_value = result
         self.service.auth = self.service.root / 'auth.json'
         self.assertEqual(Service.warm_pickup_prepare(self.service, 'MK2P4CH/A', 2), result)
         self.service.run.assert_called_once_with('purchase', {
             'sku': 'MK2P4CH/A', 'quantity': 2, 'fulfillment': 'RETAIL', 'prepare_only': True,
-            'keep_ready': True, 'concurrency': 1, 'retry_count': 0})
+            'keep_ready': True, 'concurrency': 1, 'retry_count': 0,
+            'prepared_inventory_interval_minutes':5})
         self.assertEqual(self.service.action, 'session_maintain')
         for sku, count in ((None, 1), ('', 1), ('MK2P4CH', True), ('MK2P4CH', 0), ('MK2P4CH', 1000)):
             self.service.run.reset_mock()

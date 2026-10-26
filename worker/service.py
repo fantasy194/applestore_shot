@@ -51,6 +51,8 @@ class Service:
         self.prepared_expired = False
         self.prepared_claim_config_hash = None
         self._prepared_claim = None
+        self._prepared_claim_timely_admission = False
+        self._prepared_wait_tick = None
         self._preparation_targets = None
         self._maintenance_preparation = None
         self._prepared_params = None
@@ -501,10 +503,11 @@ class Service:
         claim, params = value['prepared_claim'], value['params']
         if not isinstance(claim, dict) or not isinstance(params, dict):
             raise ValueError('准备接手参数无效。')
+        timely_admission = self.channel.consume_prepared_admission(request_id, value) is True
         if (claim.get('v') != 1 or claim.get('account_id') != self.channel.account_id
                 or claim.get('prepared_task_id') != self.channel.task_id or claim.get('request_id') != request_id
                 or claim.get('source') not in ('manual','scheduled','queue') or self._prepared_claim is not None
-                or self.submitted or int(time.time()*1000) >= prepared['expires_at_ms']):
+                or self.submitted or int(time.time()*1000) >= prepared['expires_at_ms'] and not timely_admission):
             raise ValueError('准备接手的账号、任务或有效期不匹配。')
         if any(type(claim.get(key)) is not int or claim[key] <= 0 for key in ('requested_at_ms','claimed_at_ms')):
             raise ValueError('准备接手时间标识无效。')
@@ -545,6 +548,7 @@ class Service:
         self._configure_pickup_scope(params,preserve_cache=True)
         self.prepared_claim_config_hash = checkout_options.config_fingerprint(self.checkout)
         self._prepared_claim = copy.deepcopy(claim)
+        self._prepared_claim_timely_admission = timely_admission
         self._prepared_params = {**copy.deepcopy(params),'concurrency':1,'prepare_only':False,'keep_ready':False}
         self._prepared_requested_concurrency = requested_routes
         self._prepared_performance = {'prepared_at_ms':prepared['prepared_at_ms'],
@@ -610,9 +614,29 @@ class Service:
         self.prepared_expired=False
         self.channel.emit('progress_result',result={**result,'prepared':prepared})
         request_id=str(uuid.uuid4())
+        self._prepared_claim_timely_admission = False
+        callback = self._prepared_wait_tick
+        def tick():
+            refreshed = callback()
+            if not isinstance(refreshed, dict) or refreshed.get('_refresh_required') is True:
+                return refreshed
+            snapshot = copy.deepcopy(refreshed)
+            result.clear(); result.update(snapshot)
+            for key in ('preparation_stage','review_verified','order_ready','checkout_details_prepared'):
+                if key in result:
+                    prepared[key] = copy.deepcopy(result[key])
+            self.channel.emit('progress_result', request_id=request_id, prepared_update=True,
+                              result={**result,'prepared':prepared})
+            delay = getattr(self, '_prepared_wait_tick_delay', None)
+            return {**refreshed, '_tick_next_seconds':delay()} if callable(delay) else refreshed
+        interval = getattr(self, 'prepared_inventory_interval_minutes', 5) * 60
+        delay = getattr(self, '_prepared_wait_tick_delay', None)
+        tick_options = ({'_on_tick':tick, '_tick_seconds':interval,
+                         '_tick_initial_seconds':delay() if callable(delay) else interval}
+                        if callable(callback) else {})
         try:
             accepted=self.channel.prompt('prepared_purchase','账号会话已准备，等待购买',
-                prepared=prepared,account=self.account,timeout=min(300,timeout),_request_id=request_id)
+                prepared=prepared,account=self.account,timeout=min(300,timeout),_request_id=request_id,**tick_options)
         except PromptExpired:
             self.prepared_expired=True
             return False
@@ -956,7 +980,9 @@ class Service:
         try:
             return self.run('purchase', {'sku': sku, 'quantity': count, 'fulfillment': 'RETAIL',
                                         'prepare_only': True, 'keep_ready': True, 'concurrency': 1,
-                                        'retry_count': 0, **preparation})
+                                        'retry_count': 0,
+                                        'prepared_inventory_interval_minutes':getattr(self,'prepared_inventory_interval_minutes',5),
+                                        **preparation})
         finally:
             # Engine ownership and purchase priority remain session-maintenance scoped.
             self._purchase_session_owner = previous_owner
@@ -1001,6 +1027,11 @@ class Service:
                 raise ValueError('自提准备门店与当前监控授权不一致；未下单。')
 
     def run(self, action, params):
+        if action in ('purchase','session_maintain'):
+            prepared_interval=params.get('prepared_inventory_interval_minutes',5)
+            if type(prepared_interval) is not int or not 1<=prepared_interval<=60:
+                raise ValueError('准备内库存查询间隔必须是 1–60 的整数分钟。')
+            self.prepared_inventory_interval_minutes=prepared_interval
         self._parallel_child = params.get('_parallel_child') is True
         if action == 'purchase' and self._purchase_session_owner is None:
             self._purchase_session_proof = None
@@ -1129,7 +1160,8 @@ class Service:
                 with background_browser_scope():
                     result = maintain_session(self, warm_only=params.get('warm_only') is True,
                                               preheat_flow=params.get('preheat_flow', 'login'),
-                                              sku=params.get('sku'), count=params.get('quantity'))
+                                              sku=params.get('sku'), count=params.get('quantity'),
+                                              interval_minutes=params.get('interval_minutes', 5))
             finally:
                 self.idle_maintenance = previous_idle_maintenance
                 # Nested prepare-only purchases inherit this scope. Manual actions

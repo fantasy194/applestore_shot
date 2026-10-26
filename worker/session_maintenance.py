@@ -67,7 +67,11 @@ def record_maintenance_result(service, result, *, cooling=False, warm_only=False
                         level='info' if result.get('success') else 'warning')
 
 
-def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='login', sku=None, count=None):
+def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='login', sku=None, count=None,
+                     interval_minutes=5):
+    if type(interval_minutes) is not int or not 1 <= interval_minutes <= 60:
+        raise ValueError('空闲后预热间隔必须是 1–60 的整数分钟。')
+    interval_ms = interval_minutes * 60_000
     if preheat_flow not in ('login', 'pickup_prepare', 'browser_login'):
         raise ValueError('预热流程无效。')
     browser_mode = 'background' if getattr(service, 'headless_browser', False) is True else 'visible'
@@ -82,8 +86,8 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
         checked_at = previous.get('checked_at_ms', 0)
         if (previous.get('status') not in ('healthy', 'prepared', 'waiting_stock')
                 and type(checked_at) in (int, float) and checked_at > 0
-                and 0 <= stamp - checked_at < 600_000):
-            result = {**previous, 'preheat_flow': preheat_flow, 'browser_mode': browser_mode, 'cooldown_until_ms': checked_at + 600_000, 'message': '等待下一次空闲会话维护；购买可立即自动核验。'}
+                and 0 <= stamp - checked_at < interval_ms):
+            result = {**previous, 'preheat_flow': preheat_flow, 'browser_mode': browser_mode, 'cooldown_until_ms': checked_at + interval_ms, 'message': '等待下一次空闲会话维护；购买可立即自动核验。'}
             record_maintenance_result(service, result, cooling=True, warm_only=warm_only)
             return result
     from browser_login import BrowserSessionError
@@ -171,7 +175,7 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
     result['preheat_flow'] = preheat_flow
     result['checked_at_ms'] = stamp
     result['cooldown_until_ms'] = (0 if result['status'] in ('healthy', 'prepared', 'waiting_stock') else stamp +
-        600_000)
+        interval_ms)
     duo_killer.write_private_json(path, result)
     record_maintenance_result(service, result, warm_only=warm_only)
     return result

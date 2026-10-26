@@ -21,6 +21,14 @@ class PromptExpired(ValueError):
     """A bounded preparation expired without purchase authorization."""
 
 
+class PromptRefresh(PromptExpired):
+    """Close this lease before authentication or checkout initialization."""
+
+
+class PreparedClaimReady(Exception):
+    """Yield maintenance to an already admitted purchase on this same lease."""
+
+
 class PromptClosed(ValueError):
     """The process owning a prompt ended; no user reply was synthesized."""
 
@@ -162,6 +170,8 @@ class Channel:
         self.lock = threading.Lock()
         self.activity = None
         self._checkout_auth_lease = None
+        self._prepared_reply_admission = None
+        self._active_prepared_prompt = None
 
     def emit(self, kind, **payload):
         if kind in ('credential_rejected', 'credential_authenticated') and self._checkout_auth_lease is not None:
@@ -218,7 +228,33 @@ class Channel:
             self.cancelled.set()
             self.responses.put(None)
 
-    def prompt(self, kind, label, *, timeout=None, _alive=None, _request_id=None, **fields):
+    def _timely_prepared_claim(self, kind, fields, request_id, value):
+        prepared = fields.get('prepared')
+        claim = value.get('prepared_claim') if isinstance(value, dict) else None
+        if kind != 'prepared_purchase' or not isinstance(prepared, dict) or not isinstance(claim, dict):
+            return False
+        issued, expires, claimed = (prepared.get('prepared_at_ms'), prepared.get('expires_at_ms'), claim.get('claimed_at_ms'))
+        return (all(type(stamp) is int for stamp in (issued, expires, claimed)) and issued <= claimed < expires
+                and claim.get('request_id') == request_id and claim.get('account_id') == self.account_id
+                and claim.get('prepared_task_id') == self.task_id)
+
+    def consume_prepared_admission(self, request_id, value):
+        matched = self._prepared_reply_admission == (request_id, id(value))
+        self._prepared_reply_admission = None
+        return matched
+
+    def prepared_claim_waiting(self):
+        current = self._active_prepared_prompt
+        if current is None:
+            return False
+        request_id, fields = current
+        with self.responses.mutex:
+            return any(isinstance(response, dict) and response.get('request_id') == request_id
+                       and self._timely_prepared_claim('prepared_purchase', fields, request_id, response.get('value'))
+                       for response in self.responses.queue)
+
+    def prompt(self, kind, label, *, timeout=None, _alive=None, _request_id=None,
+               _on_tick=None, _tick_seconds=None, _tick_initial_seconds=None, **fields):
         self.checkpoint()
         if _alive is not None and not _alive():
             raise PromptClosed('认证步骤已结束。')
@@ -229,6 +265,15 @@ class Channel:
         if kind == 'code' and self._checkout_auth_lease is not None:
             fields['checkout_auth_lease'] = self._checkout_auth_lease
         self.emit('prompt', prompt=dict(id=request_id, kind=kind, label=label, **fields))
+        if _on_tick is not None:
+            if kind != 'prepared_purchase' or not callable(_on_tick) or type(_tick_seconds) not in (int, float) or _tick_seconds <= 0:
+                raise ValueError('准备等待刷新参数无效。')
+            self._active_prepared_prompt = (request_id, fields)
+            try:
+                return self._prepared_prompt_ticks(request_id, deadline, _on_tick, _tick_seconds, fields,
+                                                   initial=_tick_initial_seconds)
+            finally:
+                self._active_prepared_prompt = None
         while True:
             self.checkpoint()
             if _alive is not None and not _alive():
@@ -245,11 +290,96 @@ class Channel:
                 self.emit('prompt_closed', request_id=request_id)
                 raise PromptExpired('准备等待已超时，请重新准备；未提交订单。') from None
             self.checkpoint()
-            if deadline is not None and time.monotonic() >= deadline:
+            timely = bool(response and response.get('request_id') == request_id
+                          and self._timely_prepared_claim(kind, fields, request_id, response.get('value')))
+            if deadline is not None and time.monotonic() >= deadline and not timely:
                 self.emit('prompt_closed', request_id=request_id)
                 raise PromptExpired('准备等待已超时，请重新准备；未提交订单。')
             if response and response.get('request_id') == request_id:
+                if timely:
+                    self._prepared_reply_admission = (request_id, id(response.get('value')))
                 return response.get('value')
+
+    def _prepared_prompt_ticks(self, request_id, deadline, callback, interval, fields, *, initial=None):
+        initial = interval if initial is None else max(.001, initial)
+        next_tick = time.monotonic() + initial
+        refresh_required, tick_error = False, None
+        while True:
+            self.checkpoint()
+            # Prefer a claim queued during the synchronous query, even if the
+            # query crossed wall-clock expiry. Only admission within this exact
+            # original lease and request can qualify; scope is checked by Service.
+            try:
+                response = self.responses.get_nowait()
+            except queue.Empty:
+                response = None
+            if response is not None:
+                self.checkpoint()
+                if response.get('request_id') == request_id:
+                    value = response.get('value')
+                    timely = self._timely_prepared_claim('prepared_purchase', fields, request_id, value)
+                    if timely or deadline is None or time.monotonic() < deadline:
+                        if timely:
+                            self._prepared_reply_admission = (request_id, id(value))
+                        return value
+                continue
+            now = time.monotonic()
+            if tick_error is not None or refresh_required or deadline is not None and now >= deadline:
+                self.emit('prompt_closed', request_id=request_id, prepared_close_handshake=True)
+                admitted = self._close_prepared_lease(request_id, fields)
+                if admitted is not None:
+                    return admitted
+                if tick_error is not None:
+                    raise tick_error
+                if refresh_required:
+                    raise PromptRefresh('准备需要更新认证或结算，已关闭当前等待。')
+                raise PromptExpired('准备等待已超时，请重新准备；未提交订单。')
+            if now >= next_tick:
+                result = None
+                try:
+                    result = callback()
+                    refresh_required = isinstance(result, dict) and result.get('_refresh_required') is True
+                except Exception as error:
+                    tick_error = error
+                delay = result.get('_tick_next_seconds') if isinstance(result, dict) else None
+                next_tick = time.monotonic() + (max(.001, delay) if isinstance(delay, (int, float)) else interval)
+                continue
+            wait = next_tick - now
+            if deadline is not None:
+                wait = min(wait, max(0, deadline - now))
+            try:
+                response = self.responses.get(timeout=wait)
+            except queue.Empty:
+                continue
+            if response is not None:
+                # Requeue through the single consumer so validation and expiry
+                # handling stay identical for preexisting and in-query claims.
+                self.responses.put(response)
+
+    def _close_prepared_lease(self, request_id, fields):
+        """Do not enter authentication until the owner atomically closes admission."""
+        deadline = time.monotonic() + 5
+        while True:
+            self.checkpoint()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError('准备等待关闭确认未完成，已停止；未执行认证或购买。')
+            try:
+                response = self.responses.get(timeout=min(.05, remaining))
+            except queue.Empty:
+                continue
+            self.checkpoint()
+            if not response or response.get('request_id') != request_id:
+                continue
+            value = response.get('value')
+            if self._timely_prepared_claim('prepared_purchase', fields, request_id, value):
+                self._prepared_reply_admission = (request_id, id(value))
+                return value
+            if isinstance(value, dict) and set(value) == {'_prepared_close_ack'}:
+                if value['_prepared_close_ack'] == 'closed':
+                    return None
+                # claimed may precede the actual reply on the control stream.
+                # Never open a new prompt while that admitted purchase is pending.
 
     def checkout_browser_recovery(self, digest):
         lease = self._checkout_auth_lease

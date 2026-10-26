@@ -31,6 +31,13 @@ export type Action =
   | "forget_password"
   | "qr";
 export type Data = Record<string, any>;
+export interface SessionMaintenanceSettings {
+  enabled: boolean;
+  interval_minutes: number;
+  prepared_inventory_interval_minutes: number;
+  flow: "login" | "pickup_prepare" | "browser_login";
+  last_runs?: Data[] | Record<string, Data>;
+}
 export interface Prompt {
   id: string;
   kind:

@@ -102,7 +102,8 @@ async function main() {
 
   stage = "workspace_initial_snapshot";
   await page.getByText("正在读取本地配置", { exact: true }).waitFor({
-    state: "hidden", timeout: 60_000,
+    state: "hidden",
+    timeout: 60_000,
   });
 
   stage = "foreign_origin_isolation";
@@ -206,7 +207,9 @@ async function main() {
   ensure(
     typeof maintenance.enabled === "boolean" &&
       maintenance.mode === "idle_warm_login" &&
-      maintenance.interval_minutes === 10 &&
+      Number.isInteger(maintenance.interval_minutes) &&
+      maintenance.interval_minutes >= 1 &&
+      maintenance.interval_minutes <= 60 &&
       Array.isArray(maintenance.last_runs) &&
       !maintenance.settings_error,
   );
@@ -215,8 +218,8 @@ async function main() {
   report.maintenance_accounts = maintenance.last_runs.length;
   report.checks.push("maintenance_status_read");
   report.checks.push(
-    maintenance.enabled && maintenance.interval_minutes === 10
-      ? "maintenance_idle_warm_login_10m_enabled"
+    maintenance.enabled && maintenance.interval_minutes === 5
+      ? "maintenance_idle_warm_login_5m_enabled"
       : "maintenance_existing_configuration_preserved",
   );
 

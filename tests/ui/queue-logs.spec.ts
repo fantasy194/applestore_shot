@@ -480,14 +480,14 @@ test("日志默认聚焦监控，以ID增量读取同一毫秒记录并保留旧
   ).toMatchObject({ category: "queue", limit: 40 });
 });
 
-test("保留账号的官网登录恢复和10分钟空闲预热设置", async ({ page }) => {
+test("保留账号的官网登录恢复和已存30分钟空闲预热设置", async ({ page }) => {
   await fixture(page);
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.getByRole("heading", { name: "空闲预热" })).toBeVisible();
   await expect(
     page.getByText("设备信任失效，请恢复官网登录", { exact: false }),
   ).toBeVisible();
-  await page.getByLabel("下单空闲10分钟后自动预热").check();
+  await page.getByLabel("下单空闲30分钟后自动预热").check();
   await expect
     .poll(() =>
       page.evaluate(
@@ -497,7 +497,7 @@ test("保留账号的官网登录恢复和10分钟空闲预热设置", async ({ 
           )?.params,
       ),
     )
-    .toEqual({ enabled: true, interval_minutes: 10 });
+    .toEqual({ enabled: true, interval_minutes: 30 });
   await page
     .getByRole("button", { name: "官网登录恢复（保留账号）", exact: true })
     .click();

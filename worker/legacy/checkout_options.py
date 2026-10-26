@@ -433,12 +433,12 @@ def prepare_checkout_details(flow, config_path, auth_path=None):
 def priority_fulfillment(flow, config, config_path, payload):
     """Try allowed stores in order only while still choosing fulfillment."""
     from pickup_options import (validate_preset, search_results, store_name, time_slot_payload, NoPickupSlot,
-                                PickupUnavailable, fulfillment_error, fresh_pickup_context, fresh_pickup_slot_payload)
+                                PickupUnavailable, fulfillment_error, fresh_pickup_context, fresh_pickup_slot_payload,
+                                pickup_search_payload, query_pickup_stores)
     policy = validate_preset(config)['pickup']
     path = 'checkout.fulfillment'
     locator = path + '.pickupTab.pickup.storeLocator'
     slot_path = path + '.pickupTab.pickup.timeSlot'
-    region = locator + '.address.stateCitySelectorForCheckout'
     handler = interaction.handler
     rejected = []
     current_search = None
@@ -446,10 +446,7 @@ def priority_fulfillment(flow, config, config_path, payload):
         if getattr(handler, 'submitted', False) is True or value(flow.model, 'checkout.d.page') != 'Fulfillment':
             raise ValueError('已离开自提选择阶段，不能自动切换其他门店。')
         flow.require(locator)
-        store_data = {locator + '.showAllStores':'true', locator + '.selectStore':'',
-                      locator + '.searchInput':preferred['search']}
-        store_data.update({region + '.' + key:value(flow.model, region + '.d.' + key, '')
-                           for key in ('state','city','district','provinceCityDistrict','countryCode')})
+        store_data = pickup_search_payload(flow,preferred['search'])
         fresh_context = fresh_pickup_context(flow, preferred)
         query = tuple(sorted(store_data.items()))
         if fresh_context is not None:
@@ -460,7 +457,7 @@ def priority_fulfillment(flow, config, config_path, payload):
                 fresh_locator = current_search[2]
             else:
                 previous_body = current_body
-                flow.action(locator, 'search', store_data)
+                query_pickup_stores(flow,preferred['search'])
                 current_body = getattr(flow, 'current_response_body', None)
                 fresh_locator = value(current_body, locator)
                 if current_body is previous_body or not isinstance(fresh_locator, dict):
@@ -573,19 +570,16 @@ def fulfillment(flow, config_path):
         search = validate_preset(config)['pickup']['search']
     else:
         search = ask('自提门店所在城市/地区', config.get('pickup', {}).get('search') or value(node, 'd.searchInput', '') or config.get('delivery', {}).get('city', ''))
-    region = locator + '.address.stateCitySelectorForCheckout'
     # The default visible subset can omit the explicitly requested store.
     # Ask for all results in this search area; selection remains exact and
     # a disabled/missing target never falls back to another store or HOME.
-    store_data = {locator + '.showAllStores': 'true' if automatic_options() else 'false',
-                  locator + '.selectStore': '', locator + '.searchInput': search}
-    store_data.update({region + '.' + k: value(flow.model, region + '.d.' + k, '')
-                      for k in ('state', 'city', 'district', 'provinceCityDistrict', 'countryCode')})
-    from pickup_options import search_results, fresh_pickup_context, fresh_pickup_slot_payload
+    from pickup_options import (search_results, fresh_pickup_context, fresh_pickup_slot_payload,
+                                pickup_search_payload, query_pickup_stores)
+    store_data = pickup_search_payload(flow,search,show_all=automatic_options())
     previous_body = getattr(flow, 'current_response_body', None)
     fresh_context = fresh_pickup_context(flow, config['pickup']) if automatic_options() else None
     if fresh_context is None:
-        flow.action(locator, 'search', store_data)
+        query_pickup_stores(flow,search,show_all=automatic_options())
         stores = search_results(flow.require(locator))
         fresh_context = fresh_pickup_context(flow, config['pickup']) if automatic_options() else None
     else:

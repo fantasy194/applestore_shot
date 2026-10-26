@@ -61,6 +61,7 @@ import {
   type Data,
   type Prompt,
   type Snapshot,
+  type SessionMaintenanceSettings,
   type Task,
 } from "./types";
 
@@ -1331,7 +1332,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.21</span>
+          <span>DUO Killer · 0.1.22</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (
@@ -1555,7 +1556,13 @@ function SessionMaintenance({
   bridge: NonNullable<typeof api>;
   account: Account;
 }) {
-  const [state, setState] = useState<Data | null>(null);
+  const [state, setState] = useState<SessionMaintenanceSettings | null>(null);
+  const [intervalMinutes, setIntervalMinutes] = useState(5);
+  const [intervalValid, setIntervalValid] = useState(true);
+  const intervalDirty = useRef(false);
+  const [inventoryIntervalMinutes, setInventoryIntervalMinutes] = useState(5);
+  const [inventoryIntervalValid, setInventoryIntervalValid] = useState(true);
+  const inventoryIntervalDirty = useRef(false);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -1563,19 +1570,37 @@ function SessionMaintenance({
   const version = useRef(0);
   const configuring = useRef(false);
   async function configure(patch: Data) {
-    if (!bridge.maintenance) return;
+    if (
+      !bridge.maintenance ||
+      !state ||
+      configuring.current ||
+      saving ||
+      !intervalValid ||
+      !inventoryIntervalValid
+    )
+      return;
     const expected = ++version.current;
     configuring.current = true;
     setSaving(true);
     setError("");
     try {
       const result = await bridge.maintenance("configure", {
+        interval_minutes: state.interval_minutes ?? 5,
         ...patch,
-        interval_minutes: 10,
       });
       if (expected === version.current) {
-        setState(result);
+        setState(result as SessionMaintenanceSettings);
         setReadAt(Date.now());
+        if (Object.hasOwn(patch, "interval_minutes")) {
+          intervalDirty.current = false;
+          setIntervalMinutes(result.interval_minutes ?? 5);
+        }
+        if (Object.hasOwn(patch, "prepared_inventory_interval_minutes")) {
+          inventoryIntervalDirty.current = false;
+          setInventoryIntervalMinutes(
+            result.prepared_inventory_interval_minutes ?? 5,
+          );
+        }
       }
     } catch (error) {
       if (expected === version.current) setError(errorText(error));
@@ -1595,8 +1620,14 @@ function SessionMaintenance({
       try {
         const result = await bridge.maintenance!("status");
         if (!disposed && expected === version.current && !configuring.current) {
-          setState(result);
+          setState(result as SessionMaintenanceSettings);
           setReadAt(Date.now());
+          if (!intervalDirty.current)
+            setIntervalMinutes(result.interval_minutes ?? 5);
+          if (!inventoryIntervalDirty.current)
+            setInventoryIntervalMinutes(
+              result.prepared_inventory_interval_minutes ?? 5,
+            );
           setError("");
         }
       } catch (error) {
@@ -1624,15 +1655,16 @@ function SessionMaintenance({
   const runningFlow = current?.flow || flow;
   const reason =
     current?.blocked_reason || (current?.busy ? "account_busy" : "");
-  const remaining = Number.isFinite(current?.remaining_seconds)
-    ? Math.max(
-        0,
-        current.remaining_seconds -
-          Math.floor(Math.max(0, now - readAt) / 1000),
-      )
-    : current?.next_check_at_ms
-      ? Math.max(0, Math.ceil((current.next_check_at_ms - now) / 1000))
-      : null;
+  const remaining =
+    current && Number.isFinite(current.remaining_seconds)
+      ? Math.max(
+          0,
+          current.remaining_seconds -
+            Math.floor(Math.max(0, now - readAt) / 1000),
+        )
+      : current?.next_check_at_ms
+        ? Math.max(0, Math.ceil((current.next_check_at_ms - now) / 1000))
+        : null;
   const status = !state?.enabled
     ? "空闲预热已关闭"
     : current?.status === "running"
@@ -1664,19 +1696,96 @@ function SessionMaintenance({
       <label className="checkbox-label">
         <input
           type="checkbox"
-          disabled={saving || !state}
+          disabled={
+            saving || !state || !intervalValid || !inventoryIntervalValid
+          }
           checked={state?.enabled === true}
           onChange={(event) =>
             void configure({ enabled: event.target.checked })
           }
         />
-        下单空闲10分钟后自动预热
+        下单空闲{state?.interval_minutes ?? 5}分钟后自动预热
       </label>
+      <NumberField
+        className="session-warm-flow"
+        label="空闲预热间隔（分钟）"
+        value={intervalMinutes}
+        min={1}
+        max={60}
+        disabled={saving || !state}
+        onChange={(value) => {
+          intervalDirty.current = true;
+          setIntervalMinutes(value);
+        }}
+        onValidityChange={(valid) => {
+          setIntervalValid(valid);
+          if (!valid) intervalDirty.current = true;
+        }}
+        hint="1–60 分钟，默认 5 分钟。"
+      />
+      <div className="button-row">
+        <button
+          type="button"
+          disabled={
+            saving ||
+            !state ||
+            !intervalValid ||
+            !inventoryIntervalValid ||
+            intervalMinutes === (state.interval_minutes ?? 5)
+          }
+          onClick={() => void configure({ interval_minutes: intervalMinutes })}
+        >
+          保存预热间隔
+        </button>
+      </div>
+      <p className="ui-caption">
+        这是下单空闲后启动预热的间隔，不是库存检测频率或会话有效期。保存后用于后续调度，不取消正在进行的准备或购买。
+      </p>
+      <NumberField
+        className="session-warm-flow"
+        label="准备内库存刷新间隔（分钟）"
+        value={inventoryIntervalMinutes}
+        min={1}
+        max={60}
+        disabled={saving || !state}
+        onChange={(value) => {
+          inventoryIntervalDirty.current = true;
+          setInventoryIntervalMinutes(value);
+        }}
+        onValidityChange={(valid) => {
+          setInventoryIntervalValid(valid);
+          if (!valid) inventoryIntervalDirty.current = true;
+        }}
+        hint="1–60 分钟，默认 5 分钟。"
+      />
+      <div className="button-row">
+        <button
+          type="button"
+          disabled={
+            saving ||
+            !state ||
+            !intervalValid ||
+            !inventoryIntervalValid ||
+            inventoryIntervalMinutes ===
+              (state.prepared_inventory_interval_minutes ?? 5)
+          }
+          onClick={() =>
+            void configure({
+              prepared_inventory_interval_minutes: inventoryIntervalMinutes,
+            })
+          }
+        >
+          保存准备内刷新间隔
+        </button>
+      </div>
+      <p className="ui-caption">
+        仅账号准备内直连查询，匿名自动监控独立；实际购买不受此间隔限制。保存后用于新准备和后续派发，不取消当前购买。
+      </p>
       <SelectField
         className="session-warm-flow"
         label="预热流程"
         value={flow}
-        disabled={saving || !state}
+        disabled={saving || !state || !intervalValid || !inventoryIntervalValid}
         options={[
           { value: "login", label: "预热登录（不加购）" },
           { value: "pickup_prepare", label: "提前准备自提（不下单）" },
@@ -1686,7 +1795,7 @@ function SessionMaintenance({
       />
       <p className="ui-caption">
         {flow === "pickup_prepare"
-          ? "按各账号的商品、数量和自提偏好准备结算；可能加购，不提交订单。有货后接手原准备继续购买。"
+          ? `按账号的商品、数量和自提偏好准备结算，可能加购，不提交订单。新准备等待选店时每 ${state?.prepared_inventory_interval_minutes ?? 5} 分钟直连刷新门店库存；自动监控仍使用独立匿名会话。有货后接手原准备继续购买。`
           : flow === "browser_login"
             ? "保留账号和浏览器登录资料，使用现有凭证恢复官网登录；不加购、不下单。"
             : "自动维护账号会话，失效时使用保存的凭证登录；不加购、不下单。"}
@@ -1714,10 +1823,12 @@ function SessionMaintenance({
       <details className="ui-disclosure">
         <DisclosureSummary>预热说明与会话日志</DisclosureSummary>
         <p>
-          账号连续10分钟没有下单操作且空闲后，执行所选流程。切换流程重新计时，正在执行的预热按原流程完成。下单优先；账号忙碌或订单结果待确认时暂缓。
+          账号达到设定的下单空闲时间后，执行所选流程。调整间隔只影响后续调度；正在执行的预热按原流程完成。下单优先；账号忙碌或订单结果待确认时暂缓。
         </p>
         <p>
-          登录预热不清空购物袋、不加购。自提准备使用本账号预设，可预填地址和联系人，官网接受后保留准备并每5分钟刷新；不提交订单，下单时仍会复核商品、库存、门店和时段。
+          登录预热不清空购物袋、不加购。自提准备使用本账号预设，可预填地址和联系人，官网接受后保留准备；新准备等待选店时每
+          {state?.prepared_inventory_interval_minutes ?? 5}
+          分钟刷新库存。不提交订单，下单时仍会复核商品、库存、门店和时段。
         </p>
         <p>
           官网登录恢复保留账号和浏览器资料，使用可用凭证完成普通登录。自动预热不弹出可见浏览器；缺少密码、需要验证码或官网验证时暂停并提示处理。手动登录和官网登录恢复仍打开可见窗口。
@@ -2319,8 +2430,7 @@ function PromptForm({
           </>
         )}
         <p className="muted">
-          有货或点击购买后继续，仍会复核。每 5
-          分钟向官网刷新准备；刷新失败会结束并显示原因，可随时结束。
+          有货或点击购买后继续，仍会复核。准备持续核验，门店库存按本轮设置的间隔查询；刷新失败会显示原因，可随时结束。
         </p>
         <button type="button" className="secondary" onClick={onCancel}>
           结束准备

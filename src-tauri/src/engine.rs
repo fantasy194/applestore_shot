@@ -258,6 +258,7 @@ struct Control {
     input: mpsc::Sender<Value>,
     pid: Option<u32>,
     browser_pid: Option<u32>,
+    prepared_closed_request: Option<String>,
 }
 #[derive(Clone, Default)]
 struct SessionCredential {
@@ -660,6 +661,18 @@ impl Engine {
     fn apply_worker_event(&self, app: &TaskHost, account: &str, id: &str, event: &Value, queue_stream: bool) {
         if event.get("account_id").is_some_and(|owner|owner!=account) || event.get("task_id").is_some_and(|owner|owner!=id) {return}
         let kind=event["type"].as_str().unwrap_or("");
+        if kind=="prompt_closed" && event["prepared_close_handshake"]==true {
+            self.update(app,id,|task|{
+                let mut controls=self.controls.lock().unwrap();
+                let Some(control)=controls.get_mut(id)else{return};
+                if let Some(status)=prepared_close_status(task,event,&mut control.prepared_closed_request) {
+                    let acknowledgement=json!({"type":"reply","account_id":account,"task_id":id,
+                        "request_id":event["request_id"],"value":{"_prepared_close_ack":status}});
+                    if control.input.try_send(acknowledgement).is_err(){let _=control.cancel.send(true);}
+                }
+            });
+            return;
+        }
         if queue_stream && kind=="prompt_closed" && (event.get("queue_job_id").is_some() || event.get("queue_assignment").is_some()) {
             let queue=self.purchase_queue.lock().unwrap();
             if !queue.owns_active_prompt_assignment(account,id,event) {return}
@@ -708,6 +721,15 @@ impl Engine {
             return Err("任务参数过大".into());
         }
         let mut params = params;
+        if action=="purchase" && params["prepare_only"]==true && params["keep_ready"]==true {
+            if let Some(value)=params.get("prepared_inventory_interval_minutes") {
+                if !value.as_u64().is_some_and(|minutes|(1..=60).contains(&minutes)) {
+                    return Err("准备内库存刷新间隔必须是1至60之间的整数分钟".into());
+                }
+            } else {
+                params["prepared_inventory_interval_minutes"]=json!(crate::session_maintenance::prepared_inventory_interval(&self.root)?);
+            }
+        }
         for private in ["identity_proof_key", "_identity_proof_key"] {
             params.as_object_mut().unwrap().remove(private);
         }
@@ -853,6 +875,7 @@ impl Engine {
                 input,
                 pid: None,
                 browser_pid: None,
+                prepared_closed_request: None,
             },
         );
         let lock = self
@@ -1213,7 +1236,62 @@ pub fn validate_reply(
     }
 }
 
+fn apply_prepared_readiness(task: &mut Task, event: &Value) {
+    // A periodic read may downgrade readiness while retaining this
+    // exact waiting lease. Never recreate a prompt or amend scope.
+    let owned=event.get("account_id").is_none_or(|owner|owner==&task.account_id)
+        && event.get("task_id").is_none_or(|owner|owner==&task.id);
+    let current=now_ms();
+    let matches_prompt=task.prompt.as_ref().is_some_and(|prompt|prompt["kind"]=="prepared_purchase"
+        && event["request_id"].as_str().is_some_and(|id|!id.is_empty()&&prompt["id"]==id)
+        && prompt["prepared"]["prepared_at_ms"].as_u64().is_some_and(|at|at<=current)
+        && prompt["prepared"]["expires_at_ms"].as_u64().is_some_and(|expires|expires>current));
+    let update=&event["result"]["prepared"];
+    let coherent=match update["preparation_stage"].as_str() {
+        Some("review")=>update["review_verified"]==true&&update["order_ready"]==true,
+        Some("fulfillment")=>update["review_verified"]==false&&update["order_ready"]==false,
+        _=>false,
+    };
+    if owned && task.status=="waiting" && task.prepared_handoff.is_none()
+        && !task.order_submitted && matches_prompt && coherent {
+        let prepared=&mut task.prompt.as_mut().unwrap()["prepared"];
+        for key in ["preparation_stage","review_verified","order_ready"] {prepared[key]=update[key].clone();}
+        if let Some(details)=update["checkout_details_prepared"].as_object() {
+            let mut safe=json!({});
+            for key in ["stage","status"] {
+                if let Some(value)=details.get(key).and_then(Value::as_str) {
+                    safe[key]=json!(value.chars().take(80).collect::<String>());
+                }
+            }
+            for key in ["local_contact_ready","local_address_ready","contact_accepted","address_accepted","address_required"] {
+                if let Some(value)=details.get(key).and_then(Value::as_bool){safe[key]=json!(value);}
+            }
+            prepared["checkout_details_prepared"]=safe;
+        }
+    }
+}
+
+fn prepared_close_status(task:&mut Task,event:&Value,last_closed:&mut Option<String>)->Option<&'static str> {
+    if event["type"]!="prompt_closed" || event["prepared_close_handshake"]!=true
+        || event["account_id"]!=task.account_id || event["task_id"]!=task.id {return None;}
+    let request=event["request_id"].as_str().filter(|id|!id.is_empty()&&id.len()<=200)?;
+    if task.prepared_handoff.as_ref().is_some_and(|claim|claim["request_id"]==request) {return Some("claimed");}
+    if terminal(&task.status) || task.order_submitted {return None;}
+    if task.status=="waiting" && task.prompt.as_ref().is_some_and(|prompt|prompt["kind"]=="prepared_purchase"&&prompt["id"]==request
+        && prompt["queue_job_id"]==event["queue_job_id"]&&prompt["queue_assignment"]==event["queue_assignment"]) {
+        apply_event(task,event);
+        *last_closed=Some(request.to_owned());
+        return Some("closed");
+    }
+    if task.prompt.is_none() && last_closed.as_deref()==Some(request){return Some("closed");}
+    None
+}
+
 pub fn apply_event(task: &mut Task, event: &Value) {
+    if event["type"]=="progress_result" && event["prepared_update"]==true {
+        apply_prepared_readiness(task,event);
+        return;
+    }
     purchase_progress::update(task, event);
     if event["order_submitted"] == true {
         task.order_submitted = true;
@@ -1600,6 +1678,144 @@ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type='
     }
 
     #[test]
+    fn prepared_close_handshake_is_atomic_idempotent_and_never_closes_a_new_or_claimed_lease() {
+        let mut current=task();current.action="session_maintain".into();current.status="waiting".into();
+        current.prompt=Some(json!({"id":"lease","kind":"prepared_purchase","prepared":{"expires_at_ms":500000}}));
+        let event=json!({"type":"prompt_closed","prepared_close_handshake":true,"account_id":current.account_id,"task_id":current.id,"request_id":"lease"});
+        let mut last=None;
+        assert_eq!(prepared_close_status(&mut current,&event,&mut last),Some("closed"));
+        assert!(current.prompt.is_none());assert_eq!(current.status,"running");
+        assert_eq!(prepared_close_status(&mut current,&event,&mut last),Some("closed"));
+        current.status="waiting".into();current.prompt=Some(json!({"id":"new-lease","kind":"prepared_purchase"}));
+        let newer=current.prompt.clone();
+        for field in ["request_id","account_id","task_id"] {
+            let mut foreign=event.clone();foreign[field]=json!("foreign");
+            assert_eq!(prepared_close_status(&mut current,&foreign,&mut last),None);assert_eq!(current.prompt,newer);
+        }
+        assert_eq!(prepared_close_status(&mut current,&event,&mut last),None);assert_eq!(current.prompt,newer);
+        current.action="purchase".into();current.status="running".into();current.prompt=None;
+        current.prepared_handoff=Some(json!({"request_id":"lease","source":"manual"}));
+        for _ in 0..2 {assert_eq!(prepared_close_status(&mut current,&event,&mut last),Some("claimed"));}
+        assert_eq!(current.action,"purchase");assert_eq!(current.status,"running");assert!(current.prepared_handoff.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepared_close_first_prevents_claim_and_claim_first_keeps_reply_and_claimed_ack() {
+        use sha2::Digest;
+        for close_first in [true,false] {
+            let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
+            let account=engine.add_account("ordered-close@example.test".into()).unwrap();engine.accounts.lock().unwrap()[0].pending=false;
+            let directory=scope_dir(root.path(),&account.id);fs::create_dir_all(&directory).unwrap();
+            let raw=br#"{"pickup":{"store_id":"R001"}}"#;fs::write(directory.join("checkout.json"),raw).unwrap();
+            let mut current=task();current.id=Uuid::new_v4().to_string();current.account_id=account.id.clone();
+            current.action="session_maintain".into();current.status="waiting".into();
+            current.prompt=Some(json!({"id":"ordered-lease","kind":"prepared_purchase","prepared":{
+                "v":1,"sku":"MK2P4CH/A","quantity":1,"fulfillment":"RETAIL","config_fingerprint":"a".repeat(64),
+                "config_file_sha256":format!("{:x}",sha2::Sha256::digest(raw)),"authorized_store_ids":["R001"],
+                "prepared_at_ms":now_ms()-1000,"expires_at_ms":now_ms()+240000,"preparation_stage":"fulfillment","review_verified":false,"order_ready":false}}));
+            let id=current.id.clone();engine.tasks.lock().unwrap().insert(id.clone(),current);
+            let (cancel,_)=watch::channel(false);let (input,mut receiver)=mpsc::channel(4);
+            engine.controls.lock().unwrap().insert(id.clone(),Control{cancel,input,pid:None,browser_pid:None,prepared_closed_request:None});
+            let host=TaskHost{worker:root.path().join("must-not-spawn"),script:None,on_update:Arc::new(|_|{})};
+            let event=json!({"type":"prompt_closed","prepared_close_handshake":true,"account_id":account.id,"task_id":id,"request_id":"ordered-lease"});
+            let params=json!({"sku":"MK2P4CH","quantity":1,"fulfillment":"RETAIL","concurrency":1});
+            if close_first {
+                engine.apply_worker_event(&host,&account.id,&id,&event,false);
+                assert_eq!(receiver.try_recv().unwrap()["value"]["_prepared_close_ack"],"closed");
+                assert!(engine.try_claim_prepared(&host,&account.id,&params,None).unwrap().is_none());
+                assert!(receiver.try_recv().is_err());assert!(engine.tasks.lock().unwrap()[&id].prepared_handoff.is_none());
+            } else {
+                assert_eq!(engine.try_claim_prepared(&host,&account.id,&params,None).unwrap(),Some(id.clone()));
+                engine.apply_worker_event(&host,&account.id,&id,&event,false);
+                let reply=receiver.try_recv().unwrap();assert_eq!(reply["request_id"],"ordered-lease");assert!(reply["value"]["prepared_claim"].is_object());
+                assert_eq!(receiver.try_recv().unwrap()["value"]["_prepared_close_ack"],"claimed");
+                let tasks=engine.tasks.lock().unwrap();assert_eq!(tasks[&id].action,"purchase");assert_eq!(tasks[&id].status,"running");
+                assert!(tasks[&id].prepared_handoff.is_some());assert!(tasks[&id].prompt.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_close_ack_bridge_uses_bound_reply_and_stops_when_channel_is_closed() {
+        let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
+        let account=engine.add_account("close-fixture@example.test".into()).unwrap();engine.accounts.lock().unwrap()[0].pending=false;
+        let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();let python=project.join(if cfg!(windows){".venv/Scripts/python.exe"}else{".venv/bin/python"});
+        let script=root.path().join("prepared-close-bridge.py");
+        fs::write(&script,format!(r#"import json,pathlib,sys
+sys.path.insert(0,{worker:?})
+from protocol import Channel
+r=json.loads(sys.stdin.readline());channel=Channel(r['account_id'],r['task_id'])
+channel.emit('prompt',prompt={{'id':'bridge-lease','kind':'prepared_purchase','label':'Fixture waiting'}})
+channel.emit('prompt_closed',request_id='bridge-lease',prepared_close_handshake=True)
+message=json.loads(sys.stdin.readline());channel.receive(message);ack=channel.responses.get(timeout=5)
+assert ack['request_id']=='bridge-lease' and ack['value']=={{'_prepared_close_ack':'closed'}}
+channel.emit('result',result={{'success':True,'status':'fixture_complete'}})
+"#,worker=project.join("worker").to_string_lossy().to_string())).unwrap();
+        let host=TaskHost{worker:python,script:Some(script),on_update:Arc::new(|_|{})};
+        let id=engine.start(host.clone(),account.id.clone(),"session_maintain".into(),json!({})).unwrap();
+        for _ in 0..400 {if engine.tasks.lock().unwrap()[&id].status=="succeeded"{break;}tokio::time::sleep(std::time::Duration::from_millis(20)).await;}
+        assert_eq!(engine.tasks.lock().unwrap()[&id].status,"succeeded");assert!(engine.tasks.lock().unwrap()[&id].prompt.is_none());
+        let mut waiting=task();waiting.id="closed-pipe".into();waiting.account_id=account.id.clone();waiting.status="waiting".into();
+        waiting.prompt=Some(json!({"id":"lease","kind":"prepared_purchase"}));engine.tasks.lock().unwrap().insert(waiting.id.clone(),waiting);
+        let (cancel,rx)=watch::channel(false);let (input,receiver)=mpsc::channel(1);drop(receiver);
+        engine.controls.lock().unwrap().insert("closed-pipe".into(),Control{cancel,input,pid:None,browser_pid:None,prepared_closed_request:None});
+        engine.apply_worker_event(&host,&account.id,"closed-pipe",&json!({"type":"prompt_closed","prepared_close_handshake":true,
+            "account_id":account.id,"task_id":"closed-pipe","request_id":"lease"}),false);
+        assert!(*rx.borrow());
+    }
+
+    #[test]
+    fn prepared_progress_updates_only_current_unclaimed_readiness_without_changing_lease_or_scope() {
+        let mut current=task();current.action="purchase".into();current.status="waiting".into();
+        current.prompt=Some(json!({"id":"waiting-lease","kind":"prepared_purchase","prepared":{
+            "v":1,"sku":"MK2P4CH/A","quantity":1,"authorized_store_ids":["R001"],
+            "config_file_sha256":"base-hash","prepared_at_ms":now_ms()-1000,"expires_at_ms":now_ms()+240000,
+            "preparation_stage":"review","review_verified":true,"order_ready":true}}));
+        let original=current.prompt.as_ref().unwrap()["prepared"].clone();
+        let event=json!({"type":"progress_result","prepared_update":true,"request_id":"waiting-lease","result":{"status":"waiting_stock","prepared":{
+            "sku":"OTHER","quantity":99,"authorized_store_ids":["R999"],"config_file_sha256":"other",
+            "prepared_at_ms":1,"expires_at_ms":u64::MAX,
+            "preparation_stage":"fulfillment","review_verified":false,"order_ready":false,
+            "checkout_details_prepared":{"stage":"Fulfillment","status":"waiting_stock","contact_accepted":false,"account":"must-not-copy"}}}});
+        apply_event(&mut current,&event);
+        assert_eq!(current.status,"waiting");let prepared=&current.prompt.as_ref().unwrap()["prepared"];
+        assert_eq!(prepared["preparation_stage"],"fulfillment");assert_eq!(prepared["review_verified"],false);assert_eq!(prepared["order_ready"],false);
+        for key in ["v","sku","quantity","authorized_store_ids","config_file_sha256","prepared_at_ms","expires_at_ms"]{assert_eq!(prepared[key],original[key]);}
+        assert_eq!(prepared["checkout_details_prepared"],json!({"stage":"Fulfillment","status":"waiting_stock","contact_accepted":false}));
+    }
+
+    #[test]
+    fn late_prepared_progress_cannot_restore_claimed_or_closed_prompt_or_update_another_request() {
+        let mut current=task();current.action="session_maintain".into();current.status="waiting".into();
+        current.prompt=Some(json!({"id":"new-lease","kind":"prepared_purchase","prepared":{
+            "prepared_at_ms":now_ms()-1000,"expires_at_ms":now_ms()+240000,
+            "preparation_stage":"review","review_verified":true,"order_ready":true}}));
+        let event=json!({"type":"progress_result","prepared_update":true,"request_id":"new-lease","result":{"status":"waiting_stock","prepared":{
+            "preparation_stage":"fulfillment","review_verified":false,"order_ready":false}}});
+        for change in ["foreign_request","foreign_account","foreign_task","submitted","claimed","terminal","expired"] {
+            let mut candidate=current.clone();let mut event=event.clone();
+            match change {
+                "foreign_request"=>event["request_id"]=json!("old-lease"),
+                "foreign_account"=>event["account_id"]=json!("other"),
+                "foreign_task"=>event["task_id"]=json!("other"),
+                "submitted"=>candidate.order_submitted=true,
+                "claimed"=>candidate.prepared_handoff=Some(json!({"source":"manual"})),
+                "terminal"=>candidate.status="failed".into(),
+                "expired"=>candidate.prompt.as_mut().unwrap()["prepared"]["expires_at_ms"]=json!(now_ms()-1),
+                _=>unreachable!(),
+            }
+            let before=candidate.prompt.clone();apply_event(&mut candidate,&event);assert_eq!(candidate.prompt,before,"{change}");
+        }
+        current.action="purchase".into();current.prepared_handoff=Some(json!({"source":"queue"}));
+        current.prompt=None;current.status="running".into();current.result=Some(json!({"status":"queue_running"}));
+        apply_event(&mut current,&json!({"type":"stage","message":"正在提交订单","order_submitted":true}));
+        let progress=serde_json::to_value(&current.purchase_progress).unwrap();
+        apply_event(&mut current,&event);assert!(current.prompt.is_none());assert_eq!(current.status,"running");
+        assert_eq!(current.result.as_ref().unwrap()["status"],"queue_running");
+        assert_eq!(serde_json::to_value(&current.purchase_progress).unwrap(),progress);
+    }
+
+    #[test]
     fn prompt_closed_matches_current_request_and_never_clears_new_or_foreign_prompt() {
         let mut current=task();current.status="waiting".into();
         current.prompt=Some(json!({"id":"new-code","kind":"code","label":"六位验证码"}));
@@ -1764,7 +1980,7 @@ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type='
         engine.tasks.lock().unwrap().get_mut("t").unwrap().status = "succeeded".into();
         let (cancel, _) = watch::channel(false);
         let (input, _) = mpsc::channel(1);
-        engine.controls.lock().unwrap().insert("t".into(), Control { cancel, input, pid: None, browser_pid: None });
+        engine.controls.lock().unwrap().insert("t".into(), Control { cancel, input, pid: None, browser_pid: None, prepared_closed_request:None });
         assert!(engine.reserve_removal(&a.id).is_err());
         engine.controls.lock().unwrap().clear();
         assert!(engine.reserve_removal(&a.id).is_ok());
@@ -1968,6 +2184,7 @@ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type='
                 input,
                 pid: None,
                 browser_pid: None,
+                prepared_closed_request: None,
             },
         );
         assert!(engine.remove_invalid_account(&a.id, "current").unwrap());
