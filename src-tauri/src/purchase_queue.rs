@@ -7,6 +7,7 @@ use std::io::Read;
 
 const CAPACITY: usize = 500;
 const HISTORY: usize = 200;
+const REARM_CAPACITY: usize = CAPACITY * 30;
 const FRESH_MS: u64 = 10_000;
 const CHILD_SLOTS: u32 = 10;
 const RESTORE_PRIORITY_MODE: &str = "下单方式已变更，任务暂停。恢复本账号的「预选多店」和自动抢购授权后，有货时继续；改用固定单店请取消此任务。";
@@ -121,6 +122,8 @@ pub(super) struct QueueState {
     #[serde(default)]
     episodes: HashMap<String, String>,
     #[serde(default)]
+    rearmed_after_ms: HashMap<String, u64>,
+    #[serde(default)]
     blocked_accounts: HashMap<String, String>,
     #[serde(default)]
     priority_migrated: HashSet<String>,
@@ -136,7 +139,7 @@ struct PolicyRejection {account_id:String,sku:String,quantity:u32,message:String
 
 impl Default for QueueState {
     fn default() -> Self {
-        Self {mode:default_mode(),purchase_groups:HashMap::new(),max_concurrency:1,paused:false,resume_after_restart:Some(true),next_sequence:0,jobs:vec![],episodes:HashMap::new(),blocked_accounts:HashMap::new(),priority_migrated:HashSet::new(),policy_rejections:HashMap::new()}
+        Self {mode:default_mode(),purchase_groups:HashMap::new(),max_concurrency:1,paused:false,resume_after_restart:Some(true),next_sequence:0,jobs:vec![],episodes:HashMap::new(),rearmed_after_ms:HashMap::new(),blocked_accounts:HashMap::new(),priority_migrated:HashSet::new(),policy_rejections:HashMap::new()}
     }
 }
 
@@ -149,7 +152,8 @@ impl QueueState {
                 .map_err(|_| "下单队列记录损坏，未恢复下单，请先核实已有订单")?
         } else { Self::default() };
         if !matches!(state.mode.as_str(),"sequential"|"parallel") || !(1..=10).contains(&state.max_concurrency)
-            || state.jobs.len()>CAPACITY+HISTORY+10 {
+            || state.jobs.len()>CAPACITY+HISTORY+10 || state.rearmed_after_ms.len()>REARM_CAPACITY
+            || state.rearmed_after_ms.iter().any(|(key,at)|key.len()>200||*at==0||*at>now_ms().saturating_add(1000)) {
             return Err("下单队列配置或容量无效，未恢复下单".into());
         }
         // Legacy paused state is the only available user intent. A previously
@@ -276,7 +280,8 @@ impl QueueState {
             }
         }
         if recovered { state.paused=true; }
-        if exists && (recovered || migrated_stock_time || migrated_authentication || migrated_groups) { state.save(root)?; }
+        let before_rearm=state.rearmed_after_ms.len();state.prune();
+        if exists && (recovered || migrated_stock_time || migrated_authentication || migrated_groups || before_rearm!=state.rearmed_after_ms.len()) { state.save(root)?; }
         Ok(state)
     }
     pub(super) fn owns_active_prompt_assignment(&self,account:&str,task:&str,event:&Value)->bool {
@@ -292,6 +297,12 @@ impl QueueState {
         self.jobs.retain(|job| {
             if job.terminal() && remaining>HISTORY { remaining-=1; false } else { true }
         });
+        // The old failure can leave bounded history. Its stock watermark still
+        // belongs to the active authorized group, until a new cycle is admitted.
+        let active:HashSet<_>=self.purchase_groups.values().filter(|group|group.status=="active"&&group.authorization_active)
+            .flat_map(|group|group.policy["stores"].as_array().into_iter().flatten()
+                .filter_map(move|store|store["store_id"].as_str().map(|store|format!("group|{}|{store}",group.id)))).collect();
+        self.rearmed_after_ms.retain(|key,_|active.contains(key)&&!self.episodes.contains_key(key));
     }
     fn save(&self, root: &Path) -> Result<(), String> {
         let mut disk=self.clone();
@@ -458,6 +469,37 @@ pub(super) fn contains_unknown(result: &Value) -> bool {
     // order cannot resolve another submitted child whose order is unknown.
     if children_any(result,contains_unknown) {return true}
     (result["order_submitted"]==true || result["submitted"]==true) && !contains_known_order(result)
+}
+
+fn failed_priority_episode_rearm(queue:&QueueState,key:&str,target:&Value)->Option<Value> {
+    if target["auto_purchase"]!=true{return None;}
+    let group_id=target["_queue_purchase_group_id"].as_str()?;
+    if !queue.purchase_groups.values().any(|group|group.id==group_id&&group.status=="active"&&group.authorization_active)
+        || queue.jobs.iter().any(|job|job.episode_key==key&&(job.pending()||job.inflight())) {return None;}
+    let job=if let Some(previous)=queue.episodes.get(key) {
+        queue.jobs.iter().find(|job|job.id==*previous&&job.episode_key==key&&job.purchase_group_id.as_deref()==Some(group_id))?
+    } else if queue.rearmed_after_ms.contains_key(key) {
+        queue.jobs.iter().rev().find(|job|job.episode_key==key&&job.purchase_group_id.as_deref()==Some(group_id))?
+    } else {return None;};
+    let (account,sku,store,quantity)=target_key(target).ok()?;
+    if job.status!="failed" || job.order_submitted || job.account_id!=account || canonical_sku(&job.sku)!=canonical_sku(&sku)
+        || job.store_id!=store || job.quantity!=quantity
+        || queue.blocked_accounts.get(&account).is_some_and(|reason|reason=="submission_unknown") {return None;}
+    let result=job.result.as_ref()?;
+    let confirmed_failure=result.is_object()&&result["success"]!=true&&match result.get("status").and_then(Value::as_str) {
+        Some("failed"|"error"|"purchase_failed")=>true,
+        None=>result["success"]==false,
+        _=>false,
+    };
+    if !confirmed_failure{return None;}
+    if contains_known_order(result)||contains_unknown(result)||result["order_submitted"]==true||result["submitted"]==true{return None;}
+    let checked=target["checked_at_ms"].as_u64()?;
+    let previous_positive=job.stock_detected_at_ms.unwrap_or(job.enqueued_at_ms).max(job.checked_at_ms);
+    if checked<=previous_positive{return None;}
+    Some(json!({"account_id":account,"task_id":job.task_id,"queue_job_id":job.id,"sequence":job.sequence,
+        "sku":sku,"quantity":quantity,"store_id":store,"checked_at_ms":checked,"order_submitted":false,
+        "status":"rearmed","reason":"fresh_unavailable_after_unsubmitted_failure",
+        "message":"原失败记录已保留；确认新无货后，等待下一补货周期的新有货信号。"}))
 }
 
 impl Engine {
@@ -696,6 +738,7 @@ impl Engine {
         let mut queue=self.purchase_queue.lock().unwrap();
         let previous=queue.clone();
         let mut outcomes=vec![];
+        let mut rearmed=vec![];
         // A monitor result refreshes authorization, not an already accepted signal.
         // Missing targets invalidate authorization after the complete snapshot is read.
         let targets=self.policy_inventory_targets(&mut queue,targets,current);
@@ -740,11 +783,28 @@ impl Engine {
                 // A waiting intent already owns this episode; rearm only after
                 // terminal work, never create a replacement for a retained job.
                 if target["_queue_purchase_group_id"].is_null() && !queue.jobs.iter().any(|job|job.episode_key==key&&job.pending()) {queue.episodes.remove(&key);}
+                else if let Some(context)=failed_priority_episode_rearm(&queue,&key,target) {
+                    let first=queue.episodes.remove(&key).is_some();
+                    let checked=target["checked_at_ms"].as_u64().unwrap();
+                    let watermark=queue.rearmed_after_ms.entry(key.clone()).or_default();*watermark=(*watermark).max(checked);
+                    if first{rearmed.push(context);}
+                } else if target["auto_purchase"]==true && queue.rearmed_after_ms.contains_key(&key)
+                    && queue.purchase_groups.values().any(|group|Some(group.id.as_str())==target["_queue_purchase_group_id"].as_str()
+                        &&group.status=="active"&&group.authorization_active)
+                    && !queue.jobs.iter().any(|job|job.episode_key==key&&(job.pending()||job.inflight())) {
+                    // Keep the negative high-water mark even after the failed
+                    // record is pruned from history; do not rearm a second time.
+                    let checked=target["checked_at_ms"].as_u64().unwrap();
+                    let watermark=queue.rearmed_after_ms.get_mut(&key).unwrap();*watermark=(*watermark).max(checked);
+                }
                 continue
             }
             if target["auto_purchase"]!=true || stock!="available" {continue}
             if !fresh {outcomes.push(json!({"target_id":target["id"],"status":"waiting_stock","message":"库存检查时间无效或已超过 10 秒"}));continue}
             if let Some(id)=queue.episodes.get(&key) {outcomes.push(json!({"target_id":target["id"],"status":"already_queued","queue_job_id":id}));continue}
+            if queue.rearmed_after_ms.get(&key).is_some_and(|after|target["checked_at_ms"].as_u64().unwrap_or(0)<=*after) {
+                outcomes.push(json!({"target_id":target["id"],"status":"waiting_stock","message":"等待晚于本次无货确认的新有货信号"}));continue;
+            }
             let concurrency=match pickup_concurrency(target) {Ok(value)=>value,Err(message)=>{outcomes.push(json!({"target_id":target["id"],"status":"blocked","message":message}));continue}};
             let retries=match purchase_retry_count(target) {Ok(value)=>value,Err(message)=>{outcomes.push(json!({"target_id":target["id"],"status":"blocked","message":message}));continue}};
             if queue.jobs.iter().filter(|job|!job.terminal()).count()>=CAPACITY {
@@ -760,7 +820,7 @@ impl Engine {
                 status:"queued".into(),stock_status:"available".into(),checked_at_ms:target["checked_at_ms"].as_u64().unwrap_or(0),signal_confirmed:true,
                 task_id:None,message:"库存已确认，等待按发现时间执行；账号忙时保留排队".into(),result:None,order_submitted:false,assignment:0,pickup_policy:target.get("pickup_policy").cloned(),
                 authorization_confirmed:true,authorized_stores:target["_queue_authorized_stores"].as_array().map(|rows|rows.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),episode_key:key.clone()});
-            queue.episodes.insert(key,id.clone());
+            queue.rearmed_after_ms.remove(&key);queue.episodes.insert(key,id.clone());
             outcomes.push(json!({"target_id":target["id"],"status":"queued","queue_job_id":id,"sequence":sequence}));
         }
         for job in queue.jobs.iter_mut().filter(|job|job.pending()&&!observed.contains(&(job.episode_key.clone(),job.quantity))) {
@@ -768,6 +828,7 @@ impl Engine {
         }
         queue.prune();queue.jobs.sort_by_key(|job|(job.enqueued_at_ms,job.sequence));
         if let Err(error)=queue.save(&self.root) {*queue=previous;return vec![json!({"status":"blocked","message":format!("无法保存下单队列，未分配购买：{error}")})]}
+        for context in rearmed {self.append_event("queue_episode_rearmed",&context);}
         for job in &queue.jobs {
             if previous.jobs.iter().find(|before|before.id==job.id).is_some_and(|before|
                 before.pickup_policy!=job.pickup_policy || before.status!=job.status&&job.status=="cancelled") {
@@ -1355,7 +1416,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn priority_each_store_needs_one_fresh_signal_and_failed_attempts_never_rearm() {
+    async fn priority_failed_store_rearms_only_for_a_later_confirmed_stock_cycle() {
+        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R493","R703"]));
+        let at=now_ms()-1000;observe(&engine,&host,vec![target(&account,"R493",at)]);
+        {
+            let mut queue=engine.purchase_queue.lock().unwrap();let failed=&mut queue.jobs[0];
+            failed.status="failed".into();failed.message="官网确认无货，原任务失败".into();
+            failed.result=Some(json!({"status":"failed","success":false,"order_submitted":false}));
+        }
+        let failed=jobs(&engine)[0].clone();let original=serde_json::to_value(&failed).unwrap();
+        let repeated=observe(&engine,&host,vec![target(&account,"R493",at+200)]);
+        assert_eq!(repeated[0]["status"],"already_queued");assert_eq!(jobs(&engine).len(),1);
+        observe(&engine,&host,vec![negative(target(&account,"R493",at+500))]);
+        let discovered=observe(&engine,&host,vec![target(&account,"R493",at+800)]);
+        assert_eq!(discovered[0]["status"],"queued");
+        let renewed=jobs(&engine);assert_eq!(renewed.len(),2);assert_ne!(renewed[0].id,renewed[1].id);
+        assert!(renewed[1].sequence>renewed[0].sequence);assert_eq!(renewed[1].purchase_group_id,failed.purchase_group_id);
+        assert_eq!(serde_json::to_value(&renewed[0]).unwrap(),original);
+        assert!(renewed.iter().all(|job|job.store_id=="R493"));assert_eq!(renewed[1].authorized_stores,vec!["R493"]);
+        observe(&engine,&host,vec![target(&account,"R493",at+900)]);assert_eq!(jobs(&engine).len(),2);
+    }
+
+    #[tokio::test]
+    async fn priority_rearm_rejects_unsafe_history_and_non_new_negative_samples() {
+        for case in ["queued","waiting_stock","dispatched","running","cancelling","cancelled","interrupted","succeeded","submission_unknown",
+            "submitted","known_order","nested_known","nested_unknown","missing_result","successful_result","pending_result","cancelled_result","unknown_result","blocked_account",
+            "group_success","group_unknown","group_cancelled","revoked","old_negative","equal_negative","stale_negative","unknown_negative","invalid_time","other_pending"] {
+            let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R493"]));let at=now_ms()-2000;
+            observe(&engine,&host,vec![target(&account,"R493",at)]);
+            {
+                let mut queue=engine.purchase_queue.lock().unwrap();let job=&mut queue.jobs[0];
+                job.status="failed".into();job.result=Some(json!({"success":false,"status":"failed","order_submitted":false}));
+                match case {
+                    "queued"|"waiting_stock"|"dispatched"|"running"|"cancelling"|"cancelled"|"interrupted"|"succeeded"|"submission_unknown"=>job.status=case.into(),
+                    "submitted"=>job.order_submitted=true,
+                    "known_order"=>job.result=Some(json!({"success":false,"status":"failed","order_number":"W123"})),
+                    "nested_known"=>job.result=Some(json!({"success":false,"status":"failed","attempts":[{"order_number":"W123"}]})),
+                    "nested_unknown"=>job.result=Some(json!({"success":false,"status":"failed","attempts":[{"status":"submission_unknown"}]})),
+                    "missing_result"=>job.result=None,
+                    "successful_result"=>job.result=Some(json!({"success":true,"status":"succeeded"})),
+                    "pending_result"=>job.result=Some(json!({"success":false,"status":"pending_payment","order_submitted":false})),
+                    "cancelled_result"=>job.result=Some(json!({"success":false,"status":"cancelled","order_submitted":false})),
+                    "unknown_result"=>job.result=Some(json!({"success":false,"status":"unknown","order_submitted":false})),
+                    _=>{},
+                }
+                if case=="blocked_account"{queue.blocked_accounts.insert(account.clone(),"submission_unknown".into());}
+                if case.starts_with("group_"){queue.purchase_groups.values_mut().next().unwrap().status=match case{"group_success"=>"succeeded","group_unknown"=>"submission_unknown",_=>"cancelled"}.into();}
+                if case=="other_pending"{let mut pending=queue.jobs[0].clone();pending.id=Uuid::new_v4().to_string();pending.sequence=2;pending.status="queued".into();pending.result=None;queue.jobs.push(pending);queue.next_sequence=2;}
+            }
+            let count=jobs(&engine).len();let key=jobs(&engine)[0].episode_key.clone();let original_episode=engine.purchase_queue.lock().unwrap().episodes[&key].clone();
+            let mut negative=negative(target(&account,"R493",at+1000));
+            match case {
+                "revoked"=>negative["auto_purchase"]=json!(false),
+                "old_negative"=>negative["checked_at_ms"]=json!(at-1),
+                "equal_negative"=>negative["checked_at_ms"]=json!(at),
+                "stale_negative"=>negative["checked_at_ms"]=json!(now_ms()-20000),
+                "unknown_negative"=>negative["status"]=json!("unknown"),
+                "invalid_time"=>negative["checked_at_ms"]=Value::Null,
+                _=>{},
+            }
+            observe(&engine,&host,vec![negative]);
+            let queue=engine.purchase_queue.lock().unwrap();assert_eq!(queue.episodes.get(&key),Some(&original_episode),"{case}");assert!(queue.rearmed_after_ms.is_empty(),"{case}");drop(queue);
+            if case!="revoked"{observe(&engine,&host,vec![target(&account,"R493",at+1500)]);assert_eq!(jobs(&engine).len(),count,"{case}");}
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_rearmed_watermark_survives_history_prune_and_restart_and_cleans_on_group_end() {
+        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R493"]));let at=now_ms()-2000;
+        observe(&engine,&host,vec![target(&account,"R493",at)]);
+        {let mut queue=engine.purchase_queue.lock().unwrap();queue.jobs[0].status="failed".into();queue.jobs[0].result=Some(json!({"status":"failed","success":false,"order_submitted":false}));}
+        let old=jobs(&engine)[0].clone();let key=old.episode_key.clone();
+        observe(&engine,&host,vec![negative(target(&account,"R493",at+500))]);
+        {
+            let mut queue=engine.purchase_queue.lock().unwrap();
+            for index in 0..=HISTORY {
+                let mut historical=old.clone();historical.id=Uuid::new_v4().to_string();historical.sequence=(index+2) as u64;
+                historical.purchase_group_id=None;historical.pickup_policy=None;historical.authorized_stores.clear();
+                historical.episode_key=format!("fixed-fixture-{index}");queue.jobs.push(historical);
+            }
+            queue.next_sequence=(HISTORY+2) as u64;queue.prune();assert!(!queue.jobs.iter().any(|job|job.id==old.id));
+            assert_eq!(queue.rearmed_after_ms[&key],at+500);queue.save(root.path()).unwrap();
+        }
+        let restored=QueueState::load(root.path(),&HashMap::new()).unwrap();assert_eq!(restored.rearmed_after_ms[&key],at+500);
+        *engine.purchase_queue.lock().unwrap()=restored;
+        observe(&engine,&host,vec![negative(target(&account,"R493",at+1000))]);
+        assert_eq!(engine.purchase_queue.lock().unwrap().rearmed_after_ms[&key],at+1000);
+        let late=observe(&engine,&host,vec![target(&account,"R493",at+800)]);assert_eq!(late[0]["status"],"waiting_stock");
+        assert_eq!(jobs(&engine).len(),HISTORY);
+        let newest=observe(&engine,&host,vec![target(&account,"R493",at+1500)]);assert_eq!(newest[0]["status"],"queued");
+        assert!(!engine.purchase_queue.lock().unwrap().rearmed_after_ms.contains_key(&key));
+        assert!(jobs(&engine).last().unwrap().sequence>old.sequence);
+        // A watermark belongs only to an active authorized group/store. Cancel,
+        // success, unknown, store removal and authorization revocation clean it.
+        for reason in ["cancelled","succeeded","submission_unknown","revoked","removed"] {
+            let mut queue=engine.purchase_queue.lock().unwrap();queue.episodes.remove(&key);queue.rearmed_after_ms.insert(key.clone(),at+1000);
+            let group=queue.purchase_groups.values_mut().next().unwrap();group.status="active".into();group.authorization_active=true;
+            match reason {"revoked"=>group.authorization_active=false,"removed"=>group.policy["stores"]=json!([]),_=>group.status=reason.into()};
+            queue.prune();assert!(!queue.rearmed_after_ms.contains_key(&key),"{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_rearm_save_failure_restores_old_episode_and_watermark_atomically() {
+        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R493"]));let at=now_ms()-2000;
+        observe(&engine,&host,vec![target(&account,"R493",at)]);
+        {let mut queue=engine.purchase_queue.lock().unwrap();queue.jobs[0].status="failed".into();queue.jobs[0].result=Some(json!({"status":"failed","success":false,"order_submitted":false}));}
+        let before=serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap();
+        let path=root.path().join("settings/purchase_queue.json");fs::rename(&path,root.path().join("settings/queue-backup.json")).unwrap();fs::create_dir(&path).unwrap();
+        let outcome=observe(&engine,&host,vec![negative(target(&account,"R493",at+1000))]);assert_eq!(outcome[0]["status"],"blocked");
+        assert_eq!(serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap(),before);
+        fs::remove_dir(&path).unwrap();fs::rename(root.path().join("settings/queue-backup.json"),&path).unwrap();
+        observe(&engine,&host,vec![negative(target(&account,"R493",at+1000))]);
+        let armed=serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap();
+        fs::rename(&path,root.path().join("settings/queue-backup.json")).unwrap();fs::create_dir(&path).unwrap();
+        let outcome=observe(&engine,&host,vec![target(&account,"R493",at+1500)]);assert_eq!(outcome[0]["status"],"blocked");
+        assert_eq!(serde_json::to_value(&*engine.purchase_queue.lock().unwrap()).unwrap(),armed);
+    }
+
+    #[tokio::test]
+    async fn priority_new_stock_cycle_success_still_ends_the_original_intent_and_pending_siblings() {
+        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R493","R703"]));let at=now_ms()-2000;
+        let mut waiting=target(&account,"R703",at);waiting["status"]=json!("unknown");waiting["checked_at_ms"]=Value::Null;
+        observe(&engine,&host,vec![target(&account,"R493",at),waiting.clone()]);
+        {let mut queue=engine.purchase_queue.lock().unwrap();queue.jobs[0].status="failed".into();queue.jobs[0].result=Some(json!({"status":"failed","success":false,"order_submitted":false}));}
+        let failed=serde_json::to_value(&jobs(&engine)[0]).unwrap();
+        observe(&engine,&host,vec![negative(target(&account,"R493",at+500)),waiting]);
+        observe(&engine,&host,vec![target(&account,"R493",at+1000),target(&account,"R703",at+1000)]);
+        assert_eq!(jobs(&engine).len(),3);assert_eq!(jobs(&engine)[0].purchase_group_id,jobs(&engine)[1].purchase_group_id);
+        engine.queue_pump_once();let current=jobs(&engine)[1].clone();ready(&engine,&current);
+        ack(&engine,&current,"queue_finished",json!({"status":"pending_payment","success":true,"order_submitted":true,"order_number":"W123456"}));
+        let finished=jobs(&engine);assert_eq!(serde_json::to_value(&finished[0]).unwrap(),failed);
+        assert_eq!(finished[1].status,"succeeded");assert_eq!(finished[2].status,"cancelled");
+        observe(&engine,&host,vec![negative(target(&account,"R493",at+1200)),negative(target(&account,"R703",at+1200))]);
+        observe(&engine,&host,vec![target(&account,"R493",at+1500),target(&account,"R703",at+1500)]);assert_eq!(jobs(&engine).len(),3);
+        assert!(engine.purchase_queue.lock().unwrap().rearmed_after_ms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn priority_each_store_needs_fresh_signal_and_unproven_failure_does_not_rearm() {
         let (root,engine,host,account)=fixture();let at=now_ms();save_policy(root.path(),&account,priority(&["R001","R002"]));
         observe(&engine,&host,vec![target(&account,"R001",at-20_000),target(&account,"R002",at)]);
         assert_eq!(jobs(&engine).len(),1);assert_eq!(jobs(&engine)[0].store_id,"R002");
@@ -1412,7 +1611,8 @@ mod tests {
         for pool in [false,true] {for status in ["unavailable","unknown","available"] {
             let (root,engine,host,account)=fixture();
             if pool {save_policy(root.path(),&account,priority(&["R390","R391"]));}
-            let mut signal=target(&account,"R390",now_ms());signal["retry_count"]=json!(2);
+            let at=now_ms()-2000;
+            let mut signal=target(&account,"R390",at);signal["retry_count"]=json!(2);
             observe(&engine,&host,vec![signal]);let initial=jobs(&engine)[0].clone();
             let mut next=target(&account,"R390",if status=="available" {now_ms()-20_000}else {now_ms()});next["status"]=json!(status);
             if status=="unknown" {next["checked_at_ms"]=Value::Null;}
@@ -1430,10 +1630,11 @@ mod tests {
             ack(&engine,&dispatched,"queue_finished",json!({"status":"failed","success":false,"order_submitted":false,"message":"官网结账：所选门店已无货","retry_summary":{"attempts":3,"retry_count":2}}));
             let failed=jobs(&engine)[0].clone();assert_eq!(failed.status,"failed");assert_eq!(failed.message,"官网结账：所选门店已无货");
             assert_eq!(failed.result.as_ref().unwrap()["retry_summary"]["attempts"],3);
-            let mut renewed=target(&account,"R390",now_ms());renewed["retry_count"]=json!(2);
+            let mut renewed=target(&account,"R390",at+1000);renewed["retry_count"]=json!(2);
             observe(&engine,&host,vec![renewed.clone()]);assert_eq!(jobs(&engine).len(),1);
-            observe(&engine,&host,vec![negative(target(&account,"R390",now_ms()))]);
-            observe(&engine,&host,vec![renewed]);assert_eq!(jobs(&engine).len(),if pool {1}else {2});
+            observe(&engine,&host,vec![negative(target(&account,"R390",at+1200))]);
+            renewed["checked_at_ms"]=json!(at+1500);
+            observe(&engine,&host,vec![renewed]);assert_eq!(jobs(&engine).len(),2);
             assert_eq!(jobs(&engine)[0].message,"官网结账：所选门店已无货");
         }}
     }

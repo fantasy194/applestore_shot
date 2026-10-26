@@ -1,5 +1,7 @@
 # 架构与运行约定
 
+0.1.23 修复预选多店中旧失败周期阻止新补货入队的问题，见 [新库存周期入队修复](RESTOCK-CYCLE-QUEUE-FIX.md)。
+
 0.1.22 区分官网明确结账过期与未知页面，在同一授权内复用当前购物袋恢复一次，见 [过期结账恢复](EXPIRED-CHECKOUT-RECOVERY.md)。
 
 0.1.21 的上午下单复盘、认证范围与返回主机轮换、当前 Cookie 保留及准备续期恢复，见 [上午维护复盘](MORNING-MAINTENANCE-REVIEW.md)。
