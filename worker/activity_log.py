@@ -28,7 +28,7 @@ DETAIL_FIELDS = frozenset((
     'browser_input_reason', 'browser_input_phase', 'browser_input_error',
     'credential_state', 'credential_source', 'credential_phase', 'credential_available',
     'credential_saved', 'credential_save_requested',
-    'authentication_phase',
+    'authentication_phase', 'authentication_reason',
 ))
 IDENTIFIER = re.compile(r'[A-Za-z0-9_.:-]{1,100}')
 INPUT_DIAGNOSTICS = {
@@ -42,7 +42,12 @@ CREDENTIAL_DIAGNOSTICS = {
                          'rejection_ignored', 'storage_unavailable', 'save_failed'},
     'credential_source': {'app_prompt', 'service_cache', 'vault', 'task_memory'},
     'credential_phase': {'password_authentication', 'authentication_context'},
-    'authentication_phase': {'password_authentication', 'authentication_context', 'store_exchange'},
+    'authentication_phase': {'password_authentication', 'authentication_context', 'store_exchange',
+                             'store_redirect', 'prepared_renewal'},
+    'authentication_reason': {'unsupported_signin_scope', 'redirect_missing', 'redirect_host_mismatch',
+        'redirect_scope_mismatch', 'redirect_method_invalid', 'redirect_args_invalid',
+        'current_signin_required', 'checkout_response_unverified', 'configuration_changed',
+        'authorization_changed', 'goods_changed', 'renewal_recovery_failed'},
 }
 SENSITIVE_ASSIGNMENT = re.compile(
     r'''(?ix)(["']?(?:password|passwd|pwd|token|access_token|refresh_token|id_token|authorization|cookie|set-cookie|otp|verification_code|验证码|密码|x-aos-stk|x-as-actk|csrf|secret|api_?key)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}]+)''')
@@ -299,7 +304,8 @@ class ActivityLog:
         queue_context = {key: payload[key] for key in ('queue_job_id', 'queue_assignment') if key in payload}
         if kind in ('stage', 'log'):
             self.record('task_' + kind, payload.get('message', ''),
-                        details={**queue_context, **{key: payload[key] for key in INPUT_DIAGNOSTICS if key in payload},
+                        details={**queue_context, **{key: payload[key] for key in
+                                 (*INPUT_DIAGNOSTICS, 'authentication_phase', 'authentication_reason') if key in payload},
                                  'order_submitted': payload.get('order_submitted') is True},
                         category='queue' if queue_context else None)
         elif kind == 'prompt':

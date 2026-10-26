@@ -34,11 +34,31 @@ srp.no_username_in_x()
 
 
 class LoginError(Exception):
-    def __init__(self, message, *, status=None, codes=(), phase=None):
+    def __init__(self, message, *, status=None, codes=(), phase=None, reason=None):
         super().__init__(message)
         self.status = status
         self.codes = tuple(codes)
         self.phase = phase
+        self.reason = reason
+
+
+def _redirect_error(reason, message):
+    return LoginError(message, phase='store_redirect', reason=reason)
+
+
+def _signin_scope(signin_url):
+    if signin_url is None:
+        return 'store'
+    try:
+        parsed=urlsplit(apple_url(signin_url))
+    except (LoginError,ValueError):
+        raise LoginError('本次认证入口不属于已授权的官方商城范围。',
+                         phase='authentication_context',reason='unsupported_signin_scope') from None
+    scope={'/shop/signIn/account':'account','/shop/signIn/orders':'orders','/shop/signIn':'checkout'}.get(parsed.path)
+    if (scope is None or re.fullmatch(r'(?:www|secure\d*\.www)\.apple\.com\.cn',parsed.hostname or '') is None):
+        raise LoginError('本次认证入口不属于已支持的官方商城范围。',
+                         phase='authentication_context',reason='unsupported_signin_scope')
+    return scope
 
 
 def recoverable_password_rejection(error, service):
@@ -753,38 +773,15 @@ class AppleStoreLogin:
             self.update_trust(trust_response)
 
     def discard_failed_login(self, error):
-        if (isinstance(error, LoginError) and error.status == 541
-                or recoverable_password_rejection(error, interaction.handler)):
-            # The authx response has already updated this jar (including
-            # expirations/deletions). Keep that current state, never restore
-            # a pre-request snapshot or treat a merchant block as bad password.
-            if self.auth_path is not None:
-                from duo_killer import save_auth
-                save_auth(self.session, auth_path=self.auth_path)
-            return
-        auth_names = {"as_ltn_cn", "as_cn", "as_disa", "as_rec", "myacinfo", "acn01"}
-
-        def is_auth(name, domain):
-            return name in auth_names or domain.lstrip(".") == "idmsa.apple.com.cn"
-
-        # 同时清理内存，避免账户/结账流程 finally 中的 save_auth 把失败凭证写回。
-        for cookie in list(self.session.cookies):
-            if is_auth(cookie.name, cookie.domain):
-                self.session.cookies.clear(cookie.domain, cookie.path, cookie.name)
-        if self.auth_path is None or not self.auth_path.exists():
-            return
-        config = json.loads(self.auth_path.read_text(encoding="utf-8"))
-        for group, cookies in config.get("cookies", {}).items():
-            config["cookies"][group] = [c for c in cookies if not is_auth(c["name"], c["domain"])]
-        fd, temporary = tempfile.mkstemp(dir=self.auth_path.parent, prefix=".auth-")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(config, file, ensure_ascii=False, indent=2)
-                file.write("\n")
-            os.replace(temporary, self.auth_path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        # Failure does not authorize a client-side mass deletion of merchant or
+        # IDMS state. requests already consumed the response's Set-Cookie
+        # rotations/deletions; persist exactly that current jar, never an older
+        # snapshot. This is not identity/login success and issues no proof.
+        from purchase_identity import invalidate_identity
+        invalidate_identity(session=self.session)
+        if self.auth_path is not None:
+            from duo_killer import save_auth
+            save_auth(self.session, auth_path=self.auth_path)
 
     def login(self, account, password, sms=False, *, signin_url=None, signin_response=None):
         try:
@@ -822,6 +819,10 @@ class AppleStoreLogin:
         reset_password = getattr(interaction.handler, 'begin_password_authentication', None)
         if callable(reset_password):
             reset_password()
+        # A refreshed login page may move to another official shard or the
+        # generic signIn document. That navigation cannot change the caller's
+        # actual account/orders/checkout authentication intent.
+        authentication_scope=_signin_scope(signin_url)
         self.account = account
         self.begin_authentication_context()
         self.restore_trust()
@@ -885,9 +886,9 @@ class AppleStoreLogin:
             confirmed()
         print("Apple 账号认证完成。")
         if signin_url is not None:
-            if urlsplit(self.store_page).path == "/shop/signIn/account":
+            if authentication_scope == 'account':
                 return self.finish_store_login(account=True)
-            if urlsplit(self.store_page).path == "/shop/signIn/orders":
+            if authentication_scope == 'orders':
                 return self.finish_store_login(orders=True)
             return self.finish_store_login(checkout=True)
         return self.finish_store_login()
@@ -915,32 +916,46 @@ class AppleStoreLogin:
                      response.headers.get('Content-Type', ''), len(response.content))
             raise LoginError('Apple 账号认证已完成，但商城会话交换被拒绝（HTTP 541）。'
                              '这不是验证码错误；商城登录尚未完成。', status=541, phase='store_exchange')
-        data = self.expect(response, (200,))
+        try:
+            data = self.expect(response, (200,))
+        except LoginError as error:
+            error.phase='store_exchange'
+            raise
         head = data.get("head", {}) if isinstance(data, dict) else {}
         target = head.get("data", {}).get("url")
         if head.get("status") != 302 or not isinstance(target, str) or not target:
-            raise LoginError("商城 authx 未返回成功跳转，未保存为已登录会话。")
-        target = apple_url(urljoin(self.store_page, target))
+            raise _redirect_error('redirect_missing',"商城 authx 未返回成功跳转，未保存为已登录会话。")
+        try:
+            target = apple_url(urljoin(self.store_page, target))
+        except (LoginError,ValueError):
+            raise _redirect_error('redirect_host_mismatch','商城认证返回了未授权的跳转地址。') from None
         if account or orders:
             redirect = head["data"]
             expected_path = "/shop/order/list" if orders else "/shop/account/home"
-            if (urlsplit(target).netloc != urlsplit(self.store_page).netloc
-                    or urlsplit(target).path != expected_path
-                    or str(redirect.get("method", "get")).lower() != "get"
-                    or redirect.get("args")):
-                raise LoginError("认证未返回预期的订单列表跳转，已停止。" if orders else "账户认证未返回预期的账户页跳转，已停止。")
+            parsed=urlsplit(target)
+            if re.fullmatch(r'secure\d*\.www\.apple\.com\.cn',parsed.hostname or '') is None:
+                raise _redirect_error('redirect_host_mismatch','账户认证未返回官方账户服务主机，已停止。')
+            if parsed.path != expected_path:
+                raise _redirect_error('redirect_scope_mismatch','认证跳转未属于本次账户或订单范围，已停止。')
+            if str(redirect.get('method','get')).lower()!='get':
+                raise _redirect_error('redirect_method_invalid','账户或订单认证未返回只读跳转，已停止。')
+            if not isinstance(redirect.get('args',{}),dict) or redirect.get('args'):
+                raise _redirect_error('redirect_args_invalid','账户或订单认证返回了非预期参数，已停止。')
             return self.page(target)
         if checkout:
             redirect = head["data"]
             method = str(redirect.get("method", "get")).upper()
             args = redirect.get("args", {})
-            if (urlsplit(target).netloc != urlsplit(self.store_page).netloc
-                    or urlsplit(target).path not in ("/shop/checkout/start", "/shop/checkout")
-                    or method not in ("GET", "POST") or not isinstance(args, dict)
-                    or (method == "GET" and args)
-                    or (method == "POST" and (urlsplit(target).path != "/shop/checkout/start"
-                        or set(args) != {"pltn"} or not isinstance(args["pltn"], str) or not args["pltn"]))):
-                raise LoginError("结账认证返回了未支持的跳转方式或参数，已停止。")
+            if urlsplit(target).netloc != urlsplit(self.store_page).netloc:
+                raise _redirect_error('redirect_host_mismatch','结账认证跳转与当前结账主机不同，已停止。')
+            if urlsplit(target).path not in ('/shop/checkout/start','/shop/checkout'):
+                raise _redirect_error('redirect_scope_mismatch','结账认证返回了非结账跳转，已停止。')
+            if method not in ('GET','POST'):
+                raise _redirect_error('redirect_method_invalid','结账认证返回了未支持的跳转方式，已停止。')
+            if (not isinstance(args,dict) or method=='GET' and args or method=='POST' and (
+                    urlsplit(target).path!='/shop/checkout/start' or set(args)!={'pltn'}
+                    or not isinstance(args['pltn'],str) or not args['pltn'])):
+                raise _redirect_error('redirect_args_invalid','结账认证返回了未支持的跳转参数，已停止。')
             print(f"结账认证回调成功，按 {method} 继续 checkout/start。")
             return self.page(target, method=method, data=args if method == "POST" else None)
         if not any(c.name == "as_ltn_cn" and c.value and not c.is_expired()

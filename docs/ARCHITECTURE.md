@@ -1,5 +1,7 @@
 # 架构与运行约定
 
+0.1.21 的上午下单复盘、认证范围与返回主机轮换、当前 Cookie 保留及准备续期恢复，见 [上午维护复盘](MORNING-MAINTENANCE-REVIEW.md)。
+
 0.1.20 的监控准备范围、原会话续期、明确无货后的队列续用、私有身份证明和手动联系人准备，见 [活结账优化](LIVE-CHECKOUT-PERFORMANCE.md)。
 
 0.1.19 的活准备接手区分商品依据缺失与真实冲突，并按当前页面判定 Review，见 [本轮失败分析与准备复核](PREPARED-REVALIDATION-WAVE.md)。

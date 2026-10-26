@@ -941,8 +941,14 @@ class Service:
         self.validate_preparation_scope(sku=sku, count=count)
         if self.action == 'session_maintain':
             from purchase_session import verify_account_session, record_action_session
+            previous_requested = self.authentication_requested
+            previous_interaction = self.purchase_auth_interaction
             verify_account_session(self)
             record_action_session(self)
+            # Successful prewarming authentication is not a later checkout's
+            # authentication failure. Actual new requests keep their own flags.
+            self.authentication_requested = previous_requested
+            self.purchase_auth_interaction = previous_interaction
         self.stage('空闲自提预热：使用当前账号商品和自提偏好，不创建订单')
         previous_owner = self._purchase_session_owner
         if self.action == 'session_maintain':

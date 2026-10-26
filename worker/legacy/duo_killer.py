@@ -981,9 +981,84 @@ def _checkout_browser_recovery(flow, handler, expected):
     return True
 
 
+def checkout_signin_entry(flow):
+    """Only the current official document can provide an authentication entry."""
+    def allowed(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = urlsplit(value)
+            if parsed.port not in (None, 443):
+                return None
+        except ValueError:
+            return None
+        if (parsed.scheme == 'https' and not parsed.username and not parsed.password
+                and (parsed.hostname == 'www.apple.com.cn'
+                     or re.fullmatch(r'secure\d*\.www\.apple\.com\.cn', parsed.hostname or ''))
+                and parsed.path in ('/shop/signIn', '/shop/signIn/account', '/shop/signIn/orders')):
+            return value
+        return None
+    response_url = getattr(getattr(flow, 'page_response', None), 'url', None)
+    actual = allowed(response_url)
+    if actual:
+        return actual
+    body = getattr(flow, 'current_response_body', None)
+    from apple_login import find_value
+    config = find_value(body, 'customerLoginIDMS') if isinstance(body, dict) else None
+    declared = field(body, 'meta.page.htmlUrl')
+    if isinstance(config, dict) and isinstance(config.get('d'), dict):
+        entry = allowed(urljoin(response_url if isinstance(response_url, str) else flow.url, declared)) if isinstance(declared, str) else None
+        if entry:
+            return entry
+    # Fixtures and older private callers may supply the current URL directly.
+    return allowed(flow.url) if not isinstance(response_url, str) else None
+
+
+def checkout_auth_document_scope(flow, entry):
+    """Private scope identity; raw authentication URLs/documents never leave memory."""
+    body = getattr(flow, 'current_response_body', None)
+    if not isinstance(entry, str) or not isinstance(body, dict):
+        return None
+    from apple_login import find_value
+    config = find_value(body, 'customerLoginIDMS')
+    settings = config.get('d', {}) if isinstance(config, dict) else {}
+    raw_headers = field(body, 'meta.h', {})
+    if not isinstance(settings, dict) or not isinstance(raw_headers, dict):
+        return None
+    headers = {key.lower(): value for key, value in raw_headers.items()
+               if key.lower() in ('x-aos-stk', 'x-as-actk')}
+    if (not isinstance(headers.get('x-aos-stk'), str) or not headers['x-aos-stk']
+            or not isinstance(settings.get('callbackSignInUrl'), str)
+            or not isinstance(settings.get('serviceURL'), str)):
+        return None
+    parsed = urlsplit(entry)
+    # Ignore tracking/layout fields: only the dynamic login scope, official
+    # callback and this authentication document's request tokens distinguish it.
+    scope_url = {'origin': (parsed.scheme, parsed.netloc, parsed.path),
+                 'query': sorted((key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                                 if key in ('ssi', 'up'))}
+    encoded = json.dumps({'entry': scope_url, 'callback': settings['callbackSignInUrl'],
+                         'service': settings['serviceURL'], 'tokens': headers},
+                        sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def reauthenticate_checkout(flow, *, expected=None):
-    if not urlsplit(flow.url).path.startswith("/shop/signIn"):
+    entry = checkout_signin_entry(flow)
+    if entry is None:
         return False
+    response_url = getattr(getattr(flow, 'page_response', None), 'url', None)
+    if isinstance(response_url, str) and response_url != entry:
+        # A fresh document declared this exact dynamic entry. Read it once;
+        # bootstrap must receive its real matching response, never a forged URL.
+        flow.page(entry, '读取当前结账认证入口', fresh=True)
+        entry = checkout_signin_entry(flow)
+        if entry is None:
+            return False
+        if getattr(getattr(flow, 'page_response', None), 'url', None) != entry:
+            raise ValueError('官网未返回本次声明的实际认证文档，已停止；未提交登录或购买。')
+    flow.url = entry
+    auth_scope = checkout_auth_document_scope(flow, entry)
     from purchase_identity import invalidate_identity
     invalidate_identity(service=interaction.handler, session=flow.session)
     from apple_login import AppleStoreLogin, LoginError, load_credentials, recoverable_password_rejection
@@ -1027,6 +1102,7 @@ def reauthenticate_checkout(flow, *, expected=None):
                 if failed_before is False and getattr(handler, 'password_rejected', False) is not True:
                     handler.authentication_failed = False
                 log.info('[结账认证] 官网浏览器已在原购买任务中恢复结账，未重复加购或重放认证。')
+                flow._successful_checkout_auth_scope = auth_scope
                 return True
             raise ValueError("结账重新认证失败：" + str(error)) from error
         except EOFError:
@@ -1040,6 +1116,7 @@ def reauthenticate_checkout(flow, *, expected=None):
         # Persist renewed cookies before the long shipping/payment stages. A task
         # interruption must not lose a successful authentication.
         save_auth(flow.session)
+        flow._successful_checkout_auth_scope = auth_scope
         log.info("[结账认证] 已恢复到有效结算步骤。")
         return True
 
@@ -1202,6 +1279,11 @@ def confirm_order(model, *, fresh_model=None):
     contains_delivery = any(isinstance(group, dict) and bool(field(group, 'd.delivers'))
                             for key, group in review.get('fulfillmentReview', {}).items() if key.startswith('reviewGroup-'))
     pickup_proof = None
+    if not store and not delivery:
+        current_identity = fresh_review_store_identity(fresh_model)
+        if current_identity:
+            store, store_id = current_identity['store'], current_identity['store_id']
+            pickup_proof = {**current_identity, 'source': 'current_review_store_identity'}
     if not store and not delivery:
         from pickup_options import review_pickup_selection
         pickup_proof = review_pickup_selection(model, getattr(interaction.handler, 'pickup_selected', None))
@@ -1564,6 +1646,9 @@ def resume_prepared_pickup(flow, expected, result):
     approved_details = deepcopy(getattr(handler, 'order_details', None) or {})
     review_verified = result.get('review_verified') is True
     had_slot = bool(getattr(handler, 'pickup_slot_selected', None))
+    # Existing browser/authx guards may describe a successfully completed older
+    # scope. Freeze only that positive proof, never an unfinished rejection.
+    flow._prepared_successful_auth_scope = getattr(flow, '_successful_checkout_auth_scope', None)
     # Save issued cookies before waiting; the live Session/Checkout and current
     # run's selected store remain in memory and are never restored on restart.
     save_auth(flow.session)
@@ -1607,26 +1692,56 @@ def resume_prepared_pickup(flow, expected, result):
 
 
 def renew_prepared_pickup(flow, expected, previous, config, config_hash):
-    """Renew only the waiting lease, without authentication, forms or purchase."""
+    """Renew the original checkout; one current authentication recovery at most."""
+    from session_maintenance import MaintenanceFailure
     handler = interaction.handler
-    handler.channel.checkpoint()
-    handler.validate_preparation_scope()
     raw_hash = getattr(flow, '_prepared_config_file_sha256', None)
-    if (getattr(handler, 'submitted', False) is True or checkout_config_hash(config) != config_hash
-            or isinstance(raw_hash, str) and hashlib.sha256(config.read_bytes()).hexdigest() != raw_hash):
-        raise ValueError('自提准备配置或提交状态已变化，已结束等待；未自动下单。')
+    def verify_scope():
+        handler.channel.checkpoint()
+        if (getattr(handler, 'submitted', False) is True or checkout_config_hash(config) != config_hash
+                or isinstance(raw_hash, str) and hashlib.sha256(config.read_bytes()).hexdigest() != raw_hash):
+            raise MaintenanceFailure('PREPARED_RENEWAL_UNVERIFIED',
+                '自提准备配置或提交状态已变化，已结束等待；未自动下单。', reason='configuration_changed')
+        try:
+            handler.validate_preparation_scope()
+        except ValueError as error:
+            raise MaintenanceFailure('PREPARED_RENEWAL_UNVERIFIED',
+                '监控购买授权已变化，已结束准备续期；未自动下单。', reason='authorization_changed') from error
+    verify_scope()
     flow.page(flow.apple_url('/shop/checkout'), '续期核对原自提结算', fresh=True)
-    if urlsplit(flow.url).path.startswith('/shop/signIn'):
-        raise ValueError('官网要求重新认证，已结束本次准备续期；未自动重试登录或下单。')
+    verify_scope()
+    current_entry = checkout_signin_entry(flow)
+    if current_entry is not None:
+        if getattr(flow, '_preparation_auth_recovery_attempted', False) is True:
+            raise MaintenanceFailure('PREPARED_RENEWAL_AUTHENTICATION_FAILED',
+                '官网再次要求认证，原准备已使用一次恢复机会；已停止重复认证。',
+                reason='current_signin_required', requires_login=True)
+        flow._preparation_auth_recovery_attempted = True
+        prior_guards = ('_browser_authentication_recovery_attempted', '_http_authx_rejected', '_http_authentication_rejected')
+        if any(getattr(flow, flag, False) is True for flag in prior_guards):
+            completed = getattr(flow, '_prepared_successful_auth_scope', None)
+            current_scope = checkout_auth_document_scope(flow, current_entry)
+            if not isinstance(completed, str) or current_scope is None or completed == current_scope:
+                raise MaintenanceFailure('PREPARED_RENEWAL_AUTHENTICATION_FAILED',
+                    '本次认证范围尚未完成或已尝试，已结束准备；未重复认证。',
+                    reason='current_signin_required', requires_login=True)
+            for flag in prior_guards:
+                setattr(flow, flag, False)
+        # Preserve current network/local/authentication exception categories;
+        # an attempted recovery alone is not proof that login was refused.
+        reauthenticate_checkout(flow, expected=expected)
+        verify_scope()
+        if checkout_signin_entry(flow) is not None:
+            raise MaintenanceFailure('PREPARED_RENEWAL_AUTHENTICATION_FAILED',
+                '官网恢复后仍要求认证，已结束准备；未再次认证。',
+                reason='current_signin_required', requires_login=True)
     page = field(flow.current_response_body, 'checkout.d.page')
     if page not in ('Fulfillment', 'PickupContact', 'Shipping', 'Billing', 'Review'):
-        raise ValueError('官网未返回可核验的原自提结算步骤，已结束准备续期。')
+        log.info('[自提准备] reason=prepared_step_unknown；当前官网未返回已支持的结算步骤。')
+        raise MaintenanceFailure('PREPARED_RENEWAL_UNVERIFIED',
+            '官网未返回可核验的原自提结算步骤，已结束准备续期。', reason='checkout_response_unverified')
     verify_prepared_physical_items(flow, expected)
-    handler.channel.checkpoint()
-    if (checkout_config_hash(config) != config_hash
-            or isinstance(raw_hash, str) and hashlib.sha256(config.read_bytes()).hexdigest() != raw_hash):
-        raise ValueError('自提配置已变化，已结束准备续期；未自动下单。')
-    handler.validate_preparation_scope()
+    verify_scope()
     save_auth(flow.session)
     log.info('[自提准备] 原会话只读核验完成，续期等待购买；当前步骤=%s，未加购或提交。', page)
     ready = page == 'Review' and prepared_review_ready(flow.current_response_body, expected, config)
@@ -1809,6 +1924,89 @@ def current_pickup_store_confirmed(body, pickup):
     return bool(isinstance(name, str) and isinstance(store_id, str) and allowed_store(pickup, name, store_id))
 
 
+def fresh_review_store_identity(body):
+    """Use explicit current Review identities, never a preset as server proof."""
+    from pickup_options import store_name, prepared_pickup_store_confirmed
+    if field(body, 'checkout.d.page') != 'Review':
+        return None
+    sources = [field(body, 'checkout.companionBar.orderDetails.fulfillmentCompanionBar.pickupSummary.d', {})]
+    fulfillment = field(body, 'checkout.review.fulfillmentReview', {})
+    if not isinstance(fulfillment, dict):
+        return None
+    sources.extend(field(group, 'd.pickup', {}) for key, group in fulfillment.items()
+                   if key.startswith('reviewGroup-') and isinstance(group, dict))
+    ids, names = set(), {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        identity = source.get('storeId')
+        if identity:
+            if not isinstance(identity, str) or not re.fullmatch(r'R\d+', identity):
+                return None
+            ids.add(identity)
+        for key in ('store_name', 'storeName'):
+            if isinstance(source.get(key), str) and store_name(source[key]):
+                names.setdefault(store_name(source[key]), source[key])
+    if len(ids) > 1 or len(names) > 1:
+        raise ValueError('官网当前复核页门店信息不一致；未提交订单。')
+    if len(ids) != 1 or len(names) != 1:
+        return None
+    details = {'store_id': next(iter(ids)), 'store': next(iter(names.values()))}
+    return details if prepared_pickup_store_confirmed(body, details) else None
+
+
+def restore_current_review_context(flow, expected, config):
+    """A disk hint may reuse only fully re-proven current checkout evidence."""
+    from checkout_options import read_config
+    from pickup_options import (allowed_store, prepared_contact_review_proof, prepared_pickup_slot_confirmed,
+                                fresh_pickup_context, fresh_pickup_slot_payload)
+    body = flow.current_response_body
+    physical = checkout_physical_items(field(body, 'checkout.review.fulfillmentReview', {}))
+    if not physical:
+        return False
+    if physical != expected:
+        raise ValueError('官网商品或数量与本次准备不一致；未提交订单。')
+    details = fresh_review_store_identity(body)
+    if details is None:
+        return False
+    settings = read_config(config)
+    if not allowed_store(settings.get('pickup', {}), details['store'], details['store_id']):
+        raise ValueError('官网当前复核门店不属于本次自提授权；未提交订单。')
+    proof = prepared_contact_review_proof(body)
+    if proof is None:
+        return False
+    if (settings.get('pickup', {}).get('contact_mode', 'local') != 'official'
+            and not prepared_pickup_contact_confirmed(body, settings)):
+        return False
+    slots = []
+    fulfillment = field(body, 'checkout.review.fulfillmentReview', {})
+    for key, group in fulfillment.items():
+        if not key.startswith('reviewGroup-') or not isinstance(group, dict):
+            continue
+        pickup = field(group, 'd.pickup', {})
+        if not isinstance(pickup, dict):
+            return False
+        if pickup.get('date') is not None or pickup.get('timeSlotValue') is not None:
+            selected = re.fullmatch(r'\d{1,2}-(\d{2}:\d{2})-(\d{2}:\d{2})', str(pickup.get('timeSlotValue', '')))
+            if selected is None:
+                return False
+            slots.append({'store_id': details['store_id'], 'date': pickup.get('date'),
+                          'start': selected[1], 'end': selected[2]})
+    if slots and (any(slot != slots[0] for slot in slots)
+                  or not prepared_pickup_slot_confirmed(body, {**details, 'pickup_time_slot': slots[0]})):
+        return False
+    if not slots:
+        context = fresh_pickup_context(flow, {'store_name': details['store'], 'store_id': details['store_id']})
+        if context is None or fresh_pickup_slot_payload(context, settings.get('pickup', {}).get('time_slot_rule')) != {}:
+            return False  # Omitted/text-only appointments do not prove no slot is required.
+    handler = interaction.handler
+    handler.pickup_contact_proof = proof
+    handler.pickup_contact_accepted = True
+    handler.pickup_slot_selected = slots[0] if slots else None
+    log.info('[继续结算] 本次官网 Review 商品、门店及联系人证据完整，沿用原结算，未重新加购。')
+    return True
+
+
 def prepared_pickup_contact_confirmed(model, config):
     """Only a fresh, unmasked contact identity can skip refilling after a wait."""
     node = field(model, 'checkout.review.pickupContactReview')
@@ -1988,21 +2186,25 @@ def purchase_sku(part, sms=False, quantity=1, *, prepare_only=False):
                     and previous.get('config_hash') == config_hash
                     and 0 <= time() - previous.get('created_at', 0) < 300):
                 flow.page(BASE_URL + "/shop/checkout", "读取已准备的结算页面")
+                reauthenticate_checkout(flow, expected=[(part, quantity)])
                 usable = (field(flow.model, 'checkout.d.page') in ('Fulfillment', 'PickupContact', 'Shipping', 'Billing', 'Review')
                           or isinstance(field(flow.model, 'checkout.review'), dict))
-                if partial:
+                if (getattr(interaction.handler, 'fulfillment_mode', 'HOME') == 'RETAIL'
+                        and field(flow.current_response_body, 'checkout.d.page') == 'Review'):
+                    usable = restore_current_review_context(flow, [(part, quantity)], config)
+                elif partial:
                     # A marker is not inventory or item proof. Require fresh,
                     # consistent physical-item evidence before skipping the bag.
-                    evidence = [model_items(field(flow.model, path, {})) for path in
+                    evidence = [checkout_physical_items(field(flow.current_response_body, path, {})) for path in
                                 ('checkout.fulfillment', 'checkout.companionBar.orderDetails')]
                     evidence = [items for items in evidence if items]
-                    usable = (field(flow.model, 'checkout.d.page') == 'Fulfillment' and bool(evidence)
+                    usable = (field(flow.current_response_body, 'checkout.d.page') == 'Fulfillment' and bool(evidence)
                               and all(items == [(part, quantity)] for items in evidence))
                 elif (getattr(interaction.handler, 'fulfillment_mode', 'HOME') == 'RETAIL'
                         and not field(flow.model, 'checkout.companionBar.orderDetails.fulfillmentCompanionBar.pickupSummary.d.store_name')):
                     # This server hides stores on Review. A new task has no current
                     # store-selection proof: rebuild it rather than trust old cache.
-                    usable = False
+                    usable = restore_current_review_context(flow, [(part, quantity)], config)
                     log.info('[继续结算] 自提准备页未提供可重新核对的门店，重新选择官网门店；不使用旧任务的选择记录。')
                 if usable:
                     log.info("[继续结算] 复用官网当前结算步骤，最终重新核对商品、金额和地址。")

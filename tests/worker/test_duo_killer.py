@@ -499,7 +499,7 @@ class BrowserInitializationTests(unittest.TestCase):
                     with self.assertRaises(LoginError) as caught:
                         client.finish_store_login()
                     self.assertEqual(caught.exception.status, status)
-                    self.assertEqual(caught.exception.phase, "store_exchange" if status == 541 else None)
+                    self.assertEqual(caught.exception.phase, "store_exchange")
                     request.assert_called_once()
                     initialize.assert_not_called()
                 self.assertEqual((client.browser_profile / ".authx-541").exists(), status == 541)
@@ -715,7 +715,7 @@ class FirstRunTests(unittest.TestCase):
 
 
 class FailedLoginLifecycleTests(unittest.TestCase):
-    def test_failed_auth_discards_failed_session_but_keeps_identity_password_and_trust(self):
+    def test_failed_auth_preserves_current_response_state_identity_password_and_trust(self):
         failures = (LoginError("rejected", status=401, codes=("-20101",)),
                     LoginError("bad code", status=400, codes=("-21669",)),
                     LoginError("callback failed", status=541), requests.Timeout("timeout"), EOFError())
@@ -739,12 +739,11 @@ class FailedLoginLifecycleTests(unittest.TestCase):
                         with self.assertRaises(type(error)):
                             client.login(config["account"], config["password"], signin_url=entry)
                         attempt.assert_called_once()
-                    # Callers persist the current jar: rejected credentials stay removed;
-                    # a merchant 541 preserves response-updated state without old snapshots.
+                    # No response deleted these cookies. Failure alone cannot
+                    # manufacture a deletion; only current server state is saved.
                     duo_killer.save_auth(client.session)
                     saved = json.loads(path.read_text())
-                    expected_names = ({"as_ltn_cn", "myacinfo", "idmsa-session", "shld_bt_ck"}
-                                      if getattr(error, "status", None) == 541 else {"shld_bt_ck"})
+                    expected_names = {"as_ltn_cn", "myacinfo", "idmsa-session", "shld_bt_ck"}
                     self.assertEqual({c["name"] for group in saved["cookies"].values() for c in group}, expected_names)
                     self.assertEqual(saved["trust_cookies"], config["trust_cookies"])
                     self.assertEqual(saved["custom"], "keep")
@@ -1439,7 +1438,7 @@ class OrderListTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     duo_killer.order_list(session)
 
-    def test_order_authx_rejects_checkout_and_cross_host_redirects(self):
+    def test_order_authx_allows_official_shards_and_rejects_checkout_or_untrusted_hosts(self):
         client = AppleStoreLogin()
         client.store_page = "https://secure8.www.apple.com.cn/shop/signIn/orders?ssi=fresh"
         client.callback = "https://secure8.www.apple.com.cn/shop/signIn/idms/authx?ssi=fresh"
@@ -1448,14 +1447,15 @@ class OrderListTests(unittest.TestCase):
         target = "https://secure8.www.apple.com.cn/shop/order/list"
         for redirect, valid in (({"url": target}, True), ({"url": target, "method": "post"}, False),
                                 ({"url": target, "args": {"unexpected": "value"}}, False),
-                                ({"url": "https://secure9.www.apple.com.cn/shop/order/list"}, False),
+                                ({"url": "https://secure9.www.apple.com.cn/shop/order/list"}, True),
+                                ({"url": "https://secure9.www.apple.com.cn.evil.test/shop/order/list"}, False),
                                 ({"url": "https://secure8.www.apple.com.cn/shop/checkout/start"}, False)):
             with self.subTest(redirect=redirect), \
                     patch.object(client, "request", return_value=response({"head": {"status": 302, "data": redirect}})), \
                     patch.object(client, "page") as page:
                 if valid:
                     client.finish_store_login(orders=True)
-                    page.assert_called_once_with(target)
+                    page.assert_called_once_with(redirect["url"])
                 else:
                     with self.assertRaises(LoginError):
                         client.finish_store_login(orders=True)

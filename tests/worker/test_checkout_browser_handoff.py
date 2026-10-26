@@ -82,6 +82,7 @@ class CheckoutBrowserHandoffTests(unittest.TestCase):
         for entry_kind in ('manual','scheduled','queue'):
             with self.subTest(entry=entry_kind):
                 self.flow.url=self.entry;self.flow.model={'signIn':{'old':True}}
+                self.flow.page_response=requests.Response();self.flow.page_response.url=self.entry
                 self.flow._browser_authentication_recovery_attempted=False
                 self.flow._http_authentication_rejected=False
                 self.service.authentication_failed=False
@@ -102,6 +103,7 @@ class CheckoutBrowserHandoffTests(unittest.TestCase):
                 self.assertFalse(self.service.submitted)
                 self.assertFalse(self.service.authentication_failed)
                 self.flow.url=self.entry
+                self.flow.page_response=requests.Response();self.flow.page_response.url=self.entry
                 with self.assertRaises(ValueError):duo_killer.reauthenticate_checkout(self.flow)
                 self.login.assert_called_once();self.recover.assert_called_once()
 

@@ -795,7 +795,11 @@ class PartialPickupPreparationTests(TestCase):
         flow = self.blocked_flow()
         model = option_fixtures.fulfillment_model(mixed=False)
         model['checkout']['fulfillment']['item-0'] = deepcopy(flow.item)
-        flow.page = Mock(side_effect=lambda *args, **kwargs: setattr(flow, 'model', deepcopy(model)))
+        model['checkout']['fulfillment']['item-0']['d']['sku'] = 'mk2m4ch'
+        def page(*args, **kwargs):
+            flow.model = deepcopy(model)
+            flow.current_response_body = deepcopy(model)
+        flow.page = Mock(side_effect=page)
         with patch.object(shop, 'Checkout', return_value=flow), patch.object(shop, 'ensure_auth_file'), \
                 patch.object(shop, 'load_auth'), patch.object(shop, 'ensure_strong_login', return_value=False), \
                 patch.object(shop, 'save_auth'), patch.object(shop, 'add_to_bag') as add:
@@ -814,7 +818,10 @@ class PartialPickupPreparationTests(TestCase):
             if change == 'changed':
                 model['checkout']['fulfillment']['item-0'] = deepcopy(flow.item)
                 model['checkout']['fulfillment']['item-0']['d']['sku'] = 'INVALID/A'
-            flow.page = Mock(side_effect=lambda *args, **kwargs: setattr(flow, 'model', deepcopy(model)))
+            def page(*args, **kwargs):
+                flow.model = deepcopy(model)
+                flow.current_response_body = deepcopy(model)
+            flow.page = Mock(side_effect=page)
             with self.subTest(change=change), patch.object(shop, 'Checkout', return_value=flow), \
                     patch.object(shop, 'ensure_auth_file'), patch.object(shop, 'load_auth'), \
                     patch.object(shop, 'ensure_strong_login', return_value=False), patch.object(shop, 'save_auth'), \
@@ -870,7 +877,10 @@ class PreparedLeaseRenewalTests(TestCase):
                 with self.assertRaises(ValueError):
                     shop.renew_prepared_pickup(flow, [('MK2M4CH/A', 1)], {}, self.service.checkout,
                         'changed' if cause == 'config' else shop.checkout_config_hash(self.service.checkout))
-                auth.assert_not_called()
+                if cause == 'signin':
+                    auth.assert_called_once()
+                else:
+                    auth.assert_not_called()
                 flow.action.assert_not_called()
                 if cause == 'config':
                     flow.page.assert_not_called()

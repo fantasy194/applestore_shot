@@ -7,31 +7,57 @@ import requests
 import duo_killer
 
 
+AUTHENTICATION_PHASES=frozenset(('password_authentication','authentication_context','store_exchange',
+                               'store_redirect','prepared_renewal'))
+AUTHENTICATION_REASONS=frozenset(('unsupported_signin_scope','redirect_missing','redirect_host_mismatch',
+    'redirect_scope_mismatch','redirect_method_invalid','redirect_args_invalid','current_signin_required',
+    'checkout_response_unverified','configuration_changed','authorization_changed','goods_changed',
+    'renewal_recovery_failed'))
+
+
+class MaintenanceFailure(ValueError):
+    """A bounded current preparation failure, separate from historical auth flags."""
+    def __init__(self, code, message, *, reason, requires_login=False):
+        if (code not in ('PREPARED_RENEWAL_UNVERIFIED','PREPARED_RENEWAL_AUTHENTICATION_FAILED')
+                or not isinstance(reason,str) or reason not in AUTHENTICATION_REASONS or type(requires_login) is not bool):
+            raise ValueError('维护失败诊断类型无效。')
+        super().__init__(message)
+        self.code=code;self.reason=reason;self.phase='prepared_renewal'
+        self.requires_login=requires_login;self.status='requires_login' if requires_login else 'failed'
+
+
+def _causes(error):
+    seen=set()
+    for _ in range(8):
+        if error is None or id(error) in seen:return
+        seen.add(id(error));yield error
+        error=getattr(error,'__cause__',None)
+
+
 def authentication_failure_diagnostics(error):
     """Export bounded protocol facts, never exception text or private payloads."""
-    result={};seen=set()
-    for _ in range(8):
-        if error is None or id(error) in seen:
-            break
-        seen.add(id(error))
-        phase=getattr(error,'phase',None)
-        if phase in ('password_authentication','authentication_context','store_exchange'):
+    result={}
+    for cause in _causes(error):
+        phase=getattr(cause,'phase',None)
+        if isinstance(phase,str) and phase in AUTHENTICATION_PHASES:
             result.setdefault('authentication_phase',phase)
-        status=getattr(error,'http_status',None)
+        reason=getattr(cause,'reason',None)
+        if isinstance(reason,str) and reason in AUTHENTICATION_REASONS:
+            result.setdefault('authentication_reason',reason)
+        status=getattr(cause,'http_status',None)
         if type(status) is not int:
-            status=getattr(error,'status',None)
-        if type(status) is not int and isinstance(error,requests.RequestException) and error.response is not None:
-            status=error.response.status_code
+            status=getattr(cause,'status',None)
+        if type(status) is not int and isinstance(cause,requests.RequestException) and cause.response is not None:
+            status=cause.response.status_code
         if type(status) is int and 100<=status<=599:
             result.setdefault('http_status',status)
-        error=getattr(error,'__cause__',None)
     return result
 
 
 def record_maintenance_result(service, result, *, cooling=False, warm_only=False):
     activity = getattr(getattr(service, 'channel', None), 'activity', None)
     if activity is not None:
-        details = {key: result[key] for key in ('status', 'error_code', 'http_status', 'authentication_phase', 'checked_at_ms', 'preheat_flow', 'preparation_stage', 'order_ready', 'review_verified', 'browser_mode')
+        details = {key: result[key] for key in ('status', 'error_code', 'http_status', 'authentication_phase', 'authentication_reason', 'checked_at_ms', 'preheat_flow', 'preparation_stage', 'order_ready', 'review_verified', 'browser_mode')
                    if key in result}
         details.update(operation='session_maintain', transport='shared_session'
                        if warm_only and result.get('preheat_flow') == 'pickup_prepare' else 'official_browser',
@@ -101,6 +127,11 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
         if isinstance(getattr(service,'_prepared_claim',None),dict):
             raise
         diagnostics=authentication_failure_diagnostics(error)
+        causes=list(_causes(error))
+        explicit=next((cause for cause in causes if isinstance(cause,(BrowserSessionError,MaintenanceFailure))),None)
+        from apple_login import LoginError
+        current_auth_failure=any(isinstance(cause,LoginError) and cause.status in (400,401,409)
+            and cause.phase in ('password_authentication','authentication_context','store_exchange') for cause in causes)
         http_status = diagnostics.get('http_status')
         if http_status is None and isinstance(error, requests.RequestException) and error.response is not None:
             http_status = error.response.status_code
@@ -111,18 +142,24 @@ def maintain_session(service, *, now=time.time, warm_only=False, preheat_flow='l
             result = {'success': False, 'status': 'blocked', 'requires_login': True,
                       'http_status': http_status, 'error_code': 'APPLE_SESSION_BLOCKED',
                       'message': '官网限制了本次自动会话恢复，将在下一空闲周期重试。'}
-        elif isinstance(error, BrowserSessionError):
-            result = {'success': False, 'status': error.status, 'requires_login': error.requires_login,
-                      'error_code': error.code, 'message': str(error),
-                      'browser_started': error.browser_started, 'browser_connected': error.browser_connected}
-        elif (warm_only or preheat_flow == 'pickup_prepare') and (getattr(service, 'authentication_failed', False) is True
-                            or getattr(service, 'authentication_requested', False) is True):
+        elif isinstance(explicit,MaintenanceFailure):
+            result={'success':False,'status':explicit.status,'requires_login':explicit.requires_login,
+                    'error_code':explicit.code,'message':str(explicit)}
+        elif isinstance(explicit, BrowserSessionError):
+            result = {'success': False, 'status': explicit.status, 'requires_login': explicit.requires_login,
+                      'error_code': explicit.code, 'message': str(explicit),
+                      'browser_started': explicit.browser_started, 'browser_connected': explicit.browser_connected}
+        elif diagnostics.get('authentication_phase')=='store_redirect':
+            result={'success':False,'status':'failed','requires_login':False,
+                    'error_code':'STORE_LOGIN_REDIRECT_INVALID',
+                    'message':'官网认证已返回，但商城跳转未通过当前流程核验；账号和凭据已保留。'}
+        elif current_auth_failure:
             result = {'success': False, 'status': 'requires_login', 'requires_login': True,
                       'error_code': 'WARM_LOGIN_REQUIRES_ATTENTION',
                       'message': '本次自动认证未完成，将在下一空闲周期重试；未创建订单。'}
         else:
-            network = isinstance(error, requests.RequestException)
-            local_io = isinstance(error, OSError)
+            network = any(isinstance(cause,requests.RequestException) for cause in causes)
+            local_io = any(isinstance(cause,OSError) for cause in causes)
             result = {'success': False, 'status': 'failed', 'requires_login': False,
                       'error_code': 'SESSION_NETWORK_FAILED' if network else
                                     'BROWSER_LOCAL_IO_FAILED' if local_io else 'SESSION_CHECK_INCOMPLETE',

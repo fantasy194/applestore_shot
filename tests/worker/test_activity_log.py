@@ -217,6 +217,22 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(safe_details({'browser_input_phase': 'never-record-this',
             'browser_input_reason': ['private'], 'browser_input_error': True}), {})
 
+    def test_authentication_failure_transport_keeps_fixed_reason_without_private_payload(self):
+        channel = Channel('account-a', 'task-a', io.StringIO())
+        channel.activity = self.log
+        channel.emit('stage', message='官网认证返回目标尚未核验。',
+                     authentication_phase='store_redirect', authentication_reason='redirect_scope_mismatch',
+                     redirect_url='https://secure9.www.apple.com.cn/shop/signIn?ssi=private-fixture',
+                     response_body={'password': 'private-fixture-password'})
+        details = self.log.query()['entries'][0]['details']
+        self.assertEqual(details, {'order_submitted': False, 'authentication_phase': 'store_redirect',
+                                  'authentication_reason': 'redirect_scope_mismatch'})
+        self.assertNotIn('private-fixture', json.dumps(self.log.query()))
+        self.assertEqual(safe_details({'authentication_phase': 'https://private.example.test',
+                                      'authentication_reason': 'private-fixture-password'}), {})
+        self.assertEqual(safe_details({'authentication_phase': ['store_redirect'],
+                                      'authentication_reason': {'private': 'payload'}}), {})
+
     def test_real_queue_progress_shape_records_retry_and_job_metadata_without_private_result(self):
         channel = Channel('account-a', 'task-a', io.StringIO())
         channel.activity = self.log

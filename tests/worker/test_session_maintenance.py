@@ -252,7 +252,8 @@ class SessionMaintenanceTests(unittest.TestCase):
 
     def test_idle_preheat_failure_requiring_auth_is_bounded_and_safe(self):
         self.service.authentication_requested = True
-        self.service.warm_login.side_effect = ValueError('private-fixture authentication payload')
+        from apple_login import LoginError
+        self.service.warm_login.side_effect = LoginError('private-fixture authentication payload',status=401,phase='password_authentication')
         result = maintain_session(self.service, now=lambda: 100, warm_only=True)
         again = maintain_session(self.service, now=lambda: 101, warm_only=True)
         self.service.warm_login.assert_called_once_with()
