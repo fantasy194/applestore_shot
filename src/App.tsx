@@ -285,17 +285,21 @@ function WorkspaceApp() {
   const allActive = activeTasks.length;
   const resumingTask =
     !!account &&
-    !account.pending &&
     tasks.some(
       (t) =>
         t.id === taskTarget?.id &&
         t.action !== "enroll" &&
-        (active(t) || ["purchase", "checkout"].includes(t.action)),
+        (account.pending
+          ? account.id !== LOCAL_ID &&
+            ["purchase", "checkout"].includes(t.action)
+          : active(t) || ["purchase", "checkout"].includes(t.action)),
     );
   const readOnlyTaskView =
-    !sessionReady && resumingTask && !!task && !active(task);
+    resumingTask &&
+    !!task &&
+    (account?.pending === true || (!sessionReady && !active(task)));
   const viewingGate =
-    (!sessionReady && !resumingTask) ||
+    ((!sessionReady || account?.pending === true) && !resumingTask) ||
     (adding && (!taskTarget || taskTarget.action === "enroll"));
   const settingsTarget =
     taskTarget &&
@@ -593,50 +597,54 @@ function WorkspaceApp() {
             </button>
           </div>
         )}
-        {ready && bridge && (!sessionReady || adding) && (
-          <div
-            className="page-content"
-            hidden={route !== "workspace" || !viewingGate}
-          >
-            <div className="setup-content">
-              <AccountGate
-                key={accountGateVersion}
-                snapshot={snapshot}
-                bridge={bridge}
-                refresh={refreshSnapshot}
-                onRemove={setRemovingAccount}
-                onBack={sessionReady ? () => setAdding(false) : undefined}
-                onDone={(ids) => {
-                  setEnabledIds((old) =>
-                    sessionReady ? [...new Set([...old, ...ids])] : ids,
-                  );
-                  setAccountId(ids[0]);
-                  setSessionReady(true);
-                  setAdding(false);
-                  setTab(
-                    new URLSearchParams(location.search).get("view") ===
-                      "orders"
-                      ? "orders"
-                      : "home",
-                  );
-                  navigate("workspace");
-                  setError("");
-                }}
-                renderForm={(submit, cancel) => (
-                  <AccountForm onSubmit={submit} onCancel={cancel} />
-                )}
-                renderPrompt={(task, cancel) => (
-                  <PromptForm
-                    key={task.prompt!.id}
-                    prompt={task.prompt!}
-                    onReply={(value) => answer(task, value)}
-                    onCancel={cancel}
-                  />
-                )}
-              />
+        {ready &&
+          bridge &&
+          (!sessionReady || adding || (account?.pending && !resumingTask)) && (
+            <div
+              className="page-content"
+              hidden={route !== "workspace" || !viewingGate}
+            >
+              <div className="setup-content">
+                <AccountGate
+                  key={accountGateVersion}
+                  snapshot={snapshot}
+                  bridge={bridge}
+                  refresh={refreshSnapshot}
+                  onRemove={setRemovingAccount}
+                  onBack={
+                    sessionReady && adding ? () => setAdding(false) : undefined
+                  }
+                  onDone={(ids) => {
+                    setEnabledIds((old) =>
+                      sessionReady ? [...new Set([...old, ...ids])] : ids,
+                    );
+                    setAccountId(ids[0]);
+                    setSessionReady(true);
+                    setAdding(false);
+                    setTab(
+                      new URLSearchParams(location.search).get("view") ===
+                        "orders"
+                        ? "orders"
+                        : "home",
+                    );
+                    navigate("workspace");
+                    setError("");
+                  }}
+                  renderForm={(submit, cancel) => (
+                    <AccountForm onSubmit={submit} onCancel={cancel} />
+                  )}
+                  renderPrompt={(task, cancel) => (
+                    <PromptForm
+                      key={task.prompt!.id}
+                      prompt={task.prompt!}
+                      onReply={(value) => answer(task, value)}
+                      onCancel={cancel}
+                    />
+                  )}
+                />
+              </div>
             </div>
-          </div>
-        )}
+          )}
         {!ready ? (
           <div className="empty">
             <LoaderCircle className="spin" />
@@ -695,7 +703,11 @@ function WorkspaceApp() {
             </div>
             {readOnlyTaskView && (
               <div className="local-task">
-                <p>正在查看已保存的下单任务。</p>
+                <p>
+                  {task && active(task)
+                    ? "正在处理当前下单任务。"
+                    : "正在查看已保存的下单任务。"}
+                </p>
                 <button
                   onClick={() => {
                     setTaskTarget(null);
@@ -1332,7 +1344,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.23</span>
+          <span>DUO Killer · 0.1.24</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (

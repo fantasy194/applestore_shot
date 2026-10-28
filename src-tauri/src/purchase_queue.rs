@@ -880,14 +880,25 @@ impl Engine {
         });
     }
 
-    fn queue_account_message(&self,account:&str,coordinator:Option<&Coordinator>) -> Option<String> {
-        if !self.accounts.lock().unwrap().iter().any(|item|item.id==account&&!item.pending) {return Some("账号未完成登录验证，任务仍保留排队".into())}
+    fn queue_account_message(&self,account:&str,coordinator:Option<&Coordinator>,job:&QueueJob) -> Option<String> {
+        if !self.accounts.lock().unwrap().iter().any(|item|item.id==account) {return Some("账号不存在，任务仍保留排队".into())}
         let tasks=self.tasks.lock().unwrap();
+        let mut preparation_allows_lock=false;
         for task in tasks.values().filter(|task|task.account_id==account) {
             if coordinator.is_some_and(|current|current.task_id==task.id) {continue}
+            if task_has_unknown_submission(task) {return Some("该账号存在未知订单提交，队列停止自动分配".into())}
             if !terminal(&task.status) {
+                if waiting_preparation(task) {
+                    // Automatic preheat may be released on a mismatch. A manual
+                    // preparation must instead match the exact shared claim rules
+                    // or remain untouched until the user finishes it.
+                    if is_preemptible_preheat(task) || coordinator.is_none() &&
+                        super::prepared_handoff::matching_preparation(&self.root,account,task,&job.payload(),now_ms()) {
+                        preparation_allows_lock=true;continue;
+                    }
+                    return Some("该账号存在不匹配的自提准备，队列等待其结束".into());
+                }
                 if is_preemptible_preheat(task) {
-                    if task.prompt.as_ref().is_some_and(|prompt|prompt["kind"]=="prepared_purchase") {continue}
                     if let Some(control)=self.controls.lock().unwrap().get(&task.id) {let _=control.cancel.send(true);}
                     return Some("已请求停止空闲会话预热，保留队列位置等待账号释放".into());
                 }
@@ -896,8 +907,7 @@ impl Engine {
             if task.order_submitted && (task.result.as_ref().is_none_or(contains_unknown)) {return Some("该账号存在未知订单提交，队列停止自动分配".into())}
             if task.queue_job_ids.is_empty() && unresolved_submission(task,&tasks) {return Some("该账号有待核实订单，请查询官网确认后继续队列".into())}
         }
-        if coordinator.is_none() && !tasks.values().any(|task|task.account_id==account&&!terminal(&task.status)
-            &&is_preemptible_preheat(task)&&task.prompt.as_ref().is_some_and(|prompt|prompt["kind"]=="prepared_purchase")) && self.locks.lock().unwrap().get(account).is_some_and(|lock|lock.available_permits()==0) {return Some("账号正在收尾，队列等待释放".into())}
+        if coordinator.is_none() && !preparation_allows_lock && self.locks.lock().unwrap().get(account).is_some_and(|lock|lock.available_permits()==0) {return Some("账号正在收尾，队列等待释放".into())}
         None
     }
 
@@ -921,8 +931,8 @@ impl Engine {
                     _=>"账号准备未完成，任务保留排队；请核实连接和登录状态后继续",
                 }.into())}
                     else if let Some(coordinator)=runtime.coordinators.get(&account) {
-                        if coordinator.closing || !coordinator.ready {Some("账号队列协调器正在准备或退出，任务保留排队".into())} else {self.queue_account_message(&account,Some(coordinator))}
-                    } else {self.queue_account_message(&account,None)};
+                        if coordinator.closing || !coordinator.ready {Some("账号队列协调器正在准备或退出，任务保留排队".into())} else {self.queue_account_message(&account,Some(coordinator),job)}
+                    } else {self.queue_account_message(&account,None,job)};
                 if let Some(message)=waiting {
                     if queue.jobs[index].message!=message {queue.jobs[index].message=message;changed=true;}
                     continue;
@@ -970,7 +980,11 @@ impl Engine {
             }
         }
         for (account,coordinator) in &mut runtime.coordinators {
-            if coordinator.idle && !coordinator.closing && !queue.jobs.iter().any(|job|(job.inflight()||job.pending()&&job.eligible())&&job.account_id==*account) {
+            // A worker whose initial account preflight failed emits queue_idle
+            // without queue_ready. It cannot accept another target; close it so
+            // the next authorized allocation can start a fresh normal worker.
+            if coordinator.idle && !coordinator.closing && !queue.jobs.iter().any(|job|
+                job.account_id==*account&&(job.inflight()||coordinator.ready&&job.pending()&&job.eligible())) {
                 if self.queue_send(account,&coordinator.task_id,json!({"type":"queue_close"})).is_ok() {coordinator.closing=true;}
             }
         }
@@ -1500,11 +1514,17 @@ mod tests {
         }
         let restored=QueueState::load(root.path(),&HashMap::new()).unwrap();assert_eq!(restored.rearmed_after_ms[&key],at+500);
         *engine.purchase_queue.lock().unwrap()=restored;
-        observe(&engine,&host,vec![negative(target(&account,"R493",at+1000))]);
-        assert_eq!(engine.purchase_queue.lock().unwrap().rearmed_after_ms[&key],at+1000);
-        let late=observe(&engine,&host,vec![target(&account,"R493",at+800)]);assert_eq!(late[0]["status"],"waiting_stock");
+        // History-pruning I/O can take long enough to age the initial fixture
+        // beyond FRESH_MS on a loaded runner. Use real current time for the
+        // next negative and positive while retaining the persisted old watermark.
+        let recent_negative=now_ms().saturating_sub(1000).max(at+1000);
+        observe(&engine,&host,vec![negative(target(&account,"R493",recent_negative))]);
+        assert_eq!(engine.purchase_queue.lock().unwrap().rearmed_after_ms[&key],recent_negative);
+        let late_target=target(&account,"R493",recent_negative-200);
+        assert!(sample_eligible(&late_target,now_ms(),true),"the late sample must still be fresh so only the watermark rejects it");
+        let late=observe(&engine,&host,vec![late_target]);assert_eq!(late[0]["status"],"waiting_stock");
         assert_eq!(jobs(&engine).len(),HISTORY);
-        let newest=observe(&engine,&host,vec![target(&account,"R493",at+1500)]);assert_eq!(newest[0]["status"],"queued");
+        let newest=observe(&engine,&host,vec![target(&account,"R493",now_ms())]);assert_eq!(newest[0]["status"],"queued");
         assert!(!engine.purchase_queue.lock().unwrap().rearmed_after_ms.contains_key(&key));
         assert!(jobs(&engine).last().unwrap().sequence>old.sequence);
         // A watermark belongs only to an active authorized group/store. Cancel,
@@ -2313,13 +2333,40 @@ mod tests {
 
     #[tokio::test]
     async fn queue_claims_live_preparation_with_same_pid_and_exact_group_assignment_ack() {
+        queue_claims_preparation_for_account(false,false,false,false).await;
+    }
+
+    #[tokio::test]
+    async fn pending_account_queue_claims_existing_preparation_without_changing_account_state() {
+        queue_claims_preparation_for_account(true,false,false,false).await;
+    }
+
+    #[tokio::test]
+    async fn queue_claims_matching_manual_preparation_with_same_worker_and_assignment() {
+        queue_claims_preparation_for_account(true,true,false,false).await;
+    }
+
+    #[tokio::test]
+    async fn queue_waits_for_different_manual_preparation_without_cancelling_or_assigning() {
+        queue_claims_preparation_for_account(false,true,true,false).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_prepared_result_never_releases_or_claims_the_owner_for_queue() {
+        for manual in [false,true] {for pending in [false,true] {
+            queue_claims_preparation_for_account(pending,manual,false,true).await;
+        }}
+    }
+
+    async fn queue_claims_preparation_for_account(pending: bool,manual: bool,mismatch: bool,unknown: bool) {
         let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();let python=project.join(if cfg!(windows){".venv/Scripts/python.exe"}else{".venv/bin/python"});
-        let (root,engine,_,account)=fixture();save_policy(root.path(),&account,priority(&["R001"]));
+        let (root,engine,_,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
         let script=root.path().join("prepared-queue-fixture.py");fs::write(&script,r#"import hashlib,json,pathlib,sys,time,os
 r=json.loads(sys.stdin.readline())
 def emit(kind,**data):
  print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type=kind,**data)),flush=True)
-assert r['action']=='session_maintain'
+assert r['action'] in ('session_maintain','purchase')
+if r['action']=='purchase':assert r['params']['prepare_only'] is True
 raw=(pathlib.Path(sys.argv[2])/'accounts'/r['account_id']/'checkout.json').read_bytes()
 now=int(time.time()*1000)
 emit('prompt',prompt={'id':'live-queue-lease','kind':'prepared_purchase','label':'ready','fixture_pid':os.getpid(),'prepared':{'v':1,'sku':'MLH74FE/A','quantity':1,'fulfillment':'RETAIL','config_fingerprint':'a'*64,'config_file_sha256':hashlib.sha256(raw).hexdigest(),'authorized_store_ids':['R001'],'prepared_at_ms':now,'expires_at_ms':now+300000,'preparation_stage':'review','review_verified':True,'order_ready':True}})
@@ -2333,18 +2380,123 @@ emit('queue_finished',result=result,**identity)
 emit('result',result=result)
 "#).unwrap();
         let host=TaskHost{worker:python,script:Some(script),on_update:Arc::new(|_|{})};
-        let prepared=engine.start(host.clone(),account.clone(),"session_maintain".into(),json!({})).unwrap();
+        let action=if manual {"purchase"} else {"session_maintain"};
+        let params=if manual {json!({"prepare_only":true,"keep_ready":true,"sku":"MLH74FE/A","quantity":1,"fulfillment":"RETAIL"})}else{json!({})};
+        let prepared=engine.start(host.clone(),account.clone(),action.into(),params).unwrap();
         assert!(bridge_wait(||engine.tasks.lock().unwrap().get(&prepared).is_some_and(|task|task.prompt.as_ref().is_some_and(|prompt|prompt["kind"]=="prepared_purchase"))).await);
         let pid=engine.tasks.lock().unwrap()[&prepared].prompt.as_ref().unwrap()["fixture_pid"].as_u64().unwrap();
-        observe(&engine,&host,vec![target(&account,"R001",now_ms())]);
+        engine.accounts.lock().unwrap()[0].pending=pending;
+        if unknown {engine.tasks.lock().unwrap().get_mut(&prepared).unwrap().result=Some(json!({"status":"submission_unknown"}));}
+        observe(&engine,&host,vec![target(&account,if mismatch {"R002"} else {"R001"},now_ms())]);
         assert!(!*engine.controls.lock().unwrap()[&prepared].cancel.borrow());engine.queue_pump_once();
+        if mismatch || unknown {
+            for _ in 0..3 {engine.queue_pump_once();}
+            let job=jobs(&engine)[0].clone();assert!(job.pending());assert_eq!(job.assignment,0);assert!(job.task_id.is_none());
+            assert_eq!(job.message,if unknown {"该账号存在未知订单提交，队列停止自动分配"} else {"该账号存在不匹配的自提准备，队列等待其结束"});
+            assert!(!*engine.controls.lock().unwrap()[&prepared].cancel.borrow());
+            assert_eq!(engine.tasks.lock().unwrap()[&prepared].prompt.as_ref().unwrap()["id"],"live-queue-lease");
+            engine.cancel(&account,&prepared).unwrap();
+            assert!(bridge_wait(||!engine.controls.lock().unwrap().contains_key(&prepared)).await);return;
+        }
         let assigned=jobs(&engine)[0].clone();assert_eq!(assigned.task_id.as_deref(),Some(prepared.as_str()));assert_eq!(assigned.assignment,1);
         assert!(bridge_wait(||jobs(&engine)[0].status=="succeeded").await);
         assert!(bridge_wait(||engine.controls.lock().unwrap().is_empty()).await);
         let task=engine.tasks.lock().unwrap()[&prepared].clone();assert_eq!(task.result.as_ref().unwrap()["pid"],pid);
         assert_eq!(task.prepared_handoff.as_ref().unwrap()["queue_job_id"],assigned.id);
         assert_eq!(task.prepared_handoff.as_ref().unwrap()["purchase_group_id"],assigned.purchase_group_id.unwrap());
+        assert_eq!(engine.accounts.lock().unwrap()[0].pending,pending);
         let done=jobs(&engine)[0].clone();assert!(done.dispatched_at_ms.is_some());assert!(done.started_at_ms.is_some());assert!(done.submit_started_at_ms.is_some());assert!(done.order_confirmed_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_account_queue_runs_worker_and_preserves_code_prompt_and_auth_failure() {
+        let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python=project.join(if cfg!(windows){".venv/Scripts/python.exe"}else{".venv/bin/python"});
+        let (root,engine,_,account)=fixture();engine.accounts.lock().unwrap()[0].pending=true;
+        engine.session_passwords.lock().unwrap().insert(account.clone(),SessionCredential{password:Some("fixture-private-only".into()),remember:true,verified:true,generation:1,rejected:false});
+        let script=root.path().join("pending-account-queue-fixture.py");fs::write(&script,r#"import json,sys
+r=json.loads(sys.stdin.readline())
+assert r['action']=='purchase' and r['params']['queue_stream'] is True
+assert r['credential']=='fixture-private-only' and r['credential_verified'] is True
+def emit(kind,**data):
+ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type=kind,**data)),flush=True)
+target=r['params']['queue_targets'][0]
+identity={key:target[key] for key in ['queue_job_id','queue_assignment','purchase_group_id']}
+emit('queue_ready');emit('queue_started',**identity)
+emit('prompt',prompt={'id':'fixture-code','kind':'code','label':'fixture verification'})
+reply=json.loads(sys.stdin.readline())
+assert reply['account_id']==r['account_id'] and reply['task_id']==r['task_id'] and reply['request_id']=='fixture-code' and reply['value']=='123456'
+result={'status':'failed','success':False,'order_submitted':False,'message':'fixture official authentication rejected'}
+emit('queue_finished',result=result,**identity);emit('result',result=result)
+"#).unwrap();
+        let host=TaskHost{worker:python,script:Some(script),on_update:Arc::new(|_|{})};
+        observe(&engine,&host,vec![target(&account,"R001",now_ms())]);engine.queue_pump_once();
+        let assigned=jobs(&engine)[0].clone();assert!(assigned.inflight(),"pending account must reach the ordinary purchase worker");
+        let task=assigned.task_id.as_deref().unwrap().to_owned();
+        assert!(bridge_wait(||engine.tasks.lock().unwrap().get(&task).is_some_and(|task|task.prompt.as_ref().is_some_and(|prompt|prompt["id"]=="fixture-code"))).await);
+        assert!(engine.reply(&host,&Uuid::new_v4().to_string(),&task,"fixture-code",json!("123456")).is_err());
+        engine.reply(&host,&account,&task,"fixture-code",json!("123456")).unwrap();
+        assert!(bridge_wait(||jobs(&engine)[0].status=="failed").await);
+        for _ in 0..3 {engine.queue_pump_once();}
+        let failed=jobs(&engine)[0].clone();assert_eq!(failed.assignment,1);assert_eq!(failed.message,"fixture official authentication rejected");
+        assert!(engine.accounts.lock().unwrap()[0].pending);assert!(!failed.order_submitted);
+    }
+
+    #[tokio::test]
+    async fn pending_account_queue_still_holds_missing_accounts_and_unknown_submissions() {
+        for absent in [false,true] {
+            let (_root,engine,host,account)=fixture();engine.accounts.lock().unwrap()[0].pending=true;
+            observe(&engine,&host,vec![target(&account,"R001",now_ms())]);
+            if absent {engine.accounts.lock().unwrap().clear();}
+            else {engine.purchase_queue.lock().unwrap().blocked_accounts.insert(account.clone(),"submission_unknown".into());}
+            engine.queue_pump_once();
+            let job=jobs(&engine)[0].clone();assert!(job.pending());assert_eq!(job.assignment,0);assert!(job.task_id.is_none());
+            assert_eq!(job.message,if absent {"账号不存在，任务仍保留排队"} else {"该账号存在未知提交，未重放任务"});
+        }
+    }
+
+    #[tokio::test]
+    async fn real_worker_preflight_failure_does_not_strand_other_authorized_target() {
+        let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let python=project.join(if cfg!(windows){".venv/Scripts/python.exe"}else{".venv/bin/python"});
+        let (root,engine,_,account)=fixture();engine.accounts.lock().unwrap()[0].pending=true;
+        let worker_fixture=project.join("tests/fixtures/queue_bridge_worker.py");
+        let script=root.path().join("actual-preflight-failure.py");
+        let fixture_path=json!(worker_fixture.to_string_lossy().to_string()).to_string();
+        fs::write(&script,format!(r#"import runpy
+m=runpy.run_path({fixture_path})
+def fail(owner):
+ raise ValueError('fixture current official authentication failed')
+m['service'].Service.prepare_purchase_session=fail
+m['actual_main'].main()
+"#)).unwrap();
+        let host=TaskHost{worker:python,script:Some(script),on_update:Arc::new(|_|{})};
+        observe(&engine,&host,vec![target(&account,"R001",now_ms()),target(&account,"R002",now_ms())]);engine.queue_pump_once();
+        let first=jobs(&engine)[0].clone();assert!(first.inflight());let first_task=first.task_id.unwrap();
+        assert!(bridge_wait(||jobs(&engine)[0].status=="failed" && engine.queue_runtime.lock().unwrap().coordinators.get(&account).is_some_and(|c|c.idle&&!c.ready)).await);
+        let original=jobs(&engine)[0].clone();assert!(!original.order_submitted);assert_eq!(original.assignment,1);
+        engine.queue_pump_once();
+        assert!(engine.queue_runtime.lock().unwrap().coordinators[&account].closing,"idle coordinator that never became ready must close even when another target is queued");
+        assert!(bridge_wait(||!engine.queue_runtime.lock().unwrap().coordinators.contains_key(&account)).await);
+        engine.queue_pump_once();
+        assert!(bridge_wait(||jobs(&engine)[1].status=="failed").await);
+        let all=jobs(&engine);assert_eq!(all[0].status,"failed");assert_eq!(all[0].task_id.as_deref(),Some(first_task.as_str()));assert_eq!(all[0].assignment,1);
+        assert_eq!(all[1].assignment,1);assert_ne!(all[1].task_id.as_deref(),Some(first_task.as_str()));
+        assert_eq!(all[0].message,"fixture current official authentication failed");assert_eq!(all[1].message,all[0].message);
+        assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.is_empty());
+        engine.queue_pump_once();
+    }
+
+    #[tokio::test]
+    async fn idle_ready_coordinator_still_reuses_worker_for_next_authorized_target() {
+        let (_root,engine,host,account)=fixture();engine.accounts.lock().unwrap()[0].pending=true;
+        observe(&engine,&host,vec![target(&account,"R001",now_ms()),target(&account,"R002",now_ms())]);engine.queue_pump_once();
+        let first=jobs(&engine)[0].clone();ready(&engine,&first);
+        ack(&engine,&first,"queue_finished",json!({"success":false,"status":"failed","order_submitted":false}));
+        assert!(engine.queue_worker_event(&account,first.task_id.as_deref().unwrap(),&json!({"type":"queue_idle"})));
+        engine.queue_pump_once();let after=jobs(&engine);assert!(after[1].inflight());
+        assert_eq!(after[1].task_id,first.task_id);assert_eq!(after[0].status,"failed");
+        let runtime=engine.queue_runtime.lock().unwrap();assert!(!runtime.coordinators[&account].closing);
     }
 
     #[tokio::test]

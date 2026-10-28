@@ -129,7 +129,7 @@ fn preparation_miss_reason(root: &Path, account: &str, task: &Task, params: &Val
     else { Some("store_scope") }
 }
 
-fn matching_preparation(root: &Path, account: &str, task: &Task, params: &Value, current: u64) -> bool {
+pub(super) fn matching_preparation(root: &Path, account: &str, task: &Task, params: &Value, current: u64) -> bool {
     preparation_miss_reason(root, account, task, params, current).is_none()
 }
 

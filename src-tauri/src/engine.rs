@@ -768,7 +768,7 @@ impl Engine {
                 .cloned()
                 .ok_or("账号不存在")?
         };
-        if account.pending && !matches!(action.as_str(), "enroll" | "address_read" | "address_save")
+        if account.pending && !matches!(action.as_str(), "enroll" | "address_read" | "address_save" | "purchase" | "checkout")
         {
             return Err("请先完成账号添加与登录验证".into());
         }
@@ -779,6 +779,10 @@ impl Engine {
             if let Some(id) = self.try_claim_prepared(&app, &account_id, &params, None)? { return Ok(id); }
         }
         let mut tasks = self.tasks.lock().unwrap();
+        let purchase_admission=matches!(action.as_str(), "purchase" | "checkout") && params["prepare_only"]!=true;
+        if purchase_admission && tasks.values().any(|task|task.account_id==account_id && !terminal(&task.status) && task_has_unknown_submission(task)) {
+            return Err("该账号存在未知订单提交，请先查询官网订单；未开始购买".into());
+        }
         if params["queue_stream"]==true && (
             tasks.values().any(|task|task.account_id==account_id && (!terminal(&task.status) && !is_preemptible_preheat(task)
                 || task.order_submitted && task.result.as_ref().is_none_or(purchase_queue::contains_unknown)
@@ -794,7 +798,6 @@ impl Engine {
             || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock|lock.available_permits()==0)) {
             return Err("账号有进行中的任务，本轮登录维护已跳过，不排队占用账号".into());
         }
-        let purchase_admission=matches!(action.as_str(), "purchase" | "checkout") && params["prepare_only"]!=true;
         let purchase_priority=purchase_admission && schedule.is_none();
         if purchase_priority {
             let controls=self.controls.lock().unwrap();
@@ -980,6 +983,10 @@ impl Engine {
             if let Some(s) = &schedule {
                 wait_for_schedule(s.at_ms, &mut cancel).await?;
                 check_schedule_lateness(s.at_ms, now_ms())?;
+                if self.tasks.lock().unwrap().values().any(|task|task.account_id==account.id && task.id!=id
+                    && !terminal(&task.status) && task_has_unknown_submission(task)) {
+                    return Err("该账号存在未知订单提交，请先查询官网订单；未开始购买".into());
+                }
                 if let Some(prepared) = self.try_claim_prepared(&app, &account.id, &params, Some(&id))? {
                     return self.follow_prepared_handoff(&app, &id, &prepared, &mut cancel).await;
                 }
@@ -1632,6 +1639,27 @@ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type='
     }
 
     #[tokio::test]
+    async fn active_preparation_unknown_result_is_not_cancelled_or_bypassed_by_purchase() {
+        for manual in [false,true] {for pending in [false,true] {
+            let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
+            let account=engine.add_account("unknown-prep@example.test".into()).unwrap();engine.accounts.lock().unwrap()[0].pending=false;
+            let host=TaskHost {worker:root.path().join("missing"),script:None,on_update:Arc::new(|_|{})};
+            let action=if manual {"purchase"}else{"session_maintain"};
+            let params=if manual {json!({"prepare_only":true})}else{json!({})};
+            let prepared=engine.start(host.clone(),account.id.clone(),action.into(),params).unwrap();
+            engine.accounts.lock().unwrap()[0].pending=pending;
+            {let mut tasks=engine.tasks.lock().unwrap();let owner=tasks.get_mut(&prepared).unwrap();owner.status="waiting".into();
+                owner.prompt=Some(json!({"id":"lease","kind":"prepared_purchase"}));owner.result=Some(json!({"status":"submission_unknown"}));}
+            for action in ["purchase","checkout"] {
+                let error=engine.start(host.clone(),account.id.clone(),action.into(),json!({"sku":"MLH74FE","quantity":1,"fulfillment":"RETAIL"})).unwrap_err();
+                assert!(error.contains("未知订单提交"),"{action}: {error}");
+                assert!(!*engine.controls.lock().unwrap()[&prepared].cancel.borrow());
+            }
+            assert_eq!(engine.tasks.lock().unwrap().len(),1);
+        }}
+    }
+
+    #[tokio::test]
     async fn queued_immediate_purchase_blocks_new_maintenance_but_future_schedule_does_not() {
         for future in [false,true] {
             let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
@@ -2091,7 +2119,28 @@ channel.emit('result',result={{'success':True,'status':'fixture_complete'}})
         assert!(restored.tasks[0].prompt.is_none());
     }
     #[tokio::test]
-    async fn pending_account_requires_verified_enrollment_and_survives_restart() {
+    async fn pending_account_purchase_checkout_prepare_and_schedule_use_purchase_admission() {
+        for (action,params) in [
+            ("purchase",json!({"sku":"MLH74FE","quantity":1,"fulfillment":"RETAIL"})),
+            ("purchase",json!({"sku":"MLH74FE","quantity":1,"fulfillment":"RETAIL","prepare_only":true})),
+            ("purchase",json!({"sku":"MLH74FE","quantity":1,"fulfillment":"RETAIL","scheduled_at":now_ms()+60_000})),
+            ("checkout",json!({})),
+        ] {
+            let temp=tempfile::tempdir().unwrap();let engine=Engine::new(temp.path().into()).unwrap();
+            let account=engine.add_account("pending-purchase@example.test".into()).unwrap();assert!(account.pending);
+            let host=TaskHost{worker:temp.path().join("no-real-worker"),script:None,on_update:Arc::new(|_|{})};
+            let task=engine.start(host.clone(),account.id.clone(),action.into(),params)
+                .unwrap_or_else(|error|panic!("{action} should reach purchase processing: {error}"));
+            assert!(engine.snapshot().accounts[0].pending);
+            assert_eq!(engine.snapshot().tasks.iter().find(|candidate|candidate.id==task).unwrap().action,action);
+            assert!(engine.start(host.clone(),Uuid::new_v4().to_string(),action.into(),json!({})).is_err());
+            assert!(engine.start(host.clone(),LOCAL_ID.into(),action.into(),json!({})).is_err());
+            engine.cancel(&account.id,&task).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_account_requires_verified_identity_to_complete_enrollment_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
         let engine = Engine::new(temp.path().into()).unwrap();
         let a = engine.add_account("a@example.test".into()).unwrap();
@@ -2102,7 +2151,7 @@ channel.emit('result',result={{'success':True,'status':'fixture_complete'}})
             on_update: Arc::new(|_| {}),
         };
         assert!(engine
-            .start(host, a.id.clone(), "purchase".into(), json!({}))
+            .start(host, a.id.clone(), "me".into(), json!({}))
             .is_err());
         assert!(engine
             .sync_account_identity(
