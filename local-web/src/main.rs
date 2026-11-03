@@ -9,6 +9,7 @@ mod session_maintenance;
 mod auth;
 mod access;
 mod push;
+mod push_observer;
 
 use axum::{
     extract::{ws::{WebSocket, WebSocketUpgrade, Message}, DefaultBodyLimit, Path as UrlPath, Query, Request, State},
@@ -526,32 +527,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let push_engine = engine.clone();
     let mut push_stop = stopping.clone();
     tokio::spawn(async move {
-        let mut results = std::collections::HashMap::<String, Value>::new();
-        // Recover the small gap between durable checkout result and push queueing.
-        // Absolute confirmation deadlines and deduplication tombstones prevent replay.
-        for task in push_engine.snapshot().tasks {
-            if task.result.is_some() && task.action != "inventory_monitor" {
-                let _ = push_worker.call("observe", json!({"task":task})).await;
-            }
-        }
+        let mut observer = push_observer::PushObserver::default();
+        // Startup begins with delivery suspended. Process recovered results in
+        // a single logical batch before any old outbox entry can be sent.
+        let mut needs_reconcile = observer.observe(&push_worker, push_engine.snapshot().tasks, true, true).await.is_err();
+        if needs_reconcile { eprintln!("Web Push 状态尚未同步，将自动重试。"); }
+        let mut retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let tasks = tokio::select! {
+            tokio::select! {
                 _ = push_stop.changed() => break,
-                event = push_events.recv() => match event {
-                    Ok(task) => vec![task],
-                    Err(broadcast::error::RecvError::Lagged(_)) => push_engine.snapshot().tasks,
-                    Err(_) => break,
-                }
-            };
-            for task in tasks {
-                if let Some(result) = &task.result {
-                    if results.get(&task.id) == Some(result) { continue; }
-                    results.insert(task.id.clone(), result.clone());
-                    if results.len() > 2000 { results.clear(); }
-                    if push_worker.call("observe", json!({"task":task})).await.is_err() {
-                        eprintln!("Web Push 事件尚未处理，请查看通知状态或重新启动服务。");
+                _ = tokio::time::sleep_until(retry_at), if needs_reconcile => {
+                    // Only failures and lag take a full snapshot. Healthy push
+                    // delivery does not clone task histories every five seconds.
+                    if observer.observe(&push_worker, push_engine.snapshot().tasks, true, false).await.is_ok() {
+                        needs_reconcile = false;
+                    } else {
+                        retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
                     }
                 }
+                event = push_events.recv(), if !needs_reconcile => match event {
+                    Ok(task) => {
+                        if observer.observe(&push_worker, vec![task], false, false).await.is_err() {
+                            eprintln!("Web Push 事件尚未处理，将自动重新同步。");
+                            needs_reconcile = true;
+                            retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                            // A failed event may carry terminal status. Pause new
+                            // deliveries while waiting to replay the current state.
+                            let _ = push_worker.call_with_timeout("hold_delivery", json!({}),
+                                std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        needs_reconcile = true;
+                        retry_at = tokio::time::Instant::now();
+                        let _ = push_worker.call_with_timeout("hold_delivery", json!({}),
+                            std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(_) => break,
+                },
             }
         }
     });
