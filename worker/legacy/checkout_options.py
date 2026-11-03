@@ -519,6 +519,8 @@ def priority_fulfillment(flow, config, config_path, payload):
             if not advanced():
                 raise ValueError('优先门店自提选择未通过官网校验：' + (error or '尚未进入下一步骤')
                                  + '；未提交订单，不自动切换门店重发。')
+        from prepared_live_review import record_accepted_selection
+        record_accepted_selection(flow)
         return
     raise PickupUnavailable('预选门店目前均不可取货或没有符合规则的有效时段；未改选列表外门店，未提交订单。')
 
@@ -539,6 +541,9 @@ def home_delivery(flow, config):
 
 
 def fulfillment(flow, config_path):
+    # A new fulfillment attempt invalidates this flow's old accepted selection.
+    flow._accepted_live_pickup_selection = None
+    flow._prepared_live_review = None
     if interaction.handler is not None:
         interaction.handler.pickup_selection_scope = None
         interaction.handler.pickup_identity_scope = None
@@ -691,6 +696,9 @@ def fulfillment(flow, config_path):
         if not advanced():
             raise ValueError('自提配送未通过官网校验：' + (error or '尚未进入取货联系人步骤，请核对门店和取货时段')
                              + '；未提交订单，不重复发送继续请求。')
+    if automatic_options():
+        from prepared_live_review import record_accepted_selection
+        record_accepted_selection(flow)
     if not automatic_options() and isinstance(value(flow.model, 'checkout.pickupContact'), dict):
         pickup_contact(flow, config, config_path)
 

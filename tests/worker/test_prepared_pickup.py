@@ -104,6 +104,320 @@ class PreparedPickupTests(TestCase):
         prompted = self.service.channel.prompt.call_args.kwargs['prepared']['checkout_details_prepared']
         self.assertEqual(prompted, details)
 
+    def enable_live_review(self, flow):
+        """Supply an official-shaped Review document with a live action/token."""
+        flow.session = requests.Session()
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'continueFromBillingToReview':
+                model = deepcopy(flow.model)
+                model['checkout']['review']['placeOrder']['a'] = {
+                    'continueFromReviewToProcess': {'url': '/shop/checkoutx/review'}}
+                model['meta'] = {'h': {'x-aos-stk': 'fixture-review-token', 'x-as-actk': 'fixture-session-token'}}
+                response = requests.Response()
+                response.url = 'https://secure11.www.apple.com.cn/shop/checkout'
+                response.status_code = 200
+                response._content = ('<script id="init_data">' + json.dumps(model) + '</script>').encode()
+                flow.read_page(response, '付款后取得官方确认页')
+        flow.action = action
+        return flow
+
+    def test_unchanged_ready_review_submits_same_live_checkout_without_refresh_or_readding(self):
+        """The user can click an unchanged, already verified Review immediately."""
+        def hide_store(model):
+            model['checkout']['review']['fulfillmentReview']['reviewGroup-1']['d']['pickup'].pop('storeId', None)
+            model['checkout'].pop('companionBar', None)
+        flow = self.enable_live_review(self.prepared_flow(refresh=hide_store))
+        session = flow.session
+        with patch.object(shop, 'add_to_bag') as add:
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        self.assertIs(flow.session, session)
+        self.assertEqual([name for _, name, _ in flow.calls[len(self.wait_calls):]],
+                         ['continueFromReviewToProcess'])
+        flow.page.assert_not_called()
+        add.assert_not_called()
+
+    def test_queued_same_store_scope_subset_consumes_original_live_review(self):
+        flow = self.enable_live_review(self.priority_prepared_flow('R580'))
+        original_prompt = self.service.channel.prompt.side_effect
+        def prompt(*args, **kwargs):
+            answer = original_prompt(*args, **kwargs)
+            answer['prepared_claim'].update(source='queue', queue_job_id='fixture-job', queue_assignment=1)
+            return answer
+        self.service.channel.prompt.side_effect = prompt
+        with patch.object(shop, 'add_to_bag') as add:
+            result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(result['pickup_store_id'], 'R580')
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual([name for _, name, _ in flow.calls[len(self.wait_calls):]],
+                         ['continueFromReviewToProcess'])
+        flow.page.assert_not_called()
+        add.assert_not_called()
+        self.assertTrue(any(call.args == ('queue_started',)
+                            for call in self.service.channel.emit.call_args_list))
+
+    def test_unchanged_priority_policy_reuses_the_already_confirmed_second_store(self):
+        self.config['pickup'] = {'selection_mode':'priority', 'search':'成都', 'stores':[
+            {'store_id':'R580', 'store_name':'测试门店', 'search':'成都'},
+            {'store_id':'R581', 'store_name':'第二门店', 'search':'成都'}]}
+        checkout_options.save_config(self.service.checkout, self.config)
+        flow = self.prepared_flow()
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'search':
+                locator = flow.model['checkout']['fulfillment']['pickupTab']['pickup']['storeLocator']
+                locator['searchResults']['d']['retailStores'] = [
+                    {'storeId':'R580', 'storeName':'测试门店', 'storeDisabled':True},
+                    {'storeId':'R581', 'storeName':'第二门店', 'storeDisabled':False}]
+                flow.current_response_body = deepcopy(flow.model)
+        flow.action = action
+        flow = self.enable_live_review(flow)
+        result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(result['pickup_store_id'], 'R581')
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_not_called()
+
+    def test_incremental_billing_response_can_issue_live_review_receipt(self):
+        flow = self.prepared_flow()
+        flow.session = requests.Session()
+        original_action = flow.action
+        def action(module, name, data=None):
+            if name != 'continueFromBillingToReview':
+                return original_action(module, name, data)
+            old = deepcopy(flow.model)
+            original_action(module, name, data)
+            review = deepcopy(flow.model['checkout']['review'])
+            review['placeOrder']['a'] = {'continueFromReviewToProcess': {'url':'/shop/checkoutx/review'}}
+            body = {'checkout': {'d': {'page':'Review'}, 'review': review},
+                    'meta': {'h': {'x-aos-stk':'new-stk'}}}
+            old['checkout']['billing']['a'] = {'continueFromBillingToReview': {'url':'/shop/checkoutx/billing'}}
+            flow.model = old
+            flow.url = 'https://secure11.www.apple.com.cn/shop/checkout'
+            flow.headers = {'x-aos-stk':'previous-stk', 'x-as-actk':'retained-actk'}
+            response = requests.Response()
+            response.status_code = 200
+            response._content = json.dumps({'head':{'status':200},'body':body}).encode()
+            with patch.object(shop, 'request_get', return_value=response):
+                shop.Checkout.action(flow, module, name, data)
+        flow.action = action
+        result = self.run_flow(flow, prepare=True)
+        self.assertEqual(result['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_not_called()
+
+    def test_live_review_without_current_submit_action_uses_fresh_path(self):
+        flow = self.enable_live_review(self.prepared_flow())
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'continueFromBillingToReview':
+                flow.model['checkout']['review']['placeOrder'].pop('a')
+                flow.current_response_body['checkout']['review']['placeOrder'].pop('a')
+        flow.action = action
+        self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_called_once()
+
+    def test_review_skeleton_without_current_page_cannot_issue_live_receipt(self):
+        flow = self.enable_live_review(self.prepared_flow())
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'continueFromBillingToReview':
+                flow.model['checkout'].pop('d')
+                flow.current_response_body['checkout'].pop('d')
+        flow.action = action
+        self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_called_once()
+
+    def signed_slot_live_flow(self, on_reply=None):
+        flow = self.prepared_flow(on_reply=on_reply)
+        original_action = flow.action
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'select':
+                pickup = flow.model['checkout']['fulfillment']['pickupTab']['pickup']
+                pickup['timeSlot'] = pickup_fixtures.signed_pickup_slots()
+        flow.action = action
+        return self.enable_live_review(flow)
+
+    def test_live_review_reuses_only_the_slot_accepted_with_this_checkout(self):
+        flow = self.signed_slot_live_flow()
+        self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        original = next(data for _, name, data in flow.calls if name == 'continueFromFulfillmentToPickupContact')
+        prefix = 'checkout.fulfillment.pickupTab.pickup.timeSlot.dateTimeSlots.'
+        self.assertEqual(original[prefix + 'timeSlotId'], 'fixture-slot-16')
+        self.assertEqual(original[prefix + 'timeSlotValue'], '16-14:15-14:30')
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_not_called()
+
+    def test_expired_accepted_slot_does_not_use_live_review(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        clock = [datetime(2026, 10, 16, 9, tzinfo=ZoneInfo('Asia/Shanghai'))]
+        def expire(flow):
+            clock[0] = datetime(2026, 10, 16, 15, tzinfo=ZoneInfo('Asia/Shanghai'))
+            return True
+        flow = self.signed_slot_live_flow(on_reply=expire)
+        with patch('pickup_options.pickup_calendar_now', side_effect=lambda: clock[0]):
+            with self.assertRaises(ValueError):
+                self.run_flow(flow, prepare=True)
+        self.assertEqual(flow.submissions, 0)
+        flow.page.assert_called_once()
+
+    def test_intervening_attempt_or_session_change_requires_refresh(self):
+        for cause in ('identical_response', 'failed_get', 'failed_action', 'cookie', 'token'):
+            def invalidate(flow):
+                if cause == 'identical_response':
+                    flow.update(deepcopy(flow.current_response_body))
+                elif cause == 'failed_get':
+                    with patch.object(shop, 'request_get', side_effect=requests.Timeout('fixture')):
+                        with self.assertRaises(requests.Timeout):
+                            shop.Checkout.page(flow, flow.url, 'fixture', fresh=True)
+                elif cause == 'failed_action':
+                    with self.assertRaises(ValueError):
+                        shop.Checkout.action(flow, 'checkout.fixture', 'edit')
+                elif cause == 'cookie':
+                    flow.session.cookies.set('fixture', 'changed', domain='.apple.com.cn', path='/')
+                else:
+                    flow.headers['x-aos-stk'] = 'changed-token'
+                return True
+            with self.subTest(cause=cause):
+                # Each subtest represents a distinct synthetic task.
+                for filename in ('payment.json', 'order_submission.json', 'test_order_submission.json', 'parallel_attempts.json'):
+                    (self.root / filename).unlink(missing_ok=True)
+                flow = self.enable_live_review(self.prepared_flow(on_reply=invalidate))
+                self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+                self.assertEqual(flow.submissions, 1)
+                flow.page.assert_called_once()
+
+    def test_expired_receipt_requires_refresh_even_with_timely_claim(self):
+        clock = [1000]
+        def expire(flow):
+            clock[0] = 1301
+            return True
+        flow = self.enable_live_review(self.prepared_flow(on_reply=expire))
+        with patch('prepared_live_review.wall_time', side_effect=lambda: clock[0]), \
+                patch('prepared_live_review.monotonic', side_effect=[10, 10, 311]):
+            self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        flow.page.assert_called_once()
+        self.assertEqual(flow.submissions, 1)
+
+    def test_cookie_expiring_while_waiting_invalidates_live_review(self):
+        clock = [1000]
+        def expire(flow):
+            clock[0] = 1002
+            return True
+        flow = self.enable_live_review(self.prepared_flow(on_reply=expire))
+        flow.session.cookies.set('fixture', 'value', domain='.apple.com.cn', path='/', expires=1001)
+        with patch('prepared_live_review.wall_time', side_effect=lambda: clock[0]):
+            self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        flow.page.assert_called_once()
+        self.assertEqual(flow.submissions, 1)
+
+    def test_unknown_write_or_submission_stops_without_refresh_or_retry(self):
+        for flag in ('_final_submit_attempted', '_expired_checkout_initialization_unverified'):
+            def invalidate(flow):
+                setattr(flow, flag, True)
+                return True
+            with self.subTest(flag=flag):
+                self.claim_purchase_params = {'sku':'MK2M4CH', 'quantity':1, 'fulfillment':'RETAIL', 'retry_count':1}
+                flow = self.enable_live_review(self.prepared_flow(on_reply=invalidate))
+                with self.assertRaisesRegex(ValueError, '未核实请求'):
+                    self.run_flow(flow, prepare=True)
+                self.assertEqual(flow.submissions, 0)
+                flow.page.assert_not_called()
+                self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
+
+    def test_unverified_nonfinal_action_invalidates_receipt_but_allows_fresh_review(self):
+        def invalidate(flow):
+            flow._unverified_checkout_action = True
+            return True
+        flow = self.enable_live_review(self.prepared_flow(on_reply=invalidate))
+        self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_called_once()
+
+    def test_billing_timeout_confirmed_advanced_rechecks_review_without_replaying_form(self):
+        flow = self.enable_live_review(self.prepared_flow())
+        original_action, original_page = flow.action, flow.page.side_effect
+        def action(module, name, data=None):
+            original_action(module, name, data)
+            if name == 'continueFromBillingToReview':
+                # The server accepted the form but its response was lost.
+                flow._unverified_checkout_action = True
+                raise requests.Timeout('fixture')
+        def page(url, stage, *, fresh=False):
+            if stage == '支付方式失败后核对结算状态':
+                response = requests.Response()
+                response.url = 'https://secure11.www.apple.com.cn/shop/checkout'
+                response.status_code = 200
+                response._content = ('<script id="init_data">' + json.dumps(flow.model) + '</script>').encode()
+                flow.read_page(response, stage)
+            else:
+                original_page(url, stage, fresh=fresh)
+        flow.action, flow.page.side_effect = action, page
+        self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        self.assertEqual(sum(name == 'continueFromBillingToReview' for _, name, _ in flow.calls), 1)
+        self.assertEqual(flow.submissions, 1)
+        self.assertEqual(flow.page.call_count, 2)
+        self.assertEqual(flow.page.call_args_list[0].args[1], '支付方式失败后核对结算状态')
+        self.assertEqual(flow.page.call_args_list[1].args[1], '自提准备后重新核对结算页')
+
+    def test_authentication_attempt_revokes_receipt_before_page_or_cookie_change(self):
+        def invalidate(flow):
+            # A real auth entry must revoke the receipt even when an earlier
+            # authentication guard raises before making another request.
+            flow._http_authx_rejected = True
+            with patch.object(shop, 'checkout_signin_entry', return_value=flow.page_response.url), \
+                    patch('purchase_identity.invalidate_identity'):
+                with self.assertRaisesRegex(ValueError, '认证恢复已尝试'):
+                    shop.reauthenticate_checkout(flow, expected=[('MK2M4CH', 1)])
+            return True
+        flow = self.enable_live_review(self.prepared_flow(on_reply=invalidate))
+        self.assertEqual(self.run_flow(flow, prepare=True)['status'], 'pending_payment')
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_called_once()
+
+    def test_uncertain_final_submission_is_not_replayed(self):
+        self.claim_purchase_params = {'sku':'MK2M4CH', 'quantity':1, 'fulfillment':'RETAIL', 'retry_count':1}
+        flow = self.enable_live_review(self.prepared_flow())
+        flow.fail_submission = True
+        with self.assertRaises(requests.Timeout):
+            self.run_flow(flow, prepare=True)
+        self.assertEqual(flow.submissions, 1)
+        flow.page.assert_not_called()
+        self.assertEqual(sum(name == 'checkout' for _, name, _ in flow.calls), 1)
+
+    def test_live_review_drift_must_refresh_and_refuse_conflicting_official_values(self):
+        for case in ('sku', 'quantity', 'store', 'contact', 'total', 'payment', 'disabled'):
+            def invalidate(flow):
+                flow.session.cookies.set('fixture', 'changed', domain='.apple.com.cn', path='/')
+                return True
+            def mutate(model):
+                review = model['checkout']['review']
+                group = review['fulfillmentReview']['reviewGroup-1']
+                if case == 'sku': group['item-0']['d']['sku'] = 'OTHER/A'
+                elif case == 'quantity': group['item-0']['itemQuantity']['d']['quantity'] = 2
+                elif case == 'store': group['d']['pickup']['storeId'] = 'R999'
+                elif case == 'contact': review['pickupContactReview']['pickupContactInfo']['d']['fullDaytimePhone'] = '13900000000'
+                elif case == 'total': review['summary']['d']['total'] = 'RMB 16,999'
+                elif case == 'payment': review['billingReview']['alipayReview']['d']['alipayLabel'] = 'OTHER'
+                else: review['placeOrder']['d']['enableContinue'] = False
+            with self.subTest(case=case):
+                flow = self.enable_live_review(self.prepared_flow(on_reply=invalidate, refresh=mutate))
+                with self.assertRaises(ValueError):
+                    self.run_flow(flow, prepare=True)
+                self.assertEqual(flow.submissions, 0)
+                flow.page.assert_called_once()
+
     def test_explicit_current_review_appointment_skips_fulfillment_without_its_old_model(self):
         def appointment(model):
             pickup = model['checkout']['review']['fulfillmentReview']['reviewGroup-1']['d']['pickup']
@@ -316,7 +630,7 @@ class PreparedPickupTests(TestCase):
                          ['continueFromReviewToProcess'])
 
     def test_authorized_other_store_edits_original_flow_and_discards_old_review_proof(self):
-        flow = self.priority_prepared_flow('R581')
+        flow = self.enable_live_review(self.priority_prepared_flow('R581'))
         original_page, original_action = flow.page.side_effect, flow.action
         def page(url, stage, *, fresh=False):
             original_page(url, stage, fresh=fresh)
@@ -504,6 +818,9 @@ class PreparedPickupTests(TestCase):
     def test_partial_edit_without_step_reads_fresh_state_before_continuing(self):
         for recovered in (True, False):
             with self.subTest(recovered=recovered):
+                # A previous subtest's synthetic order is a different task.
+                for filename in ('payment.json', 'order_submission.json', 'test_order_submission.json', 'parallel_attempts.json'):
+                    (self.root / filename).unlink(missing_ok=True)
                 flow = self.prepared_flow()
                 original_page, original_action = flow.page.side_effect, flow.action
                 def page(url, stage, *, fresh=False):

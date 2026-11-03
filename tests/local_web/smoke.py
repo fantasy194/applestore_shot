@@ -104,12 +104,12 @@ def main(package):
             def call(command, **args):
                 return request('/api/' + command, args)
 
-            def wait(task_id):
+            def wait(task_id, expected='succeeded'):
                 deadline = time.monotonic() + 20
                 while time.monotonic() < deadline:
                     task = next(t for t in call('snapshot')['tasks'] if t['id'] == task_id)
                     if task['status'] in ('succeeded', 'failed', 'cancelled'):
-                        assert task['status'] == 'succeeded', task['stage']
+                        assert task['status'] == expected, task['stage']
                         return task
                     time.sleep(.1)
                 raise AssertionError('业务任务未完成')
@@ -174,7 +174,19 @@ def main(package):
             a = call('add_account', name='测试 A', email='a@example.test')
             b = call('add_account', name='测试 B', email='b@example.test')
             assert a['pending'] is True and b['pending'] is True
-            request('/api/start_task', {'accountId': a['id'], 'action': 'purchase', 'params': {}}, expected=400)
+            # Local account-addition state no longer blocks a purchase. Use a
+            # worker-only invalid interval to finish before any authentication
+            # or network request, while proving HTTP admission and real IPC.
+            pending_purchase = call('start_task', accountId=a['id'], action='purchase',
+                                    params={'prepared_inventory_interval_minutes': 0})
+            rejected = wait(pending_purchase, expected='failed')
+            assert '准备内库存查询间隔必须是 1–60' in rejected['stage']
+            assert rejected['order_submitted'] is False
+            assert not (data / 'accounts' / a['id'] / 'auth.json').exists()
+            request_log = data / 'accounts' / a['id'] / 'tasks' / pending_purchase / 'requests.log'
+            assert not re.search(r'开始\s+(?:GET|POST)\s+https://', request_log.read_text(encoding='utf-8'))
+            assert next(account for account in call('snapshot')['accounts'] if account['id'] == a['id'])['pending'] is True
+            request('/api/start_task', {'accountId': a['id'], 'action': 'login', 'params': {}}, expected=400)
             call('save_preset', accountId=a['id'], sku='MLH74FE', quantity=3)
             request('/api/add_account', {'email': a['email']}, expected=400)
             request('/api/start_task', {'accountId': a['id'], 'action': 'unknown', 'params': {}}, expected=400)
