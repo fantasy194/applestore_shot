@@ -248,8 +248,16 @@ function WorkspaceApp() {
   const tasks = snapshot.tasks
     .filter((t) => t.account_id === accountId)
     .sort((a, b) => b.created_at - a.created_at || b.updated_at - a.updated_at);
+  const futureSchedule = (task: Task) =>
+    task.status === "scheduled" &&
+    ["purchase", "checkout"].includes(task.action) &&
+    task.schedule != null &&
+    task.schedule.triggered_at_ms == null &&
+    task.schedule.at_ms > Date.now() &&
+    !task.order_submitted &&
+    !hasUnknownSubmission(task, tasks);
   const busy =
-    tasks.some((t) => active(t) && t.status !== "scheduled") || dispatching;
+    tasks.some((task) => active(task) && !futureSchedule(task)) || dispatching;
   // Real purchases take priority over preheat only. Keep ordinary account
   // actions serialized, and retain the same unknown-order evidence as progress.
   const purchaseBusy =
@@ -258,7 +266,7 @@ function WorkspaceApp() {
       (task) =>
         hasUnknownSubmission(task, tasks) ||
         (active(task) &&
-          task.status !== "scheduled" &&
+          !futureSchedule(task) &&
           !(
             !task.order_submitted &&
             (task.prompt?.kind === "prepared_purchase" ||
@@ -842,7 +850,6 @@ function WorkspaceApp() {
                           <button
                             disabled={
                               busy ||
-                              !!scheduledTask ||
                               !presetProducts.some(
                                 (p) => p.sku === sku.replace(/\/A$/i, ""),
                               ) ||
@@ -957,7 +964,6 @@ function WorkspaceApp() {
                               type="submit"
                               disabled={
                                 purchaseBusy ||
-                                !!scheduledTask ||
                                 !presetProducts.some(
                                   (p) => p.sku === sku.replace(/\/A$/i, ""),
                                 ) ||
@@ -974,7 +980,6 @@ function WorkspaceApp() {
                               data-fulfillment="RETAIL"
                               disabled={
                                 purchaseBusy ||
-                                !!scheduledTask ||
                                 !presetProducts.some(
                                   (p) => p.sku === sku.replace(/\/A$/i, ""),
                                 ) ||
@@ -1035,7 +1040,7 @@ function WorkspaceApp() {
                       <div className="button-row">
                         <button
                           className="primary"
-                          disabled={purchaseBusy || !!scheduledTask}
+                          disabled={purchaseBusy}
                           onClick={() => start("checkout")}
                         >
                           结算购物袋
@@ -1288,6 +1293,7 @@ function WorkspaceApp() {
                       (task.status === "succeeded" ||
                         [
                           "pending_payment",
+                          "verification_required",
                           "parallel_running",
                           "parallel_complete",
                           "queue_running",
@@ -1334,7 +1340,9 @@ function WorkspaceApp() {
                             start("orders");
                           }}
                         >
-                          查询订单，确认提交结果
+                          {hasUnverifiedOrder(task.result)
+                            ? "查询订单状态"
+                            : "查询订单，确认提交结果"}
                         </button>
                       )}
                   </section>
@@ -1344,7 +1352,7 @@ function WorkspaceApp() {
           </>
         )}
         <footer className="workspace-footer">
-          <span>DUO Killer · 0.1.26</span>
+          <span>DUO Killer · 0.1.27</span>
           <span>会话与地址按账号独立保存</span>
         </footer>
         {removingAccount && (
@@ -1918,6 +1926,14 @@ function confirmedOrderTerminal(
     }
   }
 }
+function hasUnverifiedOrder(result: Data | null | undefined) {
+  return (
+    result?.status === "verification_required" &&
+    typeof result.order_number === "string" &&
+    /^W\d{6,20}$/.test(result.order_number)
+  );
+}
+
 function Result({
   task,
   onOrders,
@@ -1956,6 +1972,7 @@ function Result({
       parallel_running: "执行中",
       parallel_complete: "已返回结果",
       pending_payment: "待付款",
+      verification_required: "付款信息待核实",
       failed: "失败",
       submission_unknown: "提交结果未知",
       cancelled: "已取消",
@@ -1980,6 +1997,9 @@ function Result({
           job.result?.status === "pending_payment" ||
           job.result?.pending_orders?.length,
       );
+    const hasUnverified =
+      jobs.some((job) => hasUnverifiedOrder(job.result)) ||
+      rootAttempts.some((attempt) => hasUnverifiedOrder(attempt.result));
     return (
       <div className="queue-results">
         <h3>
@@ -1993,7 +2013,9 @@ function Result({
           <p className={unknown ? "error-text" : "muted"}>
             {unknown
               ? "存在提交结果未知的目标，请先查询订单确认。"
-              : "本批未取得待付款订单，请查看各目标结果。"}
+              : hasUnverified
+                ? "本批有订单的付款信息待核实，请查看各目标结果。"
+                : "本批未取得待付款订单，请查看各目标结果。"}
           </p>
         ) : null}
         {jobs.map((job, jobIndex) => {
@@ -2082,6 +2104,9 @@ function Result({
               {detail.error && detail.error !== detail.message && (
                 <p className="error-text">{format(detail.error)}</p>
               )}
+              {hasUnverifiedOrder(detail) && (
+                <p>订单 {detail.order_number} · 付款信息待核实。</p>
+              )}
               {!result.retry_summary && (
                 <PurchaseRetrySummary result={detail} />
               )}
@@ -2133,6 +2158,7 @@ function Result({
               })}
               {!orders.length &&
                 !attempts.length &&
+                !hasUnverifiedOrder(detail) &&
                 !detail.message &&
                 !detail.error && (
                   <p className="muted">
@@ -2220,6 +2246,15 @@ function Result({
         <button disabled={disabled} onClick={onOrders}>
           查询全部订单
         </button>
+      </div>
+    );
+  if (hasUnverifiedOrder(result))
+    return (
+      <div>
+        <p>订单 {result.order_number} · 付款信息待核实。</p>
+        {result.message && result.message !== task.stage && (
+          <p className="error-text">{format(result.message)}</p>
+        )}
       </div>
     );
   if (terminalStatus && result.status === "pending_payment")

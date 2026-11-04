@@ -226,6 +226,14 @@ pub(crate) fn ready_purchase(task:&Task)->bool {
         && task.schedule.as_ref().is_none_or(|schedule|schedule.triggered_at_ms.is_some() || schedule.at_ms<=now_ms())
 }
 
+// A schedule that has not reached its deadline has not acquired the account
+// and must not prevent another authorized purchase from using a live checkout.
+pub(crate) fn future_scheduled_purchase(task:&Task)->bool {
+    task.status=="scheduled" && matches!(task.action.as_str(),"purchase"|"checkout")
+        && task.schedule.as_ref().is_some_and(|schedule|schedule.triggered_at_ms.is_none() && schedule.at_ms>now_ms())
+        && !task_has_unknown_submission(task)
+}
+
 #[derive(Serialize)]
 pub struct Snapshot {
     pub accounts: Vec<Account>,
@@ -306,57 +314,9 @@ fn remove_private_payment_links(value: &mut Value) {
     }
 }
 
-fn resolved_official_status(status: &str) -> bool {
-    matches!(status, "PAYMENT_EXPIRED_STORED_ORDER" | "CANCELED" | "CANCELLED" | "PAID" | "PROCESSING"
-        | "PREPARING_TO_SHIP" | "SHIPPED" | "DELIVERED" | "READY_FOR_PICKUP" | "PICKED_UP" | "PICKUP_COMPLETE")
-        || status.strip_prefix("CANCELED_").or_else(|| status.strip_prefix("CANCELLED_")).is_some_and(|tail|
-            !tail.is_empty() && tail.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
-}
-
-fn official_order_resolved(tasks: &HashMap<String, Task>, account_id: &str, number: &str) -> bool {
-    let mut latest = None;
-    for task in tasks.values().filter(|task| task.account_id == account_id && task.status == "succeeded") {
-        let Some(result) = &task.result else { continue };
-        if result["success"] != true { continue }
-        let evidence = if task.action == "cancel_order" && result["order_number"] == number {
-            matches!(result["status"].as_str(), Some("order_cancelled" | "order_expired")).then_some(true)
-        } else if task.action == "orders" {
-            result["orders"].as_array().and_then(|orders| orders.iter().find(|order| order["order_number"] == number))
-                .filter(|order| order["verified_by"] == "official_detail")
-                .and_then(|order| order["items"].as_array())
-                .filter(|items| !items.is_empty())
-                .map(|items| items.iter().all(|item| item["status"].as_str().is_some_and(resolved_official_status)))
-        } else { None };
-        if let Some(resolved) = evidence {
-            let key = (task.updated_at, task.created_at);
-            if latest.as_ref().is_none_or(|(previous, _)| key >= *previous) { latest = Some((key, resolved)); }
-        }
-    }
-    latest.is_some_and(|(_, resolved)| resolved)
-}
-
 pub(crate) fn task_has_unknown_submission(task: &Task) -> bool {
-    task.order_submitted && task.result.is_none()
-        || task.result.as_ref().is_some_and(purchase_queue::contains_unknown)
-}
-
-pub(crate) fn unresolved_submission(task: &Task, tasks: &HashMap<String, Task>) -> bool {
-    if !task.order_submitted { return false }
-    let Some(result) = &task.result else { return true };
-    let mut numbers = HashSet::new();
-    if let Some(number) = result["order_number"].as_str().filter(|number| !number.is_empty()) { numbers.insert(number); }
-    if let Some(orders) = result["pending_orders"].as_array() {
-        for order in orders {
-            if let Some(number) = order["order_number"].as_str().filter(|number| !number.is_empty()) { numbers.insert(number); }
-        }
-    }
-    if result["attempts"].as_array().is_some_and(|attempts| attempts.iter().any(|attempt|
-        attempt["status"] == "submission_unknown" || attempt["order_submitted"] == true
-        && attempt.get("result").is_none_or(|value| value["order_number"].as_str().is_none_or(str::is_empty)))) { return true }
-    if numbers.is_empty() {
-        return !matches!(result["status"].as_str(),Some("order_paid" | "order_cancelled" | "order_expired"));
-    }
-    numbers.into_iter().any(|number| !official_order_resolved(tasks, &task.account_id, number))
+    task.result.as_ref().is_some_and(purchase_queue::contains_unknown)
+        || task.order_submitted && task.result.as_ref().is_none_or(|result| !purchase_queue::contains_known_order(result))
 }
 
 // Keep task submission and removal exclusive, including while the vault worker runs.
@@ -773,7 +733,7 @@ impl Engine {
             return Err("请先完成账号添加与登录验证".into());
         }
         if action == "purchase" && params["prepare_only"]!=true && schedule.is_none() {
-            if self.tasks.lock().unwrap().values().any(|task| task.account_id==account_id && task.schedule.is_some() && !terminal(&task.status)) {
+            if self.tasks.lock().unwrap().values().any(|task| task.account_id==account_id && task.schedule.is_some() && !terminal(&task.status) && !future_scheduled_purchase(task)) {
                 return Err("该账号已有定时抢购，请先取消原定时任务，避免重复下单".into());
             }
             if let Some(id) = self.try_claim_prepared(&app, &account_id, &params, None)? { return Ok(id); }
@@ -784,9 +744,8 @@ impl Engine {
             return Err("该账号存在未知订单提交，请先查询官网订单；未开始购买".into());
         }
         if params["queue_stream"]==true && (
-            tasks.values().any(|task|task.account_id==account_id && (!terminal(&task.status) && !is_preemptible_preheat(task)
-                || task.order_submitted && task.result.as_ref().is_none_or(purchase_queue::contains_unknown)
-                || task.queue_job_ids.is_empty() && unresolved_submission(task,&tasks)))
+            tasks.values().any(|task|task.account_id==account_id && (!terminal(&task.status) && !is_preemptible_preheat(task) && !future_scheduled_purchase(task)
+                || task_has_unknown_submission(task)))
             || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock|lock.available_permits()==0)
                 && !tasks.values().any(|task| task.account_id==account_id && !terminal(&task.status) && is_preemptible_preheat(task))) {
             return Err("账号有进行中的任务或待核实订单，目标保留在下单队列中".into());
@@ -806,7 +765,7 @@ impl Engine {
             }
         }
         if params["inventory_trigger"] == true && (
-            tasks.values().any(|task| task.account_id == account_id && ((!terminal(&task.status) && !(purchase_priority && is_preemptible_preheat(task))) || unresolved_submission(task, &tasks)))
+            tasks.values().any(|task| task.account_id == account_id && ((!terminal(&task.status) && !future_scheduled_purchase(task) && !(purchase_priority && is_preemptible_preheat(task))) || task_has_unknown_submission(task)))
             || self.locks.lock().unwrap().get(&account_id).is_some_and(|lock| lock.available_permits() == 0)
                 && !tasks.values().any(|task|task.account_id==account_id && !terminal(&task.status) && purchase_priority && is_preemptible_preheat(task))) {
             return Err("库存已变化但账号正忙或已有待核实订单，未排队自动下单".into());
@@ -818,7 +777,8 @@ impl Engine {
             }
         }
         if (action == "checkout" || action == "purchase" && params["prepare_only"] != true) && tasks.values().any(|t|
-            t.account_id == account_id && t.schedule.is_some() && !terminal(&t.status)) {
+            t.account_id == account_id && t.schedule.is_some() && !terminal(&t.status)
+                && (schedule.is_some() || !future_scheduled_purchase(t))) {
             return Err("该账号已有定时抢购，请先取消原定时任务，避免重复下单".into());
         }
         // Read/check requests can be triggered again by page navigation.
@@ -1365,6 +1325,16 @@ pub fn apply_event(task: &mut Task, event: &Value) {
                 task.result = Some(event["result"].clone());
                 task.prompt = None;
                 task.stage = "订单已创建，正在加载付款二维码".into();
+            } else if task.order_submitted && !terminal(&task.status) && matches!(task.action.as_str(),"purchase"|"checkout")
+                && event["result"]["status"] == "verification_required"
+                && event["result"]["success"] == false && !purchase_queue::contains_unknown(&event["result"])
+                && event["result"]["order_number"].as_str().is_some_and(|number| !number.trim().is_empty())
+                && task.result.as_ref().is_none_or(|result| !purchase_queue::contains_unknown(result)
+                    && (result["status"]=="purchase_retry" || result["status"]=="verification_required"
+                        && result["order_number"]==event["result"]["order_number"])) {
+                task.result = Some(event["result"].clone());
+                task.prompt = None;
+                task.stage = "订单已创建，付款信息需要核对".into();
             }
         }
         "queue_finished" => {
@@ -1519,6 +1489,36 @@ print(json.dumps(dict(v=1,account_id=r['account_id'],task_id=r['task_id'],type='
         apply_event(&mut t, &json!({"type":"error","message":"QR interrupted"}));
         assert_eq!(t.status, "failed");
         assert_eq!(t.result.as_ref().unwrap()["status"], "pending_payment");
+    }
+
+    #[test]
+    fn payment_verification_progress_preserves_the_known_order_across_a_later_error() {
+        for action in ["purchase","checkout"] {
+            let mut purchase=task();purchase.action=action.into();purchase.status="running".into();purchase.order_submitted=true;
+            let result=json!({"success":false,"status":"verification_required","order_number":"W123456","order_submitted":true});
+            apply_event(&mut purchase,&json!({"type":"progress_result","result":result}));
+            assert_eq!(purchase.result.as_ref(),Some(&result));assert_ne!(purchase.stage,"订单已创建，正在加载付款二维码");
+            apply_event(&mut purchase,&json!({"type":"error","message":"需要核对付款信息"}));
+            assert_eq!(purchase.status,"failed");assert_eq!(purchase.result.as_ref(),Some(&result));
+            assert!(!task_has_unknown_submission(&purchase));
+        }
+        for (submitted,number) in [(false,"W123456"),(true,""),(true,"   ")] {
+            let mut purchase=task();purchase.action="purchase".into();purchase.status="running".into();purchase.order_submitted=submitted;
+            apply_event(&mut purchase,&json!({"type":"progress_result","result":{"status":"verification_required","order_number":number}}));
+            assert!(purchase.result.is_none());
+        }
+        let mut parallel=task();parallel.action="purchase".into();parallel.status="running".into();parallel.order_submitted=true;
+        let mixed=json!({"status":"parallel_complete","attempts":[{"status":"submission_unknown","order_submitted":true}]});
+        parallel.result=Some(mixed.clone());
+        apply_event(&mut parallel,&json!({"type":"progress_result","result":{"status":"verification_required","order_number":"W123456"}}));
+        assert_eq!(parallel.result,Some(mixed));assert!(task_has_unknown_submission(&parallel));
+        for result in [json!({"status":"verification_required","success":false,"order_number":"invalid"}),
+            json!({"status":"verification_required","success":true,"order_number":"W123456"}),
+            json!({"status":"verification_required","success":false,"order_number":"W123456","attempts":[{"status":"submission_unknown"}]})] {
+            let mut purchase=task();purchase.action="purchase".into();purchase.status="running".into();purchase.order_submitted=true;
+            let stage=purchase.stage.clone();apply_event(&mut purchase,&json!({"type":"progress_result","result":result}));
+            assert!(purchase.result.is_none());assert_eq!(purchase.stage,stage);
+        }
     }
 
     #[test]
@@ -2350,6 +2350,21 @@ channel.emit('result',result={{'success':True,'status':'fixture_complete'}})
         assert!(check_schedule_lateness(1000, 4000).is_ok());
         assert!(check_schedule_lateness(1000, 4001).is_err());
     }
+    #[test]
+    fn only_untriggered_future_schedule_can_yield_its_account() {
+        let at=now_ms()+60_000;let mut scheduled=task();scheduled.action="purchase".into();scheduled.status="scheduled".into();
+        scheduled.schedule=purchase_schedule("purchase",&scheduled_params(at),now_ms()).unwrap();
+        assert!(future_scheduled_purchase(&scheduled));
+        for status in ["running","waiting","queued","interrupted","failed"] {
+            let mut other=scheduled.clone();other.status=status.into();assert!(!future_scheduled_purchase(&other),"{status}");
+        }
+        let mut triggered=scheduled.clone();triggered.schedule.as_mut().unwrap().triggered_at_ms=Some(now_ms());
+        assert!(!future_scheduled_purchase(&triggered));
+        let mut due=scheduled.clone();due.schedule.as_mut().unwrap().at_ms=now_ms().saturating_sub(1);
+        assert!(!future_scheduled_purchase(&due));
+        let mut unknown=scheduled.clone();unknown.order_submitted=true;unknown.result=Some(json!({"status":"failed"}));
+        assert!(!future_scheduled_purchase(&unknown));
+    }
     #[tokio::test]
     async fn schedule_wait_observes_cancellation_and_never_waits_on_a_missed_time() {
         let (tx, mut rx) = watch::channel(false);
@@ -2374,8 +2389,10 @@ channel.emit('result',result={{'success':True,'status':'fixture_complete'}})
         let permit = lock.try_acquire_owned().unwrap();
         drop(permit);
         assert!(engine.start(host.clone(),a.id.clone(),"purchase".into(),scheduled_params(now_ms()+120_000)).unwrap_err().contains("已有定时"));
-        assert!(engine.start(host.clone(),a.id.clone(),"purchase".into(),json!({"sku":"MJT84CH","quantity":1})).is_err());
-        assert!(engine.start(host.clone(),a.id.clone(),"checkout".into(),json!({})).is_err());
+        assert!(engine.start(host.clone(),a.id.clone(),"purchase".into(),json!({"sku":"MJT84CH","quantity":1})).is_ok());
+        assert!(engine.start(host.clone(),a.id.clone(),"checkout".into(),json!({})).is_ok());
+        assert_eq!(engine.tasks.lock().unwrap()[&id].status,"scheduled");
+        assert!(engine.tasks.lock().unwrap()[&id].schedule.as_ref().unwrap().triggered_at_ms.is_none());
         engine.cancel(&a.id,&id).unwrap();
         for _ in 0..100 {
             if terminal(&engine.tasks.lock().unwrap()[&id].status) { break }
@@ -2844,41 +2861,43 @@ else:
     }
 
     #[test]
-    fn authoritative_later_order_status_resolves_only_matching_parallel_orders() {
-        let mut purchase=task(); purchase.account_id="account".into(); purchase.status="succeeded".into();
-        purchase.order_submitted=true;
-        purchase.result=Some(json!({"status":"parallel_complete","pending_orders":[
-            {"order_number":"W111111","status":"pending_payment"},{"order_number":"W222222","status":"pending_payment"}]}));
-        let mut tasks=HashMap::new(); tasks.insert("purchase".into(),purchase.clone());
-        assert!(unresolved_submission(&purchase,&tasks));
-        let mut orders=task(); orders.account_id="account".into(); orders.action="orders".into(); orders.status="succeeded".into();
-        orders.result=Some(json!({"success":true,"orders":[
-            {"order_number":"W111111","verified_by":"official_detail","items":[{"status":"PROCESSING"}]},
-            {"order_number":"W222222","verified_by":"official_detail","items":[{"status":"PAYMENT_DUE_STORED_ORDER"}]}]}));
-        tasks.insert("orders".into(),orders.clone());
-        assert!(unresolved_submission(&purchase,&tasks));
-        orders.result.as_mut().unwrap()["orders"][1]["items"][0]["status"]=json!("PAYMENT_EXPIRED_STORED_ORDER");
-        tasks.insert("orders".into(),orders.clone());
-        assert!(!unresolved_submission(&purchase,&tasks));
-        orders.result.as_mut().unwrap()["orders"][0]["verified_by"]=Value::Null;
-        tasks.insert("orders".into(),orders.clone());
-        assert!(unresolved_submission(&purchase,&tasks));
-        // A different account cannot clear this account's pending purchase.
-        orders.account_id="other-account".into(); tasks.insert("orders".into(),orders);
-        assert!(unresolved_submission(&purchase,&tasks));
-        // An attempt without a known order number stays blocked even if other orders are resolved.
-        purchase.result.as_mut().unwrap()["attempts"]=json!([{"status":"submission_unknown","order_submitted":true}]);
-        assert!(unresolved_submission(&purchase,&tasks));
+    fn submission_evidence_distinguishes_known_orders_and_unidentified_attempts() {
+        let mut purchase=task();purchase.action="purchase".into();purchase.status="failed".into();purchase.order_submitted=true;
+        // Older persisted tasks may record submission on the task but omit it
+        // from the result. An unidentified submission still has to be held.
+        for result in [None,Some(json!({"status":"failed"})),Some(json!({"status":"pending_payment","order_number":"   "}))] {
+            purchase.result=result;
+            assert!(task_has_unknown_submission(&purchase));
+        }
+        for result in [json!({"status":"pending_payment","order_number":"W111111"}),
+            json!({"status":"parallel_complete","pending_orders":[{"order_number":"W111111"}]}),
+            json!({"status":"pending_payment","attempts":[{"status":"pending_payment","order_submitted":true,"result":{"order_number":"W111111"}}]})] {
+            purchase.result=Some(result);
+            assert!(!task_has_unknown_submission(&purchase));
+        }
+        purchase.result=Some(json!({"status":"parallel_complete","pending_orders":[{"order_number":"W111111"}],
+            "attempts":[{"status":"pending_payment","order_submitted":true,"result":{"order_number":"W111111"}},
+                {"status":"failed","order_submitted":true}]}));
+        assert!(task_has_unknown_submission(&purchase),"one known order must not mask another unidentified submission");
     }
 
-    #[test]
-    fn confirmed_cancellation_can_resolve_a_pending_purchase() {
-        let mut purchase=task(); purchase.account_id="account".into(); purchase.status="succeeded".into(); purchase.order_submitted=true;
-        purchase.result=Some(json!({"status":"pending_payment","order_number":"W111111"}));
-        let mut cancellation=task(); cancellation.account_id="account".into(); cancellation.action="cancel_order".into(); cancellation.status="succeeded".into();
-        cancellation.result=Some(json!({"success":true,"status":"order_cancelled","order_number":"W111111"}));
-        let mut tasks=HashMap::new(); tasks.insert("purchase".into(),purchase.clone()); tasks.insert("cancel".into(),cancellation);
-        assert!(!unresolved_submission(&purchase,&tasks));
+    #[tokio::test]
+    async fn prior_known_order_does_not_gate_new_purchase_entry_points() {
+        for mode in ["manual","checkout","inventory","queue"] {
+            let root=tempfile::tempdir().unwrap();let engine=Engine::new(root.path().into()).unwrap();
+            let account=engine.add_account("prior-known@example.test".into()).unwrap();engine.accounts.lock().unwrap()[0].pending=false;
+            let mut prior=task();prior.id="prior".into();prior.account_id=account.id.clone();prior.action="purchase".into();
+            prior.status="succeeded".into();prior.order_submitted=true;prior.prompt=None;
+            prior.result=Some(json!({"success":true,"status":"pending_payment","order_number":"W111111"}));
+            engine.tasks.lock().unwrap().insert(prior.id.clone(),prior.clone());
+            let host=TaskHost{worker:root.path().join("missing"),script:None,on_update:Arc::new(|_|{})};
+            let mut params=json!({"sku":"MLH74FE","quantity":1,"fulfillment":"RETAIL"});
+            if mode=="inventory" {params["inventory_trigger"]=json!(true);}
+            if mode=="queue" {params["queue_stream"]=json!(true);params["queue_targets"]=json!([]);}
+            let action=if mode=="checkout" {"checkout"} else {"purchase"};
+            let next=engine.start(host,account.id.clone(),action.into(),params).expect(mode);
+            assert_ne!(next,"prior");assert_eq!(engine.tasks.lock().unwrap()["prior"].result,prior.result);
+        }
     }
 
 }

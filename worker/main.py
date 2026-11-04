@@ -32,6 +32,15 @@ class AccountLock:
         self.file.close()
 
 
+def emit_current_unverified_order(service, channel):
+    if service is None or service.submitted is not True:
+        return
+    from payment_evidence import current_unverified_order
+    result = current_unverified_order(service.task_dir, submitted=service.submitted)
+    if result is not None:
+        channel.emit('progress_result', result=result, order_submitted=True)
+
+
 def main():
     if '--activity-log' in sys.argv[1:]:
         from activity_log import main as activity_main
@@ -141,12 +150,14 @@ def main():
     except Cancelled:
         if service:
             service.finish_prepared_handoff(cancelled=True)
+            emit_current_unverified_order(service, channel)
         channel.emit('cancelled', message='任务已取消。',
                      order_submitted=bool(service and service.submitted))
     except Exception as exc:
         error = exc
         if service:
             service.finish_prepared_handoff(error=exc)
+            emit_current_unverified_order(service, channel)
         # Never include requests' exception URLs, headers, or a traceback with locals.
         import requests
         message = '网络请求失败，请检查网络或系统代理。' if isinstance(exc, requests.RequestException) else str(exc)

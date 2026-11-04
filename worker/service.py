@@ -675,6 +675,12 @@ class Service:
         if claim is None or self._prepared_queue_finished:return
         self._prepared_queue_finished=True
         if not isinstance(result,dict) and self.submitted:
+            from payment_evidence import current_unverified_order
+            result=current_unverified_order(self.task_dir, submitted=self.submitted)
+            if result is not None:
+                result['message']=('网络请求失败，未自动重发购买。' if isinstance(error,requests.RequestException) else
+                    str(error)[:2000] if isinstance(error,(ValueError,OSError)) else '准备接手后的购买未完成。')
+        if not isinstance(result,dict) and self.submitted:
             try:
                 saved=json.loads((self.task_dir/'payment.json').read_text(encoding='utf-8'))
                 if saved.get('status')=='pending_payment' and isinstance(saved.get('order_number'),str) and saved['order_number']:

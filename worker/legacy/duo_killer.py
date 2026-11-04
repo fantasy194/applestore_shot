@@ -1561,8 +1561,7 @@ def recover_expired_checkout(flow, expected, *, config_hash):
         target = urlsplit(urljoin(flow.url, action))
         if (target.scheme != 'https' or target.username or target.password or target.port not in (None, 443)
                 or not (target.hostname == 'www.apple.com.cn'
-                        or re.fullmatch(r'secure\d*\.www\.apple\.com\.cn', target.hostname or ''))
-                or target.path != '/shop/checkoutx'):
+                        or re.fullmatch(r'secure\d*\.www\.apple\.com\.cn', target.hostname or ''))):
             raise ValueError('官网当前购物袋结算入口不符合预期；未发送操作。')
         for key in ('prepared_order','order_details','pickup_selected','pickup_selection_scope','pickup_identity_scope',
                     'pickup_slot_selected','pickup_contact_proof','pickup_identity_proof'):

@@ -142,7 +142,7 @@ impl Engine {
         let current = now_ms();
         let mut tasks = self.tasks.lock().unwrap();
         if tasks.values().any(|task| task.account_id==account && (task_has_unknown_submission(task)
-            || task.schedule.is_some() && !terminal(&task.status) && Some(task.id.as_str()) != source_task)) {
+            || task.schedule.is_some() && !terminal(&task.status) && !future_scheduled_purchase(task) && Some(task.id.as_str()) != source_task)) {
             self.append_event("prepared_claim_missed", &json!({"account_id":account,"reasons":["account_execution_guard"]}));
             return Ok(None);
         }
@@ -340,6 +340,22 @@ emit('result',result={'success':True,'status':'fixture_completed','pid':os.getpi
                 assert_eq!(source.prepared_handoff.as_ref().unwrap()["prepared_task_id"],prepared);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn future_scheduled_purchase_does_not_block_manual_claim_or_lose_its_schedule() {
+        let (_root,engine,host,account)=fixture();
+        let prepared=engine.start(host.clone(),account.clone(),"session_maintain".into(),json!({})).unwrap();
+        wait(&engine,&prepared,true).await;
+        let at=now_ms()+60_000;let mut later=purchase();later["scheduled_at"]=json!(at);
+        let scheduled=engine.start(host.clone(),account.clone(),"purchase".into(),later).unwrap();
+        let target=engine.start(host.clone(),account.clone(),"purchase".into(),purchase()).unwrap();
+        assert_eq!(target,prepared);wait(&engine,&target,false).await;
+        let tasks=engine.tasks.lock().unwrap();
+        assert_eq!(tasks[&scheduled].status,"scheduled");assert_eq!(tasks[&scheduled].schedule.as_ref().unwrap().at_ms,at);
+        assert!(tasks[&scheduled].schedule.as_ref().unwrap().triggered_at_ms.is_none());drop(tasks);
+        assert!(!*engine.controls.lock().unwrap()[&scheduled].cancel.borrow());
+        engine.cancel(&account,&scheduled).unwrap();wait(&engine,&scheduled,false).await;
     }
 
     #[tokio::test]

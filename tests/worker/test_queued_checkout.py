@@ -390,6 +390,92 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(result['pause_reason'])
         self.assertEqual(self.finished()[0]['result']['order_number'],'W12345678')
 
+    def test_unverified_payment_with_known_order_does_not_pause_next_target(self):
+        called=[]
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            if item['queue_job_id']=='a':
+                context.submitted=True
+                return {'success':False,'status':'verification_required',
+                        'order_number':'W12345678','message':'付款金额有待核对'}
+            return {'success':False,'status':'failed'}
+        result,_=self.execute([target('a'),target('b','R002')],execute)
+        self.assertEqual(called,['a','b'])
+        first=self.finished()[0]['result']
+        self.assertEqual(first['status'],'verification_required')
+        self.assertFalse(first['success'])
+        self.assertEqual(first['order_number'],'W12345678')
+        self.assertIsNone(result['pause_reason'])
+
+    def test_current_target_unverified_payment_file_keeps_order_and_original_error(self):
+        called=[]
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            if item['queue_job_id']=='a':
+                context.submitted=True
+                (context.task_dir/'payment.json').write_text(json.dumps({
+                    'status':'verification_required','success':False,'order_number':'W12345678',
+                    'payment_url':'secret-fixture-link','qr_data':'secret-fixture-image'}))
+                raise ValueError('付款金额与结算金额不一致')
+            return {'success':False,'status':'failed'}
+        result,_=self.execute([target('a',retry_count=2),target('b','R002')],execute)
+        self.assertEqual(called,['a','b'])
+        first=self.finished()[0]['result']
+        self.assertEqual(first['status'],'verification_required')
+        self.assertFalse(first['success'])
+        self.assertEqual(first['order_number'],'W12345678')
+        self.assertEqual(first['message'],'付款金额与结算金额不一致')
+        self.assertEqual(first['retry_summary']['attempts_made'],1)
+        self.assertEqual(first['retry_summary']['stop_reason'],'submitted')
+        self.assertIsNone(result['pause_reason'])
+        self.assertNotIn('secret-fixture',json.dumps(self.channel.events))
+
+    def test_current_target_known_payment_does_not_hide_unknown_child(self):
+        called=[]
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            context.submitted=True
+            (context.task_dir/'payment.json').write_text(json.dumps({
+                'status':'verification_required','success':False,'order_number':'W12345678'}))
+            (context.task_dir/'parallel_attempts.json').write_text(json.dumps({
+                'attempts':[{'status':'submission_unknown','order_submitted':True}]}))
+            raise ValueError('付款金额有待核对')
+        result,_=self.execute([target('a'),target('b','R002')],execute)
+        self.assertEqual(called,['a'])
+        self.assertEqual(result['pause_reason'],'submission_unknown')
+        self.assertEqual(self.finished()[0]['result']['status'],'submission_unknown')
+
+    def test_unverified_payment_without_current_valid_order_cannot_resolve_unknown(self):
+        called=[]
+        old=self.root/'tasks'/'old-task'
+        old.mkdir(parents=True)
+        (old/'payment.json').write_text(json.dumps({
+            'status':'verification_required','success':False,'order_number':'W12345678'}))
+        def execute(context,item):
+            called.append(item['queue_job_id'])
+            context.submitted=True
+            (context.task_dir/'payment.json').write_text(json.dumps({
+                'status':'verification_required','success':False,'order_number':'invalid'}))
+            raise ValueError('提交结果未返回订单号')
+        result,_=self.execute([target('a'),target('b','R002')],execute)
+        self.assertEqual(called,['a'])
+        self.assertEqual(result['pause_reason'],'submission_unknown')
+        self.assertEqual(self.finished()[0]['result']['status'],'submission_unknown')
+
+    def test_verification_required_order_must_belong_to_same_result_chain(self):
+        from queued_checkout import _contains_unknown_submission
+        known={'status':'verification_required','success':False,'order_number':'W12345678'}
+        self.assertFalse(_contains_unknown_submission(known))
+        self.assertFalse(_contains_unknown_submission({'status':'verification_required','result':known}))
+        for value in ('W12345', 'INVALID', '', 'W12345678 ', 12345678):
+            with self.subTest(value=value):
+                self.assertTrue(_contains_unknown_submission({**known,'order_number':value}))
+        for field in ('attempts','queue_jobs','jobs','pending_orders'):
+            with self.subTest(field=field):
+                self.assertTrue(_contains_unknown_submission({'status':'verification_required',field:[known]}))
+        self.assertTrue(_contains_unknown_submission({**known,'attempts':[
+            {'status':'submission_unknown','order_submitted':True}]}))
+
     def test_authentication_failure_finishes_target_then_parent_rechecks_next_target(self):
         self.service.purchase_session_ready.side_effect=lambda: self.service._purchase_session_proof is not None
         called=[]

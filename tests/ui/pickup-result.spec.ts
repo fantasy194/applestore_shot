@@ -147,3 +147,116 @@ test("候选池下单展示实际选店和时段，不把库存发现门店当�
     page.getByRole("heading", { name: "自提偏好需要处理" }),
   ).toHaveCount(0);
 });
+
+for (const scenario of ["single", "queue"] as const) {
+  for (const width of [390, 1180]) {
+    test(`已返回订单号但付款待核实：${scenario} ${width}px`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width, height: 800 });
+      await page.addInitScript((kind) => {
+        const root = window as any;
+        const unverified = {
+          success: false,
+          status: "verification_required",
+          order_number: "W123456789",
+          order_submitted: true,
+          message: "付款金额与结算金额不一致，请核对。",
+          payment_url: "https://example.test/unverified-payment",
+          qr_data: "data:image/png;base64,ZmFrZQ==",
+        };
+        const job = {
+          queue_job_id: "verification-job",
+          store_id: "R001",
+          store_name: "测试门店",
+          sku: "MLH74FE",
+          status: "verification_required",
+          started: true,
+          result: unverified,
+        };
+        const task = {
+          id: "verification-task",
+          account_id: "a",
+          action: "purchase",
+          status: "failed",
+          stage: "付款金额与结算金额不一致，请核对。",
+          created_at: 1792701000,
+          updated_at: 1792701001,
+          order_submitted: true,
+          logs: [],
+          result:
+            kind === "queue"
+              ? {
+                  success: false,
+                  status: "queue_complete",
+                  order_submitted: true,
+                  queue_jobs: [job],
+                  pending_orders: [],
+                  attempts: [],
+                }
+              : unverified,
+        };
+        root.__DUO_KILLER_TEST__ = {
+          snapshot: async () =>
+            structuredClone({
+              accounts: [
+                {
+                  id: "a",
+                  name: "测试账号",
+                  email: "fixture@example.test",
+                  preset_sku: "MLH74FE",
+                  preset_quantity: 1,
+                },
+              ],
+              tasks: [task],
+              data_dir: "/fixture",
+            }),
+          subscribe: async () => () => {},
+          queue: async (operation: string) => {
+            if (operation !== "status") throw new Error("fixture is read-only");
+            return { jobs: [], blocked_accounts: [], policy_errors: [] };
+          },
+          start: async () => {
+            throw new Error("fixture forbids starting any operation");
+          },
+        };
+      }, scenario);
+
+      await page.goto("/", { waitUntil: "domcontentloaded" });
+      const task = page.locator(".task-detail");
+      await expect(task.locator(".section-title .status")).toHaveText("失败");
+      await expect(task).toContainText("付款金额与结算金额不一致，请核对。");
+      await expect(task).toContainText("订单 W123456789 · 付款信息待核实。");
+      await expect(
+        page.getByRole("button", { name: "立即下单（自提）", exact: true }),
+      ).toBeEnabled();
+      await expect(
+        page.getByRole("region", { name: "下单进度" }).getByRole("status"),
+      ).toContainText("付款信息待核实");
+      if (scenario === "queue") {
+        const job = task.locator('[data-queue-job-id="verification-job"]');
+        await expect(job).toContainText("付款信息待核实");
+        await expect(job).not.toContainText("未取得待付款订单");
+      }
+      await expect(
+        task.getByRole("img", { name: /支付宝付款二维码/ }),
+      ).toHaveCount(0);
+      await expect(
+        task.getByRole("button", { name: "获取二维码" }),
+      ).toHaveCount(0);
+      await expect(
+        task.getByRole("button", { name: "我已支付，查询订单" }),
+      ).toHaveCount(0);
+      await expect(
+        task.locator('a[href="https://example.test/unverified-payment"]'),
+      ).toHaveCount(0);
+      await expect
+        .poll(() =>
+          page.evaluate(
+            () => document.documentElement.scrollWidth - innerWidth,
+          ),
+        )
+        .toBeLessThanOrEqual(0);
+    });
+  }
+}

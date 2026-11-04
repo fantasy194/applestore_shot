@@ -445,13 +445,19 @@ fn queue_order_confirmation_at(result:&Value,enqueued:u64,received:u64)->Option<
     Some(valid_time(&result["payment_confirmed_at_ms"],enqueued,received).unwrap_or(confirmed))
 }
 
-fn contains_known_order(node:&Value)->bool {
+pub(super) fn contains_known_order(node:&Value)->bool {
     node["order_number"].as_str().is_some_and(|number|!number.trim().is_empty())
         || ["result","attempts","queue_jobs","jobs","pending_orders"].iter().any(|key|match node.get(*key) {
             Some(Value::Object(_))=>contains_known_order(&node[*key]),
             Some(Value::Array(rows))=>rows.iter().filter(|child|child.is_object()).any(contains_known_order),
             _=>false,
         })
+}
+
+pub(super) fn verification_order_number(node:&Value)->Option<&str> {
+    node["order_number"].as_str().filter(|number|number.strip_prefix('W')
+        .is_some_and(|digits|(6..=20).contains(&digits.len())&&digits.bytes().all(|byte|byte.is_ascii_digit())))
+        .or_else(||node.get("result").filter(|result|result.is_object()).and_then(verification_order_number))
 }
 
 pub(super) fn contains_unknown(result: &Value) -> bool {
@@ -464,14 +470,17 @@ pub(super) fn contains_unknown(result: &Value) -> bool {
         })
     }
     if !result.is_object() {return false}
-    if matches!(result["status"].as_str(),Some("submission_unknown"|"unknown_submission"|"payment_unknown"|"verification_required")) {return true}
+    if matches!(result["status"].as_str(),Some("submission_unknown"|"unknown_submission"|"payment_unknown")) {return true}
+    // Payment verification can still be required after the shop returned an
+    // order number. That is a known order, not an unidentified submission.
+    if result["status"]=="verification_required" && verification_order_number(result).is_none() {return true}
     // Inspect each outcome before considering aggregate evidence. One known
     // order cannot resolve another submitted child whose order is unknown.
     if children_any(result,contains_unknown) {return true}
     (result["order_submitted"]==true || result["submitted"]==true) && !contains_known_order(result)
 }
 
-fn failed_priority_episode_rearm(queue:&QueueState,key:&str,target:&Value)->Option<Value> {
+fn terminal_priority_episode_rearm(queue:&QueueState,key:&str,target:&Value)->Option<Value> {
     if target["auto_purchase"]!=true{return None;}
     let group_id=target["_queue_purchase_group_id"].as_str()?;
     if !queue.purchase_groups.values().any(|group|group.id==group_id&&group.status=="active"&&group.authorization_active)
@@ -482,24 +491,28 @@ fn failed_priority_episode_rearm(queue:&QueueState,key:&str,target:&Value)->Opti
         queue.jobs.iter().rev().find(|job|job.episode_key==key&&job.purchase_group_id.as_deref()==Some(group_id))?
     } else {return None;};
     let (account,sku,store,quantity)=target_key(target).ok()?;
-    if job.status!="failed" || job.order_submitted || job.account_id!=account || canonical_sku(&job.sku)!=canonical_sku(&sku)
+    if job.order_submitted || job.account_id!=account || canonical_sku(&job.sku)!=canonical_sku(&sku)
         || job.store_id!=store || job.quantity!=quantity
         || queue.blocked_accounts.get(&account).is_some_and(|reason|reason=="submission_unknown") {return None;}
-    let result=job.result.as_ref()?;
-    let confirmed_failure=result.is_object()&&result["success"]!=true&&match result.get("status").and_then(Value::as_str) {
-        Some("failed"|"error"|"purchase_failed")=>true,
-        None=>result["success"]==false,
-        _=>false,
-    };
-    if !confirmed_failure{return None;}
-    if contains_known_order(result)||contains_unknown(result)||result["order_submitted"]==true||result["submitted"]==true{return None;}
+    let unstarted_cancel=job.status=="cancelled" && job.assignment==0 && job.task_id.is_none() && job.result.is_none()
+        && job.dispatched_at_ms.is_none() && job.started_at_ms.is_none()
+        && job.submit_started_at_ms.is_none() && job.order_confirmed_at_ms.is_none();
+    let confirmed_failure=job.status=="failed" && job.result.as_ref().is_some_and(|result| {
+        result.is_object() && result["success"]!=true && match result.get("status").and_then(Value::as_str) {
+            Some("failed"|"error"|"purchase_failed")=>true,
+            None=>result["success"]==false,
+            _=>false,
+        } && !contains_known_order(result) && !contains_unknown(result)
+            && result["order_submitted"]!=true && result["submitted"]!=true
+    });
+    if !unstarted_cancel && !confirmed_failure {return None;}
     let checked=target["checked_at_ms"].as_u64()?;
     let previous_positive=job.stock_detected_at_ms.unwrap_or(job.enqueued_at_ms).max(job.checked_at_ms);
     if checked<=previous_positive{return None;}
     Some(json!({"account_id":account,"task_id":job.task_id,"queue_job_id":job.id,"sequence":job.sequence,
         "sku":sku,"quantity":quantity,"store_id":store,"checked_at_ms":checked,"order_submitted":false,
-        "status":"rearmed","reason":"fresh_unavailable_after_unsubmitted_failure",
-        "message":"原失败记录已保留；确认新无货后，等待下一补货周期的新有货信号。"}))
+        "status":"rearmed","reason":if unstarted_cancel {"fresh_unavailable_after_unstarted_cancel"} else {"fresh_unavailable_after_unsubmitted_failure"},
+        "message":if unstarted_cancel {"原取消记录已保留；确认新无货后，等待下一补货周期的新有货信号。"} else {"原失败记录已保留；确认新无货后，等待下一补货周期的新有货信号。"}}))
 }
 
 impl Engine {
@@ -554,17 +567,14 @@ impl Engine {
             };
             let configured_stores=base["stores"].as_array().unwrap();
             let authorized:Vec<Value>=configured_stores.iter().filter(|store|rows.iter().any(|row|row["auto_purchase"]==true&&row["store_id"]==store["store_id"])).cloned().collect();
-            let mut execution=None;let mut conflict=None;
+            let mut conflicts=HashMap::new();
             for store in &authorized {
                 let matches:Vec<_>=rows.iter().filter(|row|row["auto_purchase"]==true&&row["store_id"]==store["store_id"]).collect();
-                if matches.len()!=1 {conflict=Some("同一候选门店存在重复监控目标，请先合并，未自动扩大购买".to_owned());break}
+                let store_id=store["store_id"].as_str().unwrap().to_owned();
+                if matches.len()!=1 {conflicts.insert(store_id,"同一候选门店存在重复监控目标，请先合并，未自动扩大购买".to_owned());continue}
                 match (pickup_concurrency(matches[0]),purchase_retry_count(matches[0])) {
-                    (Ok(_concurrency),Ok(retry))=>{
-                        let value=retry;
-                        if execution.is_some_and(|previous|previous!=value) {conflict=Some("同一购买意图的失败重试次数不一致，请统一配置后再执行".into());break}
-                        execution=Some(value);
-                    },
-                    (Err(error),_)|(_,Err(error))=>{conflict=Some(error);break},
+                    (Ok(_concurrency),Ok(_retry))=>{},
+                    (Err(error),_)|(_,Err(error))=>{conflicts.insert(store_id,error);},
                 }
             }
             if queue.priority_migrated.insert(key.clone()) {
@@ -617,7 +627,7 @@ impl Engine {
                 row["_queue_authorized_stores"]=json!([store["store_id"].clone()]);
                 let mut policy=group.policy.clone();policy["stores"]=json!([store.clone()]);row["pickup_policy"]=policy;
                 if group.status!="active" {row["auto_purchase"]=json!(false);}
-                if let Some(message)=&conflict {row["_queue_reject"]=json!(message);}
+                if let Some(message)=conflicts.get(store["store_id"].as_str().unwrap()) {row["_queue_reject"]=json!(message);}
                 output.push(row);
             }
         }
@@ -655,16 +665,42 @@ impl Engine {
     pub(super) fn queue_inventory_settings_changed(&self,config:Option<&Value>,targets_changed:bool) {
         if !targets_changed {return;}
         let mut queue=self.purchase_queue.lock().unwrap();
-        if let Some(targets)=config.and_then(|config|config["targets"].as_array()) {
+        let targets=config.and_then(|config|config["targets"].as_array());
+        let mut changed_groups=HashSet::new();
+        if let Some(targets)=targets {
             for (key,group) in &mut queue.purchase_groups {
                 let authorized=targets.iter().any(|target|target["auto_purchase"]==true&&target_key(target).is_ok_and(|(account,sku,store,quantity)|
                     priority_key(&account,&sku,quantity)==*key&&group.policy["stores"].as_array().unwrap().iter().any(|allowed|allowed["store_id"]==store)));
                 // Preserve the explicit disabled edge even if re-enabled before
                 // monitoring resumes. A normal save must never rearm a goal.
                 if !authorized {group.authorization_active=false;}
+                let current=key.split('|').nth(1).filter(|account|Uuid::parse_str(account).is_ok())
+                    .and_then(|account|read_account_priority(&self.root,account).ok().flatten());
+                let current_ids:Option<Vec<String>>=current.map(|policy| {
+                    let mut ids:Vec<_>=policy["stores"].as_array().into_iter().flatten().filter_map(|store| {
+                        targets.iter().any(|row|row["auto_purchase"]==true&&target_key(row).is_ok_and(|(account,sku,id,quantity)|
+                            priority_key(&account,&sku,quantity)==*key&&store["store_id"]==id))
+                            .then(||store["store_id"].as_str().unwrap().to_owned())
+                    }).collect();ids.sort();ids
+                });
+                if current_ids.as_ref()!=Some(&policy_store_ids(&group.policy)) {changed_groups.insert(group.id.clone());}
             }
         }
-        for job in queue.jobs.iter_mut().filter(|job|job.pending()) {job.wait_for_confirmation("监控配置已变更，保留排队位置，等待当前授权目标的新库存确认");}
+        for job in queue.jobs.iter_mut().filter(|job|job.pending()) {
+            let unchanged=targets.is_some_and(|targets| {
+                let matches:Vec<_>=targets.iter().filter(|row|!job.target_id.is_empty()&&row["id"].as_str()==Some(job.target_id.as_str())).collect();
+                if matches.len()!=1 || job.purchase_group_id.as_ref().is_some_and(|id|changed_groups.contains(id)) {return false;}
+                let row=matches[0];
+                row["auto_purchase"]==true && target_key(row).is_ok_and(|(account,sku,store,quantity)|
+                    account==job.account_id&&canonical_sku(&sku)==canonical_sku(&job.sku)&&store==job.store_id&&quantity==job.quantity)
+                    && targets.iter().filter(|other|other["auto_purchase"]==true&&target_key(other).is_ok_and(|(account,sku,store,_)|
+                        account==job.account_id&&canonical_sku(&sku)==canonical_sku(&job.sku)&&store==job.store_id)).count()==1
+                    && purchase_retry_count(row).ok()==Some(job.retry_count)
+                    && pickup_concurrency(row).ok()==Some(job.requested_concurrency.unwrap_or(job.concurrency))
+                    && row["location"].as_str().unwrap_or("").trim()==job.location.trim()
+            });
+            if !unchanged {job.wait_for_confirmation("本目标购买配置已变更，保留排队位置，等待当前授权目标的新库存确认");}
+        }
         if queue.save(&self.root).is_err(){queue.paused=true;}
     }
 
@@ -742,6 +778,8 @@ impl Engine {
         // A monitor result refreshes authorization, not an already accepted signal.
         // Missing targets invalidate authorization after the complete snapshot is read.
         let targets=self.policy_inventory_targets(&mut queue,targets,current);
+        let rejected_groups:HashSet<_>=targets.iter().filter(|target|target["_queue_reject"].is_string()).filter_map(|target|
+            target_key(target).ok().map(|(account,sku,_,quantity)|priority_key(&account,&sku,quantity))).collect();
         let mut observed=HashSet::new();
         for target in &targets {
             let (account,sku,store,quantity)=match target_key(target) {Ok(value)=>value,Err(message)=>{
@@ -751,22 +789,6 @@ impl Engine {
             let fresh=sample_eligible(target,current,true);
             observed.insert((key.clone(),quantity));
             let stock=target["status"].as_str().unwrap_or("unknown");
-            for job in queue.jobs.iter_mut().filter(|job|job.episode_key==key && job.quantity==quantity && job.pending()) {
-                job.stock_status=stock.into();
-                job.authorization_confirmed=target["auto_purchase"]==true;
-                job.authorized_stores=target["_queue_authorized_stores"].as_array().map(|rows|rows.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
-                if let Some(policy)=target.get("pickup_policy") {
-                    job.pickup_policy=Some(policy.clone());
-                    job.store_id=store.clone();job.store_name=target["store_name"].as_str().unwrap_or("").into();job.location=target["location"].as_str().unwrap_or("").into();
-                }
-                if !job.authorization_confirmed {
-                    job.wait_for_confirmation("监控授权已关闭，保留排队位置，等待授权与库存恢复");
-                } else {
-                    if fresh && stock=="available" {job.signal_confirmed=true;job.checked_at_ms=target["checked_at_ms"].as_u64().unwrap_or(0);}
-                    if job.signal_confirmed {job.status="queued".into();job.message="已收到有货信号，等待按发现顺序执行".into();}
-                    else {job.status="waiting_stock".into();job.message="等待当前授权目标的新有货信号".into();}
-                }
-            }
             if let Some(message)=target["_queue_reject"].as_str() {
                 for job in queue.jobs.iter_mut().filter(|job|job.episode_key==key&&job.pending()) {
                     job.wait_for_confirmation(message);
@@ -778,12 +800,41 @@ impl Engine {
                 queue.policy_rejections.insert(error_key,PolicyRejection {account_id:account.clone(),sku:canonical_sku(&sku),quantity,message:message.into(),checked_at_ms:current});
                 outcomes.push(json!({"target_id":target["id"],"status":"blocked","message":message}));continue;
             }
-            queue.policy_rejections.remove(&priority_key(&account,&sku,quantity));
+            let (concurrency,retries)=match pickup_concurrency(target).and_then(|concurrency|
+                purchase_retry_count(target).map(|retries|(concurrency,retries))) {
+                Ok(execution)=>execution,
+                Err(message)=>{
+                    for job in queue.jobs.iter_mut().filter(|job|job.episode_key==key&&job.pending()) {job.wait_for_confirmation(&message);}
+                    outcomes.push(json!({"target_id":target["id"],"status":"blocked","message":message}));continue;
+                },
+            };
+            for job in queue.jobs.iter_mut().filter(|job|job.episode_key==key && job.quantity==quantity && job.pending()) {
+                job.stock_status=stock.into();
+                job.authorization_confirmed=target["auto_purchase"]==true;
+                job.authorized_stores=target["_queue_authorized_stores"].as_array().map(|rows|rows.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+                if let Some(policy)=target.get("pickup_policy") {
+                    job.pickup_policy=Some(policy.clone());
+                    job.store_id=store.clone();job.store_name=target["store_name"].as_str().unwrap_or("").into();job.location=target["location"].as_str().unwrap_or("").into();
+                }
+                if !job.authorization_confirmed {
+                    job.wait_for_confirmation("监控授权已关闭，保留排队位置，等待授权与库存恢复");
+                } else {
+                    if fresh && stock=="available" {
+                        job.retry_count=retries;job.concurrency=1;job.requested_concurrency=(concurrency>1).then_some(concurrency);
+                        job.target_id=target["id"].as_str().unwrap_or("").chars().take(100).collect();
+                        job.signal_confirmed=true;job.checked_at_ms=target["checked_at_ms"].as_u64().unwrap_or(0);
+                    }
+                    if job.signal_confirmed {job.status="queued".into();job.message="已收到有货信号，等待按发现顺序执行".into();}
+                    else {job.status="waiting_stock".into();job.message="等待当前授权目标的新有货信号".into();}
+                }
+            }
+            let rejection_key=priority_key(&account,&sku,quantity);
+            if !rejected_groups.contains(&rejection_key) {queue.policy_rejections.remove(&rejection_key);}
             if fresh && stock=="unavailable" {
                 // A waiting intent already owns this episode; rearm only after
                 // terminal work, never create a replacement for a retained job.
                 if target["_queue_purchase_group_id"].is_null() && !queue.jobs.iter().any(|job|job.episode_key==key&&job.pending()) {queue.episodes.remove(&key);}
-                else if let Some(context)=failed_priority_episode_rearm(&queue,&key,target) {
+                else if let Some(context)=terminal_priority_episode_rearm(&queue,&key,target) {
                     let first=queue.episodes.remove(&key).is_some();
                     let checked=target["checked_at_ms"].as_u64().unwrap();
                     let watermark=queue.rearmed_after_ms.entry(key.clone()).or_default();*watermark=(*watermark).max(checked);
@@ -805,8 +856,6 @@ impl Engine {
             if queue.rearmed_after_ms.get(&key).is_some_and(|after|target["checked_at_ms"].as_u64().unwrap_or(0)<=*after) {
                 outcomes.push(json!({"target_id":target["id"],"status":"waiting_stock","message":"等待晚于本次无货确认的新有货信号"}));continue;
             }
-            let concurrency=match pickup_concurrency(target) {Ok(value)=>value,Err(message)=>{outcomes.push(json!({"target_id":target["id"],"status":"blocked","message":message}));continue}};
-            let retries=match purchase_retry_count(target) {Ok(value)=>value,Err(message)=>{outcomes.push(json!({"target_id":target["id"],"status":"blocked","message":message}));continue}};
             if queue.jobs.iter().filter(|job|!job.terminal()).count()>=CAPACITY {
                 outcomes.push(json!({"target_id":target["id"],"status":"capacity_full","message":"下单队列已满，本轮未入队，下一轮有货时再尝试"}));continue;
             }
@@ -887,6 +936,7 @@ impl Engine {
         for task in tasks.values().filter(|task|task.account_id==account) {
             if coordinator.is_some_and(|current|current.task_id==task.id) {continue}
             if task_has_unknown_submission(task) {return Some("该账号存在未知订单提交，队列停止自动分配".into())}
+            if future_scheduled_purchase(task) {continue}
             if !terminal(&task.status) {
                 if waiting_preparation(task) {
                     // Automatic preheat may be released on a mismatch. A manual
@@ -904,8 +954,6 @@ impl Engine {
                 }
                 return Some("账号正在登录、执行手动或定时任务，队列等待其结束".into())
             }
-            if task.order_submitted && (task.result.as_ref().is_none_or(contains_unknown)) {return Some("该账号存在未知订单提交，队列停止自动分配".into())}
-            if task.queue_job_ids.is_empty() && unresolved_submission(task,&tasks) {return Some("该账号有待核实订单，请查询官网确认后继续队列".into())}
         }
         if coordinator.is_none() && !preparation_allows_lock && self.locks.lock().unwrap().get(account).is_some_and(|lock|lock.available_permits()==0) {return Some("账号正在收尾，队列等待释放".into())}
         None
@@ -1171,6 +1219,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_configuration_change_preserves_other_store_and_account_signals() {
+        for pool in [false,true] {
+            let (root,engine,host,account)=fixture();
+            let other=engine.add_account("other-fixture@example.test".into()).unwrap().id;
+            if pool {save_policy(root.path(),&account,priority(&["R001","R002"]));save_policy(root.path(),&other,priority(&["R003"]));}
+            let a=target(&account,"R001",now_ms());let mut b=target(&account,"R002",now_ms());let c=target(&other,"R003",now_ms());
+            observe(&engine,&host,vec![a.clone(),b.clone(),c.clone()]);let before=jobs(&engine);
+            b["retry_count"]=json!(2);
+            engine.queue_inventory_settings_changed(Some(&json!({"targets":[a,b,c]})),true);
+            let after=jobs(&engine);
+            for store in ["R001","R003"] {
+                assert_eq!(serde_json::to_value(after.iter().find(|job|job.store_id==store).unwrap()).unwrap(),
+                    serde_json::to_value(before.iter().find(|job|job.store_id==store).unwrap()).unwrap());
+            }
+            assert!(!after.iter().find(|job|job.store_id=="R002").unwrap().eligible());
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_priority_scope_does_not_invalidate_another_purchase_group() {
+        for pool in [false,true] {
+            let (root,engine,host,account)=fixture();let other=engine.add_account("other-fixture@example.test".into()).unwrap().id;
+            if pool {save_policy(root.path(),&account,priority(&["R001","R002"]));save_policy(root.path(),&other,priority(&["R003"]));}
+            let a=target(&account,"R001",now_ms());let b=target(&account,"R002",now_ms());let c=target(&other,"R003",now_ms());
+            observe(&engine,&host,vec![a.clone(),b,c.clone()]);let before=jobs(&engine);
+            engine.queue_inventory_settings_changed(Some(&json!({"targets":[a,c]})),true);let after=jobs(&engine);
+            assert_eq!(after.iter().find(|job|job.store_id=="R001").unwrap().eligible(),!pool);
+            assert!(!after.iter().find(|job|job.store_id=="R002").unwrap().eligible());
+            assert_eq!(serde_json::to_value(after.iter().find(|job|job.store_id=="R003").unwrap()).unwrap(),
+                serde_json::to_value(before.iter().find(|job|job.store_id=="R003").unwrap()).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_or_ambiguous_target_configuration_invalidates_only_its_purchase() {
+        for change in ["disabled","removed","id","account","sku","quantity","store","location","retry","concurrency","duplicate_id","duplicate_store"] {
+            let (_root,engine,host,account)=fixture();let mut a=target(&account,"R001",now_ms());let b=target(&account,"R002",now_ms());
+            observe(&engine,&host,vec![a.clone(),b.clone()]);let before=jobs(&engine);let mut extras=vec![];
+            match change {
+                "disabled"=>a["auto_purchase"]=json!(false),
+                "removed"=>{},
+                "id"=>a["id"]=json!("new-target"),
+                "account"=>a["account_id"]=json!(Uuid::new_v4().to_string()),
+                "sku"=>a["sku"]=json!("MK2P4CH"),
+                "quantity"=>a["quantity"]=json!(2),
+                "store"=>a["store_id"]=json!("R004"),
+                "location"=>a["location"]=json!("210000"),
+                "retry"=>a["retry_count"]=json!(11),
+                "concurrency"=>a["concurrency"]=json!(11),
+                "duplicate_id"=>extras.push(a.clone()),
+                "duplicate_store"=>{let mut duplicate=a.clone();duplicate["id"]=json!("duplicate-target");extras.push(duplicate);},
+                _=>unreachable!(),
+            }
+            let mut targets=vec![b];if change!="removed" {targets.push(a);}targets.extend(extras);
+            engine.queue_inventory_settings_changed(Some(&json!({"targets":targets})),true);let after=jobs(&engine);
+            assert!(!after[0].eligible(),"{change}");
+            assert_eq!(serde_json::to_value(&after[1]).unwrap(),serde_json::to_value(&before[1]).unwrap(),"{change}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_retry_authorization_requires_new_stock_then_uses_current_parameters() {
+        for (previous,next) in [(2,0),(0,2)] {
+            let (_root,engine,host,account)=fixture();let mut signal=target(&account,"R001",now_ms());
+            signal["retry_count"]=json!(previous);signal["concurrency"]=json!(3);
+            observe(&engine,&host,vec![signal.clone()]);let before=jobs(&engine)[0].clone();
+            signal["retry_count"]=json!(next);signal["concurrency"]=json!(1);
+            engine.queue_inventory_settings_changed(Some(&json!({"targets":[signal.clone()]})),true);
+            assert!(!jobs(&engine)[0].eligible());assert_eq!(jobs(&engine)[0].retry_count,previous);
+            let mut waiting=signal.clone();waiting["status"]=json!("unknown");waiting["checked_at_ms"]=Value::Null;
+            observe(&engine,&host,vec![waiting]);assert!(!jobs(&engine)[0].eligible());
+            signal["checked_at_ms"]=json!(now_ms());observe(&engine,&host,vec![signal.clone()]);let after=jobs(&engine)[0].clone();
+            assert!(after.eligible());assert_eq!(after.retry_count,next);assert_eq!(after.payload()["requested_concurrency"],1);
+            assert_eq!((after.id,after.sequence,after.assignment),(before.id,before.sequence,before.assignment));
+            signal["retry_count"]=json!(11);
+            engine.queue_inventory_settings_changed(Some(&json!({"targets":[signal.clone()]})),true);
+            observe(&engine,&host,vec![signal]);assert!(!jobs(&engine)[0].eligible());
+        }
+    }
+
+    #[tokio::test]
     async fn scheduled_monitor_pause_keeps_accepted_jobs_authorized_and_executable() {
         for priority_pool in [false,true] {
             let (root,engine,host,account)=fixture();
@@ -1244,17 +1373,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn priority_conflicts_are_visible_and_never_reserve_or_expand_execution() {
-        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
-        for field in ["retry_count"] {
-            let a=target(&account,"R001",now_ms());let mut b=target(&account,"R002",now_ms());b[field]=json!(2);
-            let outcomes=observe(&engine,&host,vec![a,b]);assert_eq!(outcomes[0]["status"],"blocked");
-            assert!(jobs(&engine).is_empty());let state=engine.queue_command(host.clone(),"status",&json!({})).unwrap();
-            assert_eq!(state["policy_errors"].as_array().unwrap().len(),1);assert!(state["policy_errors"][0]["message"].as_str().unwrap().contains("不一致"));
+    async fn priority_stores_keep_independent_retry_counts_and_known_order_ends_the_group() {
+        for first_succeeds in [true,false] {
+            let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
+            let a=target(&account,"R001",now_ms());let mut b=target(&account,"R002",now_ms());b["retry_count"]=json!(2);
+            let outcomes=observe(&engine,&host,vec![a,b]);assert!(outcomes.iter().all(|outcome|outcome["status"]=="queued"));
+            let all=jobs(&engine);assert_eq!(all.len(),2);assert_eq!(all[0].retry_count,0);assert_eq!(all[1].retry_count,2);
+            assert_eq!(all[0].payload()["retry_count"],0);assert_eq!(all[1].payload()["retry_count"],2);
+            assert_eq!(all[0].purchase_group_id,all[1].purchase_group_id);
+            engine.queue_pump_once();let first=jobs(&engine)[0].clone();assert!(first.inflight());ready(&engine,&first);
+            let success=json!({"success":false,"status":"verification_required","order_submitted":true,"order_number":"W123456","message":"payment needs verification"});
+            if first_succeeds {
+                ack(&engine,&first,"queue_finished",success);
+                assert_eq!(jobs(&engine)[1].status,"cancelled");
+            } else {
+                ack(&engine,&first,"queue_finished",json!({"success":false,"status":"failed","order_submitted":false}));
+                engine.queue_pump_once();let second=jobs(&engine)[1].clone();assert!(second.inflight());assert_eq!(second.payload()["retry_count"],2);
+                ack(&engine,&second,"queue_finished",success);
+            }
+            assert!(engine.purchase_queue.lock().unwrap().blocked_accounts.is_empty());
+            assert_eq!(engine.purchase_queue.lock().unwrap().purchase_groups.values().next().unwrap().status,"succeeded");
         }
-        observe(&engine,&host,vec![target(&account,"R001",now_ms()),target(&account,"R002",now_ms())]);
-        assert_eq!(jobs(&engine)[0].concurrency,1);assert_eq!(jobs(&engine)[0].retry_count,0);
-        assert!(engine.queue_command(host.clone(),"status",&json!({})).unwrap()["policy_errors"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_priority_store_configuration_does_not_block_a_valid_store() {
+        for change in ["retry","concurrency","duplicate"] {
+            let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
+            let mut a=target(&account,"R001",now_ms());let b=target(&account,"R002",now_ms());let mut rows=vec![];
+            match change {
+                "retry"=>a["retry_count"]=json!(11),
+                "concurrency"=>a["concurrency"]=json!(11),
+                "duplicate"=>{let mut other=a.clone();other["id"]=json!("duplicate-target");rows.push(other);},
+                _=>unreachable!(),
+            }
+            rows.extend([a,b]);let outcomes=observe(&engine,&host,rows);let queued=jobs(&engine);
+            assert!(outcomes.iter().any(|outcome|outcome["status"]=="blocked"),"{change}");
+            assert_eq!(queued.len(),1,"{change}");assert_eq!(queued[0].store_id,"R002");assert!(queued[0].eligible());
+            assert_eq!(engine.queue_command(host.clone(),"status",&json!({})).unwrap()["policy_errors"].as_array().unwrap().len(),1);
+        }
+    }
+
+    #[test]
+    fn payment_verification_needs_its_own_order_instead_of_a_sibling_order() {
+        for known in [json!({"order_number":"W123456"}),json!({"result":{"order_number":"W123456"}})] {
+            let mut result=known;result["status"]=json!("verification_required");result["order_submitted"]=json!(true);
+            assert!(!contains_unknown(&result));
+        }
+        for unknown in [json!({"order_number":"invalid"}),
+            json!({"attempts":[{"status":"pending_payment","order_number":"W123456"}]}),
+            json!({"order_number":"W123456","attempts":[{"status":"submission_unknown","order_submitted":true}]})] {
+            let mut result=unknown;result["status"]=json!("verification_required");result["order_submitted"]=json!(true);
+            assert!(contains_unknown(&result));
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_stores_normalize_old_parallelism_without_expanding_execution() {
         let (root,other,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
         let mut a=target(&account,"R001",now_ms());let mut b=target(&account,"R002",now_ms());a["concurrency"]=json!(3);b["concurrency"]=json!(5);
         observe(&other,&host,vec![a,b]);let accepted=jobs(&other);assert_eq!(accepted.len(),2);
@@ -1262,13 +1437,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn priority_execution_conflict_still_blocks_an_accepted_signal_during_negative_stock() {
+    async fn priority_different_retry_counts_do_not_revoke_an_accepted_signal_on_negative_stock() {
         let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
         observe(&engine,&host,vec![target(&account,"R001",now_ms()),target(&account,"R002",now_ms())]);
         let a=negative(target(&account,"R001",now_ms()));let mut b=negative(target(&account,"R002",now_ms()));b["retry_count"]=json!(2);
-        let outcomes=observe(&engine,&host,vec![a,b]);assert_eq!(outcomes[0]["status"],"blocked");
-        engine.queue_pump_once();assert!(engine.snapshot().tasks.is_empty());assert!(!jobs(&engine)[0].eligible());
-        assert!(jobs(&engine)[0].message.contains("不一致"));
+        observe(&engine,&host,vec![a,b]);
+        engine.queue_pump_once();assert!(jobs(&engine)[0].inflight());
     }
 
     #[tokio::test]
@@ -1449,6 +1623,79 @@ mod tests {
         assert_eq!(serde_json::to_value(&renewed[0]).unwrap(),original);
         assert!(renewed.iter().all(|job|job.store_id=="R493"));assert_eq!(renewed[1].authorized_stores,vec!["R493"]);
         observe(&engine,&host,vec![target(&account,"R493",at+900)]);assert_eq!(jobs(&engine).len(),2);
+    }
+
+    #[tokio::test]
+    async fn priority_single_cancelled_unstarted_job_rearms_for_a_later_new_stock_cycle() {
+        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R643"]));
+        let at=now_ms()-4000;observe(&engine,&host,vec![target(&account,"R643",at)]);
+        let original=jobs(&engine)[0].clone();let key=original.episode_key.clone();
+        engine.queue_command(host.clone(),"cancel",&json!({"job_id":original.id})).unwrap();
+        let cancelled=serde_json::to_value(&jobs(&engine)[0]).unwrap();
+        assert_eq!(cancelled["status"],"cancelled");assert_eq!(cancelled["assignment"],0);
+        observe(&engine,&host,vec![target(&account,"R643",at+100)]);
+        let mut unknown=target(&account,"R643",at+200);unknown["status"]=json!("unknown");
+        observe(&engine,&host,vec![unknown]);
+        observe(&engine,&host,vec![negative(target(&account,"R643",at))]);
+        observe(&engine,&host,vec![negative(target(&account,"R643",now_ms()-20_000))]);
+        assert_eq!(jobs(&engine).len(),1);assert_eq!(engine.purchase_queue.lock().unwrap().episodes.get(&key),Some(&original.id));
+        observe(&engine,&host,vec![negative(target(&account,"R643",at+500))]);
+        {let queue=engine.purchase_queue.lock().unwrap();assert!(!queue.episodes.contains_key(&key));assert_eq!(queue.rearmed_after_ms[&key],at+500);}
+        let persisted=QueueState::load(root.path(),&HashMap::new()).unwrap();
+        assert!(!persisted.episodes.contains_key(&key));assert_eq!(persisted.rearmed_after_ms[&key],at+500);
+        assert_eq!(serde_json::to_value(&persisted.jobs[0]).unwrap(),cancelled);
+        observe(&engine,&host,vec![target(&account,"R643",at+500)]);assert_eq!(jobs(&engine).len(),1);
+        let outcome=observe(&engine,&host,vec![target(&account,"R643",at+800)]);assert_eq!(outcome[0]["status"],"queued");
+        let after=jobs(&engine);assert_eq!(after.len(),2);assert_eq!(serde_json::to_value(&after[0]).unwrap(),cancelled);
+        assert_ne!(after[1].id,original.id);assert!(after[1].sequence>original.sequence);
+        assert_eq!(after[1].purchase_group_id,original.purchase_group_id);assert_eq!(after[1].store_id,"R643");
+        observe(&engine,&host,vec![target(&account,"R643",at+900)]);assert_eq!(jobs(&engine).len(),2);
+    }
+
+    #[tokio::test]
+    async fn priority_single_cancel_rearm_requires_undispatched_and_active_authorization() {
+        for case in ["assignment","task","dispatched","started","submitted_at","confirmed_at","submitted","result_missing_evidence",
+            "result_known","result_unknown","other_pending","group_success","group_unknown","group_cancelled","revoked"] {
+            let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R643"]));
+            let at=now_ms()-2000;observe(&engine,&host,vec![target(&account,"R643",at)]);
+            let old=jobs(&engine)[0].clone();engine.queue_command(host.clone(),"cancel",&json!({"job_id":old.id})).unwrap();
+            {
+                let mut queue=engine.purchase_queue.lock().unwrap();let job=&mut queue.jobs[0];
+                match case {
+                    "assignment"=>job.assignment=1,
+                    "task"=>job.task_id=Some("old-task".into()),
+                    "dispatched"=>job.dispatched_at_ms=Some(at+1),
+                    "started"=>job.started_at_ms=Some(at+1),
+                    "submitted_at"=>job.submit_started_at_ms=Some(at+1),
+                    "confirmed_at"=>job.order_confirmed_at_ms=Some(at+1),
+                    "submitted"=>job.order_submitted=true,
+                    "result_missing_evidence"=>job.result=Some(json!({"status":"cancelled"})),
+                    "result_known"=>job.result=Some(json!({"status":"cancelled","order_number":"W123"})),
+                    "result_unknown"=>job.result=Some(json!({"status":"submission_unknown"})),
+                    _=>{},
+                }
+                if case.starts_with("group_"){queue.purchase_groups.values_mut().next().unwrap().status=match case {"group_success"=>"succeeded","group_unknown"=>"submission_unknown",_=>"cancelled"}.into();}
+                if case=="other_pending" {let mut pending=queue.jobs[0].clone();pending.id=Uuid::new_v4().to_string();pending.status="queued".into();pending.sequence=2;queue.jobs.push(pending);queue.next_sequence=2;}
+            }
+            let count=jobs(&engine).len();let key=old.episode_key.clone();let mut unavailable=negative(target(&account,"R643",at+1000));
+            if case=="revoked" {unavailable["auto_purchase"]=json!(false);}
+            observe(&engine,&host,vec![unavailable]);
+            let queue=engine.purchase_queue.lock().unwrap();assert_eq!(queue.episodes.get(&key),Some(&old.id),"{case}");assert!(!queue.rearmed_after_ms.contains_key(&key),"{case}");drop(queue);
+            if case!="revoked" {observe(&engine,&host,vec![target(&account,"R643",at+1500)]);assert_eq!(jobs(&engine).len(),count,"{case}");}
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_cancel_all_remains_cancelled_across_later_stock_cycles() {
+        let (root,engine,host,account)=fixture();save_policy(root.path(),&account,priority(&["R643"]));
+        let at=now_ms()-2000;observe(&engine,&host,vec![target(&account,"R643",at)]);
+        let original=jobs(&engine)[0].clone();engine.queue_command(host.clone(),"cancel",&json!({"all":true})).unwrap();
+        engine.queue_command(host.clone(),"resume",&json!({})).unwrap();
+        observe(&engine,&host,vec![negative(target(&account,"R643",at+500))]);
+        observe(&engine,&host,vec![target(&account,"R643",at+1000)]);engine.queue_pump_once();
+        let after=jobs(&engine);assert_eq!(after.len(),1);assert_eq!(after[0].id,original.id);
+        assert_eq!(after[0].status,"cancelled");assert_eq!(after[0].assignment,0);assert!(after[0].task_id.is_none());
+        assert!(engine.purchase_queue.lock().unwrap().purchase_groups.values().all(|group|group.status=="cancelled"));
     }
 
     #[tokio::test]
@@ -2231,9 +2478,11 @@ mod tests {
 
     #[test]
     fn aggregate_submission_requires_order_evidence_and_never_masks_unknown_children() {
-        for status in ["submission_unknown","unknown_submission","payment_unknown","verification_required"] {
+        for status in ["submission_unknown","unknown_submission","payment_unknown"] {
             assert!(contains_unknown(&json!({"status":status,"order_number":"KNOWN-001"})));
         }
+        assert!(!contains_unknown(&json!({"status":"verification_required","order_number":"W123456"})));
+        assert!(contains_unknown(&json!({"status":"verification_required"})));
         assert!(contains_unknown(&json!({"submitted":true,"status":"failed"})));
         assert!(contains_unknown(&json!({"submitted":true,"attempts":[{"status":"failed"}]})));
         assert!(contains_unknown(&json!({"order_submitted":true,"queue_jobs":[{"status":"failed"}],"pending_orders":[{}]})));
@@ -2333,32 +2582,47 @@ mod tests {
 
     #[tokio::test]
     async fn queue_claims_live_preparation_with_same_pid_and_exact_group_assignment_ack() {
-        queue_claims_preparation_for_account(false,false,false,false).await;
+        queue_claims_preparation_for_account(false,false,false,false,"none").await;
     }
 
     #[tokio::test]
     async fn pending_account_queue_claims_existing_preparation_without_changing_account_state() {
-        queue_claims_preparation_for_account(true,false,false,false).await;
+        queue_claims_preparation_for_account(true,false,false,false,"none").await;
     }
 
     #[tokio::test]
     async fn queue_claims_matching_manual_preparation_with_same_worker_and_assignment() {
-        queue_claims_preparation_for_account(true,true,false,false).await;
+        queue_claims_preparation_for_account(true,true,false,false,"none").await;
     }
 
     #[tokio::test]
     async fn queue_waits_for_different_manual_preparation_without_cancelling_or_assigning() {
-        queue_claims_preparation_for_account(false,true,true,false).await;
+        queue_claims_preparation_for_account(false,true,true,false,"none").await;
     }
 
     #[tokio::test]
     async fn unknown_prepared_result_never_releases_or_claims_the_owner_for_queue() {
         for manual in [false,true] {for pending in [false,true] {
-            queue_claims_preparation_for_account(pending,manual,false,true).await;
+            queue_claims_preparation_for_account(pending,manual,false,true,"none").await;
         }}
     }
 
-    async fn queue_claims_preparation_for_account(pending: bool,manual: bool,mismatch: bool,unknown: bool) {
+    #[tokio::test]
+    async fn known_manual_order_and_unconfirmed_cancellation_allow_queue_to_claim_prepared_worker() {
+        for manual in [false,true] {queue_claims_preparation_for_account(false,manual,false,false,"known").await;}
+    }
+
+    #[tokio::test]
+    async fn task_only_unknown_submission_still_blocks_queue_claim() {
+        queue_claims_preparation_for_account(false,false,false,false,"task_only_unknown").await;
+    }
+
+    #[tokio::test]
+    async fn future_scheduled_purchase_does_not_block_queue_claim_and_is_preserved() {
+        queue_claims_preparation_for_account(false,false,false,false,"future_schedule").await;
+    }
+
+    async fn queue_claims_preparation_for_account(pending: bool,manual: bool,mismatch: bool,unknown: bool,history: &str) {
         let project=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();let python=project.join(if cfg!(windows){".venv/Scripts/python.exe"}else{".venv/bin/python"});
         let (root,engine,_,account)=fixture();save_policy(root.path(),&account,priority(&["R001","R002"]));
         let script=root.path().join("prepared-queue-fixture.py");fs::write(&script,r#"import hashlib,json,pathlib,sys,time,os
@@ -2387,25 +2651,61 @@ emit('result',result=result)
         let pid=engine.tasks.lock().unwrap()[&prepared].prompt.as_ref().unwrap()["fixture_pid"].as_u64().unwrap();
         engine.accounts.lock().unwrap()[0].pending=pending;
         if unknown {engine.tasks.lock().unwrap().get_mut(&prepared).unwrap().result=Some(json!({"status":"submission_unknown"}));}
+        if matches!(history,"known"|"task_only_unknown") {
+            let mut tasks=engine.tasks.lock().unwrap();
+            let mut previous=tasks[&prepared].clone();previous.id="previous-purchase".into();previous.action="purchase".into();
+            previous.status="succeeded".into();previous.prompt=None;previous.order_submitted=true;previous.queue_job_ids.clear();
+            previous.result=Some(if history=="known" {json!({"success":true,"status":"pending_payment","order_number":"W00000001"})}
+                else {json!({"success":false,"status":"failed"})});
+            tasks.insert(previous.id.clone(),previous.clone());
+            if history=="known" {
+                let mut cancellation=previous;cancellation.id="previous-cancellation".into();cancellation.action="cancel_order".into();
+                cancellation.order_submitted=false;cancellation.result=Some(json!({"success":false,"status":"cancellation_unknown","order_number":"W00000001"}));
+                tasks.insert(cancellation.id.clone(),cancellation);
+            }
+        }
+        let scheduled=if history=="future_schedule" {
+            let at=now_ms()+60_000;
+            let id=engine.start(host.clone(),account.clone(),"purchase".into(),json!({"sku":"MLH74FE/A","quantity":1,"fulfillment":"RETAIL","scheduled_at":at})).unwrap();
+            Some((id,at))
+        } else {None};
+        // A cancelled earlier job stays terminal while an independently
+        // authorized new target is dispatched to the same live worker.
+        if history=="known" {
+            let old=target(&account,"R002",now_ms());
+            observe(&engine,&host,vec![old]);let old=jobs(&engine)[0].clone();
+            engine.queue_command(host.clone(),"cancel",&json!({"job_id":old.id})).unwrap();
+            assert_eq!(jobs(&engine)[0].status,"cancelled");
+        }
         observe(&engine,&host,vec![target(&account,if mismatch {"R002"} else {"R001"},now_ms())]);
         assert!(!*engine.controls.lock().unwrap()[&prepared].cancel.borrow());engine.queue_pump_once();
-        if mismatch || unknown {
+        let index=if history=="known" {1}else{0};
+        if mismatch || unknown || history=="task_only_unknown" {
             for _ in 0..3 {engine.queue_pump_once();}
-            let job=jobs(&engine)[0].clone();assert!(job.pending());assert_eq!(job.assignment,0);assert!(job.task_id.is_none());
-            assert_eq!(job.message,if unknown {"该账号存在未知订单提交，队列停止自动分配"} else {"该账号存在不匹配的自提准备，队列等待其结束"});
+            let job=jobs(&engine)[index].clone();assert!(job.pending());assert_eq!(job.assignment,0);assert!(job.task_id.is_none());
+            assert_eq!(job.message,if unknown || history=="task_only_unknown" {"该账号存在未知订单提交，队列停止自动分配"} else {"该账号存在不匹配的自提准备，队列等待其结束"});
             assert!(!*engine.controls.lock().unwrap()[&prepared].cancel.borrow());
             assert_eq!(engine.tasks.lock().unwrap()[&prepared].prompt.as_ref().unwrap()["id"],"live-queue-lease");
             engine.cancel(&account,&prepared).unwrap();
             assert!(bridge_wait(||!engine.controls.lock().unwrap().contains_key(&prepared)).await);return;
         }
-        let assigned=jobs(&engine)[0].clone();assert_eq!(assigned.task_id.as_deref(),Some(prepared.as_str()));assert_eq!(assigned.assignment,1);
-        assert!(bridge_wait(||jobs(&engine)[0].status=="succeeded").await);
-        assert!(bridge_wait(||engine.controls.lock().unwrap().is_empty()).await);
+        let assigned=jobs(&engine)[index].clone();assert_eq!(assigned.task_id.as_deref(),Some(prepared.as_str()));assert_eq!(assigned.assignment,1);
+        assert!(bridge_wait(||jobs(&engine)[index].status=="succeeded").await);
+        assert!(bridge_wait(||!engine.controls.lock().unwrap().contains_key(&prepared)).await);
         let task=engine.tasks.lock().unwrap()[&prepared].clone();assert_eq!(task.result.as_ref().unwrap()["pid"],pid);
         assert_eq!(task.prepared_handoff.as_ref().unwrap()["queue_job_id"],assigned.id);
         assert_eq!(task.prepared_handoff.as_ref().unwrap()["purchase_group_id"],assigned.purchase_group_id.unwrap());
         assert_eq!(engine.accounts.lock().unwrap()[0].pending,pending);
-        let done=jobs(&engine)[0].clone();assert!(done.dispatched_at_ms.is_some());assert!(done.started_at_ms.is_some());assert!(done.submit_started_at_ms.is_some());assert!(done.order_confirmed_at_ms.is_some());
+        let done=jobs(&engine)[index].clone();assert!(done.dispatched_at_ms.is_some());assert!(done.started_at_ms.is_some());assert!(done.submit_started_at_ms.is_some());assert!(done.order_confirmed_at_ms.is_some());
+        if history=="known" {let cancelled=jobs(&engine)[0].clone();assert_eq!(cancelled.status,"cancelled");assert_eq!(cancelled.assignment,0);assert!(cancelled.task_id.is_none());}
+        if let Some((scheduled,at))=scheduled {
+            let tasks=engine.tasks.lock().unwrap();let task=&tasks[&scheduled];
+            assert_eq!(task.status,"scheduled");assert_eq!(task.schedule.as_ref().unwrap().at_ms,at);
+            assert!(task.schedule.as_ref().unwrap().triggered_at_ms.is_none());drop(tasks);
+            assert!(!*engine.controls.lock().unwrap()[&scheduled].cancel.borrow());
+            engine.cancel(&account,&scheduled).unwrap();
+            assert!(bridge_wait(||!engine.controls.lock().unwrap().contains_key(&scheduled)).await);
+        }
     }
 
     #[tokio::test]

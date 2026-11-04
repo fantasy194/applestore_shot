@@ -11,6 +11,13 @@ async function fixture(
     missingConfig?: boolean;
     resolvedUnknown?: boolean;
     prepared?: boolean;
+    orderEvidence?:
+      | "known"
+      | "summary_known"
+      | "summary_known_paid"
+      | "summary_mixed"
+      | "mixed"
+      | "invalid";
   } = {},
 ) {
   const calls: any[] = [];
@@ -64,6 +71,45 @@ async function fixture(
       : {}),
   };
   const tasks = [task];
+  if (options.orderEvidence) {
+    const known = {
+      status: "verification_required",
+      order_number:
+        options.orderEvidence === "invalid" ? "invalid" : "W12345678",
+      order_submitted: true,
+      success: false,
+    };
+    Object.assign(task, {
+      action: "purchase",
+      status:
+        options.orderEvidence === "summary_known_paid" ? "succeeded" : "failed",
+      ...(options.orderEvidence === "summary_known_paid"
+        ? { stage: "已完成" }
+        : {}),
+      order_submitted: true,
+      result: options.orderEvidence.startsWith("summary_")
+        ? {
+            status: "queue_complete",
+            purchase_attention: {
+              known_order_numbers: ["W12345678"],
+              unknown_order_numbers: [],
+              pending_order_numbers: [],
+              unknown_unidentified: options.orderEvidence === "summary_mixed",
+              pending_unidentified: false,
+            },
+          }
+        : options.orderEvidence === "mixed"
+          ? {
+              status: "queue_complete",
+              order_submitted: true,
+              queue_jobs: [known, { status: "submission_unknown" }],
+            }
+          : known,
+      ...(options.orderEvidence.startsWith("summary_")
+        ? { is_summary: true, detail_revision: "known-summary" }
+        : {}),
+    });
+  }
   if (options.prepared) {
     Object.assign(task, {
       action: "purchase",
@@ -243,7 +289,6 @@ for (const scenario of [
     status: "running",
     unknown: true,
   },
-  { label: "已存在定时抢购", scheduled: true },
 ]) {
   test(`${scenario.label}不会因购买优先而开放重复购买`, async ({ page }) => {
     const { calls } = await fixture(page, scenario);
@@ -262,6 +307,66 @@ for (const scenario of [
       page.getByRole("button", { name: "结算购物袋", exact: true }),
     ).toBeDisabled();
     expect(calls).toEqual([]);
+  });
+}
+
+test("未来定时不占用账号，即时购买和自提准备仍可开始", async ({ page }) => {
+  const { calls } = await fixture(page, { scheduled: true });
+  await expect(
+    page.getByRole("button", { name: "立即下单", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "立即下单（自提）", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "提前准备自提（不下单）", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "取消定时抢购", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "立即下单（自提）", exact: true })
+    .click();
+  await expect.poll(() => calls.length).toBe(1);
+  expect(calls[0].action).toBe("purchase");
+  expect(calls[0].params.fulfillment).toBe("RETAIL");
+  await page.getByRole("button", { name: "购物袋", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "结算购物袋", exact: true }),
+  ).toBeEnabled();
+});
+
+for (const orderEvidence of ["known", "summary_known"] as const) {
+  test(`${orderEvidence} 已知订单号不阻止新购买`, async ({ page }) => {
+    await fixture(page, { orderEvidence });
+    await expect(
+      page.getByRole("button", { name: "立即下单（自提）", exact: true }),
+    ).toBeEnabled();
+    await expect(
+      page.getByRole("region", { name: "下单进度" }).getByRole("status"),
+    ).toContainText(orderEvidence === "known" ? "付款信息待核实" : "下单失败");
+  });
+}
+
+test("已完成订单摘要不会误报付款信息待核实", async ({ page }) => {
+  await fixture(page, { orderEvidence: "summary_known_paid" });
+  await expect(
+    page.getByRole("button", { name: "立即下单（自提）", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("region", { name: "下单进度" }).getByRole("status"),
+  ).not.toContainText("付款信息待核实");
+});
+
+for (const orderEvidence of ["invalid", "mixed", "summary_mixed"] as const) {
+  test(`${orderEvidence} 未知提交仍阻止新购买`, async ({ page }) => {
+    await fixture(page, { orderEvidence });
+    await expect(
+      page.getByRole("button", { name: "立即下单（自提）", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page.getByRole("region", { name: "下单进度" }).getByRole("status"),
+    ).toContainText("提交结果待确认");
   });
 }
 

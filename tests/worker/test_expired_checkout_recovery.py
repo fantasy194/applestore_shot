@@ -112,6 +112,61 @@ class ExpiredCheckoutRecoveryTests(TestCase):
         self.assertEqual(sum('/shop/bag' in call.args[0] for call in flow.page.call_args_list), 1)
         add.assert_not_called()
 
+    def test_recovery_uses_the_current_dynamic_checkout_action(self):
+        actions = ('/shop/bagx/checkout_now',
+                   '/shop/bagx/checkout_now?_a=fixture&_m=shoppingCart.actions',
+                   'https://secure11.www.apple.com.cn/shop/bagx/renamed_checkout?fixture=1')
+        for action in actions:
+            flow = self.make_flow(lambda bag: bag['shoppingCart']['actions']['a']['checkout'].update(url=action))
+            original = flow.action.side_effect
+            observed = []
+            def operate(module, name, data=None):
+                if name == 'checkout':
+                    observed.append(shop.field(flow.model, 'shoppingCart.actions.a.checkout.url'))
+                return original(module, name, data)
+            flow.action.side_effect = operate
+            session = flow.session
+            with self.subTest(action=action):
+                self.assertTrue(self.recover(flow))
+                self.assertIs(flow.session, session)
+                self.assertEqual(observed, [action])
+                self.assertEqual(flow.initializations, 1)
+                self.assertEqual(flow.submissions, 0)
+
+    def test_real_action_posts_fresh_bag_checkout_once_using_original_session(self):
+        self.service.purchase_selection = self.expected[0]
+        session = requests.Session()
+        self.addCleanup(session.close)
+        flow = shop.Checkout(session)
+        flow.read_page(self.expired(), 'fixture expired')
+        action = '/shop/bagx/checkout_now?_a=fixture&_m=shoppingCart.actions'
+        bag = {'meta': {'h': {'x-aos-stk': 'fresh-bag-stk'}}, 'shoppingCart': {
+            'items': {'item-0': deepcopy(fixtures.PickupFlow().item)},
+            'actions': {'a': {'checkout': {'url': action}}}}}
+        calls = []
+        def request(current, stage, url, **kwargs):
+            calls.append((current, stage, url, kwargs))
+            if stage == '结算到期后核对当前购物袋':
+                return self.response('https://www.apple.com.cn/shop/bag', bag)
+            if stage == 'checkout':
+                self.assertEqual(url, 'https://www.apple.com.cn' + action)
+                self.assertEqual(kwargs['method'], 'POST')
+                self.assertEqual(kwargs['headers']['x-aos-stk'], 'fresh-bag-stk')
+                self.assertEqual(kwargs['data']['shoppingCart.items.item-0.itemQuantity.quantity'], '1')
+                response = self.response(url)
+                response._content = json.dumps({'head': {'status': '200'},
+                    'body': fixtures.fulfillment_model(mixed=False)}).encode()
+                return response
+            self.fail('unexpected network stage: ' + stage)
+        with patch.object(shop, 'request_get', side_effect=request), \
+                patch.object(shop, 'add_to_bag') as add:
+            self.assertTrue(self.recover(flow))
+        self.assertEqual([row[1] for row in calls], ['结算到期后核对当前购物袋', 'checkout'])
+        self.assertTrue(all(row[0] is session for row in calls))
+        self.assertEqual(shop.field(flow.current_response_body, 'checkout.d.page'), 'Fulfillment')
+        self.assertEqual(flow._expired_checkout_recovery_generation, 1)
+        add.assert_not_called()
+
     def test_unclaimed_renewal_only_initializes_then_waits_without_forms_or_submission(self):
         flow = self.make_flow()
         self.service.preparing = self.service.keep_prepared_pickup = True
@@ -126,7 +181,7 @@ class ExpiredCheckoutRecoveryTests(TestCase):
         continuation.assert_not_called()
 
     def test_extra_goods_wrong_quantity_missing_token_or_bad_action_prevent_post(self):
-        cases = ('sku', 'quantity', 'extra', 'token', 'action', 'port')
+        cases = ('sku', 'quantity', 'extra', 'token', 'host', 'scheme', 'credentials', 'port')
         for case in cases:
             def mutate(bag):
                 cart = bag['shoppingCart']
@@ -134,10 +189,28 @@ class ExpiredCheckoutRecoveryTests(TestCase):
                 elif case == 'quantity': cart['items']['item-0']['itemQuantity']['d']['quantity'] = 2
                 elif case == 'extra': cart['items']['item-1'] = deepcopy(cart['items']['item-0'])
                 elif case == 'token': bag['meta']['h'] = {}
-                elif case == 'action': cart['actions']['a']['checkout']['url'] = '/shop/checkoutx/review'
+                elif case == 'host': cart['actions']['a']['checkout']['url'] = 'https://www.apple.com.cn.evil.example/shop/checkoutx'
+                elif case == 'scheme': cart['actions']['a']['checkout']['url'] = 'http://www.apple.com.cn/shop/checkoutx'
+                elif case == 'credentials': cart['actions']['a']['checkout']['url'] = 'https://user@www.apple.com.cn/shop/checkoutx'
                 else: cart['actions']['a']['checkout']['url'] = 'https://www.apple.com.cn:8443/shop/checkoutx'
             flow = self.make_flow(mutate)
             with self.subTest(case=case), self.assertRaises(ValueError):
+                self.recover(flow)
+            self.assertEqual(flow.initializations, 0)
+
+    def test_recovery_rejects_action_or_token_not_from_current_bag_response(self):
+        for case in ('action', 'token'):
+            flow = self.make_flow(lambda bag: bag['shoppingCart']['actions']['a']['checkout'].update(
+                url='/shop/bagx/checkout_now'))
+            original = flow.page.side_effect
+            def page(*args, **kwargs):
+                original(*args, **kwargs)
+                if case == 'action':
+                    flow.model['shoppingCart']['actions']['a']['checkout']['url'] = '/shop/stale'
+                else:
+                    flow.headers['x-aos-stk'] = 'stale-token'
+            flow.page.side_effect = page
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, '未提供可核对的新结算操作'):
                 self.recover(flow)
             self.assertEqual(flow.initializations, 0)
 

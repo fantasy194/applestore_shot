@@ -228,6 +228,37 @@ class WorkerCancellationTests(unittest.TestCase):
                 self.assertEqual(events[0]['type'], 'cancelled')
                 self.assertIs(events[0]['order_submitted'], submitted)
 
+    def test_failed_or_cancelled_purchase_preserves_current_unverified_order_evidence(self):
+        import main
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled), tempfile.TemporaryDirectory() as directory:
+                account, task = str(uuid.uuid4()), str(uuid.uuid4())
+                task_dir=Path(directory)/'accounts'/account/'tasks'/task
+                task_dir.mkdir(parents=True)
+                (task_dir/'payment.json').write_text(json.dumps({
+                    'status':'verification_required','success':False,'order_number':'W12345678',
+                    'payment_url':'secret-fixture-link','qr_data':'secret-fixture-image'}))
+                request=dict(account_id=account,task_id=task,account='fixture@example.test',
+                             action='purchase',params={})
+                output=io.StringIO()
+                with patch.object(sys,'argv',['worker','--data-dir',directory,'--account-id',account,'--task-id',task]), \
+                        patch.object(sys,'stdin',io.StringIO(json.dumps(request)+'\n')), \
+                        patch.object(sys,'stdout',output),patch('main.threading.Thread'), \
+                        patch('service.Service') as factory:
+                    factory.return_value.submitted=True
+                    factory.return_value.task_dir=task_dir
+                    factory.return_value.run.side_effect=(Cancelled() if cancelled else ValueError('付款金额有待核对'))
+                    factory.return_value.should_remove_account.return_value=False
+                    main.main()
+                events=[json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual([event['type'] for event in events],['progress_result','cancelled' if cancelled else 'error'])
+                evidence=events[0]['result']
+                self.assertEqual(evidence['status'],'verification_required')
+                self.assertEqual(evidence['order_number'],'W12345678')
+                self.assertFalse(evidence['success'])
+                self.assertNotIn('secret-fixture',output.getvalue())
+                if not cancelled:self.assertIn('付款金额有待核对',events[-1]['message'])
+
 
 class AccountRemovalTests(unittest.TestCase):
     def test_forget_mode_only_deletes_the_requested_vault_entry(self):

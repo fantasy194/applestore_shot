@@ -174,6 +174,24 @@ class PreparedHandoffTests(unittest.TestCase):
         for call in [started[0],finished[0]]:
             self.assertEqual(call.kwargs['queue_assignment'],3);self.assertEqual(call.kwargs['purchase_group_id'],'group-one')
 
+    def test_queue_ack_preserves_unverified_payment_and_known_order_on_error(self):
+        self.source='queue'
+        self.service.wait_prepared_pickup(self.result,timeout=300)
+        self.service.submitted=True
+        (self.task/'payment.json').write_text(json.dumps({
+            'success':False,'status':'verification_required','order_number':'W12345678',
+            'payment_url':'secret-fixture-link','qr_data':'secret-fixture-image'}))
+        self.service.finish_prepared_handoff(error=ValueError('付款金额与结算金额不一致'))
+        finished=[call for call in self.channel.emit.call_args_list if call.args[0]=='queue_finished']
+        self.assertEqual(len(finished),1)
+        result=finished[0].kwargs['result']
+        self.assertEqual(result['status'],'verification_required')
+        self.assertFalse(result['success'])
+        self.assertTrue(result['order_submitted'])
+        self.assertEqual(result['order_number'],'W12345678')
+        self.assertEqual(result['message'],'付款金额与结算金额不一致')
+        self.assertNotIn('secret-fixture',json.dumps(result))
+
     def test_monotonic_durations_exclude_preparation_wait(self):
         self.service.wait_prepared_pickup(self.result,timeout=300)
         self.service._purchase_clocks={'execution':10,'handoff':10}

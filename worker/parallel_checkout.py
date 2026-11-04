@@ -107,6 +107,18 @@ def _pending(result):
             and ORDER_NUMBER.fullmatch(result['order_number']) is not None)
 
 
+def _unverified_order(result):
+    return (isinstance(result, dict) and result.get('status') == 'verification_required'
+            and result.get('success') is False and isinstance(result.get('order_number'), str)
+            and ORDER_NUMBER.fullmatch(result['order_number']) is not None)
+
+
+def _item_unverified(item):
+    return (item.get('_known_order_conflict') is not True
+            and item.get('_protocol_failure') is not True
+            and _unverified_order(item.get('result')))
+
+
 class _WindowsJob:
     """Closing the parent-owned handle kills workers if the parent crashes."""
     def __init__(self):
@@ -287,6 +299,23 @@ class PurchaseBatch:
                         else:
                             data.pop('qr_image', None)
                     _write(destination / 'payment.json', data)
+                elif _unverified_order(data) and not _pending(item.get('result')):
+                    previous = item.get('result')
+                    if _unverified_order(previous) and previous['order_number'] != data['order_number']:
+                        # Conflicting sources from the same child do not bind
+                        # an order to this submission.
+                        item['_known_order_conflict'] = True
+                        item['status'] = 'submission_unknown'
+                    elif (not isinstance(previous, dict) or previous.get('status') == 'purchase_retry'
+                            and not any(key in previous for key in ('result','attempts','jobs','queue_jobs','pending_orders'))):
+                        # Only the identity crosses into the aggregate. The
+                        # unverified payment itself stays private to this task.
+                        item['result'] = {'success':False,'status':'verification_required',
+                                          'order_number':data['order_number'],'order_submitted':True}
+                    item['order_submitted'] = True
+                    self.service.submitted = True
+                    if not item.get('_known_order_conflict'):
+                        _write(destination / 'payment.json', data)
         for name in ('order_submission.json', 'test_order_submission.json'):
             marker = source_root / name
             if marker.exists():
@@ -298,6 +327,7 @@ class PurchaseBatch:
         result = item.get('result')
         status = item['status']
         disk_status = ('succeeded' if status == 'pending_payment' else
+                       'failed' if status == 'verification_required' else
                        'interrupted' if status == 'submission_unknown' else
                        status if status in ('failed', 'cancelled') else 'running')
         _write(destination / 'task.json', {
@@ -498,6 +528,7 @@ class PurchaseBatch:
                     return
                 if item.get('_checkout_auth_granted') is True:
                     self._stop_attempt(item)
+                    item['_protocol_failure'] = True
                     item.update(status='failed', terminal=True, retryable=False,
                                 error='同一购买尝试不能重复申请结账认证。')
                     return
@@ -579,6 +610,7 @@ class PurchaseBatch:
         checkout_code = kind == 'code' and self._owns_authentication(item, prompt.get('checkout_auth_lease'))
         if kind == 'password' or kind == 'code' and not checkout_code:
             self._stop_attempt(item)
+            item['_protocol_failure'] = True
             item.update(status='submission_unknown' if item['order_submitted'] else 'failed',
                         error=SESSION_AUTH_MESSAGE, terminal=True, retryable=False)
             if not item['order_submitted']:
@@ -606,6 +638,7 @@ class PurchaseBatch:
         if kind == '_eof':
             if not item['terminal']:
                 item.update(status='pending_payment' if _pending(item.get('result')) else
+                            'verification_required' if _item_unverified(item) and item['order_submitted'] else
                             'submission_unknown' if item['order_submitted'] else 'failed',
                             error='子进程意外结束；请核对官网订单。' if item['order_submitted']
                             else '子进程意外结束，未自动重试。', terminal=True)
@@ -615,6 +648,7 @@ class PurchaseBatch:
                 or event.get('account_id') != self.channel.account_id
                 or event.get('task_id') != item['task_id']):
             self._stop_attempt(item)
+            item['_protocol_failure'] = True
             item.update(status='submission_unknown' if item['order_submitted'] else 'failed',
                         error='并发子任务的协议标识无效，已停止。', terminal=True)
             return
@@ -644,6 +678,8 @@ class PurchaseBatch:
                 item['status'] = 'pending_payment'
                 item['order_submitted'] = True
                 self.service.submitted = True
+            elif _unverified_order(result) and item['order_submitted']:
+                item['status'] = 'verification_required'
             elif kind == 'result':
                 item['status'] = 'submission_unknown' if item['order_submitted'] else 'failed'
             if kind == 'result':
@@ -652,6 +688,7 @@ class PurchaseBatch:
             self.channel.emit('progress_result', result=self.summary())
         elif kind in ('error', 'cancelled'):
             item.update(status='pending_payment' if _pending(item.get('result')) else
+                        'verification_required' if _item_unverified(item) and item['order_submitted'] else
                         'submission_unknown' if item['order_submitted'] else
                         'cancelled' if kind == 'cancelled' else 'failed',
                         error=str(event.get('message', '本次尝试未完成。'))[:2000], terminal=True)
@@ -742,7 +779,8 @@ class PurchaseBatch:
             for item in self.attempts:
                 self._artifact(item)
                 if item['order_submitted'] and not _pending(item.get('result')):
-                    item['status'] = 'submission_unknown'
+                    item['status'] = ('verification_required' if _item_unverified(item)
+                                      else 'submission_unknown')
             self.finished = True
             return self.summary(finished=True)
         finally:
@@ -752,8 +790,9 @@ class PurchaseBatch:
                 if not item['terminal']:
                     item.update(status='submission_unknown' if item['order_submitted'] else 'cancelled',
                                 error='批次已停止，未自动重新提交。', terminal=True)
-                elif item['order_submitted'] and item['status'] not in ('pending_payment', 'submission_unknown'):
-                    item['status'] = 'submission_unknown'
+                elif item['order_submitted'] and item['status'] != 'pending_payment':
+                    item['status'] = ('verification_required' if _item_unverified(item)
+                                      else 'submission_unknown')
                 self._artifact(item)
             self.persist()
 

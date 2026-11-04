@@ -122,6 +122,34 @@ if mode == 'unknown_no_ipc' and index == 2:
 emit('stage', message='提交一次', order_submitted=True)
 if mode == 'unknown' and index == 2:
     os._exit(17)
+if mode in ('verification_known', 'verification_mixed', 'verification_no_ipc', 'verification_cancel', 'verification_invalid', 'verification_conflict', 'verification_bad_identity', 'verification_bad_version', 'verification_bad_task', 'verification_bad_prompt'):
+    if mode == 'verification_mixed' and index == 2:
+        os._exit(17)
+    data = {'success':False,'status':'verification_required','order_number':'W1234567'+str(index),
+            'payment_url':'https://payment.example.test/unverified-private','qr_data':'private-fixture'}
+    if mode == 'verification_invalid':
+        data['order_number'] = 'invalid'
+    write(task / 'payment.json', data)
+    if mode == 'verification_no_ipc':
+        os._exit(17)
+    observed_number = 'W12345672' if mode == 'verification_conflict' else data['order_number']
+    emit('progress_result', result={'success':False,'status':'verification_required',
+                                  'order_number':observed_number,'order_submitted':True},
+         order_submitted=True)
+    if mode in ('verification_bad_identity','verification_bad_version','verification_bad_task'):
+        event = {'v':1,'account_id':a.account_id,'task_id':a.task_id,'type':'log','message':'invalid fixture'}
+        if mode == 'verification_bad_identity': event['account_id'] = 'foreign'
+        if mode == 'verification_bad_version': event['v'] = 2
+        if mode == 'verification_bad_task': event['task_id'] = 'foreign'
+        print(json.dumps(event),flush=True)
+        sys.exit(0)
+    if mode == 'verification_bad_prompt':
+        emit('prompt',prompt={'id':'untrusted','kind':'password','label':'invalid fixture'})
+        time.sleep(1)
+        sys.exit(0)
+    emit('cancelled' if mode == 'verification_cancel' else 'error',
+         message='付款金额有待核对', order_submitted=True)
+    sys.exit(0)
 result = {'success':True,'status':'pending_payment','order_number':'W1234567'+str(index),
           'order_total':145,'payment_url':'https://payment.example.test/private',
           'qr_data':'data:image/png;base64,fixture','qr_image':str(task / 'fixture.png')}
@@ -455,6 +483,69 @@ class ParallelPurchaseTests(unittest.TestCase):
         marker = self.root / 'tasks' / unknown['task_id'] / 'order_submission.json'
         self.assertEqual(json.loads(marker.read_text())['state'], 'submission_unknown')
         self.assertEqual(len(list((self.task_dir / 'parallel').iterdir())), 3)
+
+    def test_unverified_payment_keeps_known_order_and_failure(self):
+        result = self.run_batch('verification_known', count=1)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['pending_orders'], [])
+        attempt = result['attempts'][0]
+        self.assertEqual(attempt['status'], 'verification_required')
+        self.assertEqual(attempt['result']['order_number'], 'W12345671')
+        self.assertFalse(attempt['result']['success'])
+        self.assertTrue(attempt['order_submitted'])
+        self.assertEqual(attempt['error'], '付款金额有待核对')
+        destination=self.root/'tasks'/attempt['task_id']
+        task=json.loads((destination/'task.json').read_text(encoding='utf-8'))
+        self.assertEqual(task['status'],'failed')
+        self.assertEqual(task['result']['status'],'verification_required')
+        self.assertNotIn('unverified-private',(destination/'task.json').read_text(encoding='utf-8'))
+        self.assertNotIn('private-fixture',json.dumps(result))
+
+    def test_unverified_payment_artifact_survives_lost_progress_event(self):
+        result = self.run_batch('verification_no_ipc', count=1)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['pending_orders'], [])
+        attempt=result['attempts'][0]
+        self.assertEqual(attempt['status'],'verification_required')
+        self.assertEqual(attempt['result']['order_number'],'W12345671')
+        self.assertFalse(attempt['result']['success'])
+
+    def test_cancelled_unverified_order_keeps_identity_without_marking_payment_complete(self):
+        result=self.run_batch('verification_cancel',count=1)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['pending_orders'],[])
+        self.assertEqual(result['attempts'][0]['status'],'verification_required')
+        self.assertEqual(result['attempts'][0]['result']['order_number'],'W12345671')
+
+    def test_invalid_unverified_order_remains_unknown(self):
+        result=self.run_batch('verification_invalid',count=1)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['pending_orders'],[])
+        self.assertEqual(result['attempts'][0]['status'],'submission_unknown')
+
+    def test_conflicting_unverified_order_sources_remain_unknown(self):
+        result=self.run_batch('verification_conflict',count=1)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['pending_orders'],[])
+        self.assertEqual(result['attempts'][0]['status'],'submission_unknown')
+
+    def test_bad_protocol_after_unverified_order_remains_unknown(self):
+        for mode in ('verification_bad_identity','verification_bad_version','verification_bad_task','verification_bad_prompt'):
+            with self.subTest(mode=mode):
+                result=self.run_batch(mode,count=1)
+                self.assertFalse(result['success'])
+                self.assertEqual(result['pending_orders'],[])
+                self.assertEqual(result['attempts'][0]['status'],'submission_unknown')
+
+    def test_known_unverified_payment_does_not_hide_unknown_sibling(self):
+        from queued_checkout import _contains_unknown_submission
+        result = self.run_batch('verification_mixed', count=2)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['pending_orders'], [])
+        self.assertEqual([a['status'] for a in result['attempts']],
+                         ['verification_required','submission_unknown'])
+        self.assertEqual(result['attempts'][0]['result']['order_number'],'W12345671')
+        self.assertTrue(_contains_unknown_submission(result))
 
     def test_submission_marker_is_harvested_before_return_when_all_ipc_is_lost(self):
         result = self.run_batch('unknown_no_ipc')

@@ -15,7 +15,7 @@ import time
 import uuid
 from types import SimpleNamespace
 
-from parallel_checkout import PurchaseBatch, _read, _safe_result, _write, concurrency
+from parallel_checkout import ORDER_NUMBER, PurchaseBatch, _read, _safe_result, _write, concurrency
 from protocol import Cancelled
 from purchase_retry import run_purchase, retry_count
 
@@ -27,7 +27,7 @@ MAX_JOBS = 1000
 def _contains_unknown_submission(result):
     if not isinstance(result, dict):
         return False
-    if result.get('status') in ('submission_unknown', 'unknown_submission', 'payment_unknown', 'verification_required'):
+    if result.get('status') in ('submission_unknown', 'unknown_submission', 'payment_unknown'):
         return True
     children = []
     for key in ('result', 'attempts', 'queue_jobs', 'jobs', 'pending_orders'):
@@ -37,6 +37,16 @@ def _contains_unknown_submission(result):
         elif isinstance(value, list):
             children.extend(item for item in value if isinstance(item, dict))
     if any(_contains_unknown_submission(child) for child in children):
+        return True
+    if result.get('status') == 'verification_required':
+        # The order belongs to this result, not an arbitrary sibling attempt
+        # or pending order. Wrappers may only delegate through `result`.
+        current = result
+        while isinstance(current, dict):
+            number = current.get('order_number')
+            if isinstance(number, str) and ORDER_NUMBER.fullmatch(number):
+                return False
+            current = current.get('result')
         return True
     def known(node):
         if not isinstance(node, dict):
@@ -426,10 +436,17 @@ class QueuedCheckout:
 
     def _recover(self, context):
         try:
-            return _read(context.task_dir / 'parallel_attempts.json')
+            result = _read(context.task_dir / 'parallel_attempts.json')
         except (OSError, ValueError, TypeError):
             with self.lock:
-                return copy.deepcopy(self.jobs[context.channel.identity].get('progress') or {})
+                result = copy.deepcopy(self.jobs[context.channel.identity].get('progress') or {})
+        from payment_evidence import current_unverified_order
+        payment = current_unverified_order(context.task_dir, submitted=context.submitted)
+        if payment and result.get('status') not in ('submission_unknown', 'unknown_submission', 'payment_unknown'):
+            # Retain any child outcomes: a known order in this task cannot
+            # resolve a separate child whose actual submission is unknown.
+            result.update(payment)
+        return result
 
     def _run_target(self, identity, context):
         target = self.jobs[identity]['target']
@@ -445,16 +462,20 @@ class QueuedCheckout:
                     parallel_executor=isolated, serial_executor=self.parent_executor)
             result = run_purchase(context, target, attempt, backoff_seconds=self.backoff)
         except Cancelled:
-            result = {**self._recover(context), 'success': False,
-                      'status': 'submission_unknown' if context.submitted else 'cancelled',
+            recovered = self._recover(context)
+            result = {**recovered, 'success': False,
+                      'status': ('verification_required' if recovered.get('status') == 'verification_required' else
+                                 'submission_unknown' if context.submitted else 'cancelled'),
                       'retryable': False, 'message': '队列任务已停止，未自动重放。'}
         except Exception as error:
             # Match main.py's private network-error boundary.
             import requests
             message = '网络请求失败，请检查网络或系统代理。' if isinstance(error, requests.RequestException) else (
                 str(error) if isinstance(error, (ValueError, OSError)) else f'队列任务未完成（{type(error).__name__}）。')
-            result = {**self._recover(context), 'success': False,
-                      'status': 'submission_unknown' if context.submitted else 'failed',
+            recovered = self._recover(context)
+            result = {**recovered, 'success': False,
+                      'status': ('verification_required' if recovered.get('status') == 'verification_required' else
+                                 'submission_unknown' if context.submitted else 'failed'),
                       'message': message[:2000]}
             if hasattr(error, 'retry_summary'):
                 result['retry_summary'] = error.retry_summary

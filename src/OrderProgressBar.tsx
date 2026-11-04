@@ -169,6 +169,7 @@ export function hasUnknownSubmission(task: Task, tasks: Task[]) {
     (!active(task) &&
       task.order_submitted &&
       !result.pending &&
+      !result.known &&
       !resolvedTask(task, tasks))
   );
 }
@@ -190,6 +191,13 @@ function describe(task: Task, tasks: Task[]) {
       phase: phase === "unknown" ? "submit" : phase,
       title: "提交结果待确认",
       detail: cause || "官网尚未确认订单结果，请先查询订单。",
+    };
+  if (result.unverified)
+    return {
+      tone: "danger",
+      phase: phase === "unknown" ? "submit" : phase,
+      title: "付款信息待核实",
+      detail: cause || "官网已返回订单号，请查询订单核对付款信息。",
     };
   if (result.pending)
     return {

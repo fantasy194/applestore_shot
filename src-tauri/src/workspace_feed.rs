@@ -22,6 +22,7 @@ fn revision(task: &Task) -> String {
 pub(super) fn purchase_attention(result: &Value) -> Value {
     struct Attention {
         pending: std::collections::BTreeSet<String>,
+        known: std::collections::BTreeSet<String>,
         unknown: std::collections::BTreeSet<String>,
         pending_unidentified: bool,
         unknown_unidentified: bool,
@@ -38,21 +39,25 @@ pub(super) fn purchase_attention(result: &Value) -> Value {
                 return;
             }
             self.remaining -= 1;
-            let order_number = number(&node["order_number"]).or_else(|| number(&node["result"]["order_number"]));
+            let verified_identity = super::purchase_queue::verification_order_number(node);
+            if let Some(number)=verified_identity {self.known.insert(number.into());}
+            let order_number = number(&node["order_number"]).or_else(|| number(&node["result"]["order_number"])).or(verified_identity);
             let pending = pending_entry || node["status"] == "pending_payment";
             let known = order_number.is_some()
                 || node["pending_orders"].as_array().is_some_and(|rows| !rows.is_empty())
                 || node["result"]["pending_orders"].as_array().is_some_and(|rows| !rows.is_empty());
             let has_children = ["queue_jobs", "attempts", "jobs"].iter()
                 .any(|key| node[*key].as_array().is_some_and(|rows| !rows.is_empty()));
-            let unknown = matches!(node["status"].as_str(), Some("submission_unknown" | "payment_unknown"))
+            let unverified_unknown=node["status"]=="verification_required"&&verified_identity.is_none();
+            let unknown = matches!(node["status"].as_str(), Some("submission_unknown" | "unknown_submission" | "payment_unknown"))
+                || unverified_unknown
                 || (node["order_submitted"] == true && !known && !has_children);
             if pending {
                 if let Some(number) = order_number { self.pending.insert(number.into()); }
                 else { self.pending_unidentified = true; }
             }
             if unknown {
-                if let Some(number) = order_number { self.unknown.insert(number.into()); }
+                if let Some(number) = order_number.filter(|_|!unverified_unknown) { self.unknown.insert(number.into()); }
                 else { self.unknown_unidentified = true; }
             }
             for key in ["pending_orders", "queue_jobs", "attempts", "jobs"] {
@@ -69,10 +74,10 @@ pub(super) fn purchase_attention(result: &Value) -> Value {
             }
         }
     }
-    let mut attention = Attention {pending:Default::default(), unknown:Default::default(),
+    let mut attention = Attention {pending:Default::default(), known:Default::default(), unknown:Default::default(),
         pending_unidentified:false, unknown_unidentified:false, remaining:100};
     attention.visit(result, 0, false);
-    json!({"pending_order_numbers":attention.pending,"unknown_order_numbers":attention.unknown,
+    json!({"pending_order_numbers":attention.pending,"known_order_numbers":attention.known,"unknown_order_numbers":attention.unknown,
         "pending_unidentified":attention.pending_unidentified,"unknown_unidentified":attention.unknown_unidentified})
 }
 
@@ -286,7 +291,7 @@ mod tests {
         assert_eq!(view["result"]["success"],true);
         assert_eq!(view["result"]["message"],"队列已完成");
         assert_eq!(view["result"]["purchase_attention"],json!({"pending_order_numbers":["W123"],
-            "unknown_order_numbers":["W456","W789"],"pending_unidentified":false,"unknown_unidentified":false}));
+            "known_order_numbers":[],"unknown_order_numbers":["W456","W789"],"pending_unidentified":false,"unknown_unidentified":false}));
         let serialized = view.to_string();
         for private in ["PRIVATE_","pending_orders","queue_jobs","attempts","payment_url","contact","qr_data"] {
             assert!(!serialized.contains(private),"{private}");
@@ -300,12 +305,12 @@ mod tests {
         let evidence = purchase_attention(&json!({"status":"queue_complete","order_submitted":true,
             "pending_orders":[{"order_number":""}],"jobs":[{"status":"succeeded","order_submitted":true}],
             "attempts":[{"status":"submission_unknown"},{"status":"payment_unknown","order_number":"W123"}]}));
-        assert_eq!(evidence,json!({"pending_order_numbers":[],"unknown_order_numbers":["W123"],
+        assert_eq!(evidence,json!({"pending_order_numbers":[],"known_order_numbers":[],"unknown_order_numbers":["W123"],
             "pending_unidentified":true,"unknown_unidentified":true}));
         assert_eq!(purchase_attention(&json!({"order_submitted":true}))["unknown_unidentified"],true);
         assert_eq!(purchase_attention(&json!({"order_submitted":true,"order_number":"W123"}))["unknown_unidentified"],false);
         assert_eq!(purchase_attention(&json!({"order_submitted":true,"jobs":[{"status":"pending_payment","order_number":"W123"}]})),
-            json!({"pending_order_numbers":["W123"],"unknown_order_numbers":[],"pending_unidentified":false,"unknown_unidentified":false}));
+            json!({"pending_order_numbers":["W123"],"known_order_numbers":[],"unknown_order_numbers":[],"pending_unidentified":false,"unknown_unidentified":false}));
     }
 
     #[test]
@@ -322,9 +327,27 @@ mod tests {
         let invalid = purchase_attention(&json!({"pending_orders":[{"order_number":"W".repeat(129)},
             {"order_number":"https://PRIVATE_PAYMENT"},{"order_number":"  W123  "},{"order_number":"W123"}],
             "jobs":[{"status":"submission_unknown","order_number":"private@example.test"}]}));
-        assert_eq!(invalid,json!({"pending_order_numbers":["W123"],"unknown_order_numbers":[],
+        assert_eq!(invalid,json!({"pending_order_numbers":["W123"],"known_order_numbers":[],"unknown_order_numbers":[],
             "pending_unidentified":true,"unknown_unidentified":true}));
         assert!(!invalid.to_string().contains("PRIVATE_"));assert!(!invalid.to_string().contains("example.test"));
+    }
+
+    #[test]
+    fn purchase_summary_keeps_known_unverified_orders_without_masking_an_unknown_sibling() {
+        let mut current=task(&Uuid::new_v4().to_string());current.action="purchase".into();current.order_submitted=true;
+        let known=json!({"status":"verification_required","success":false,"order_number":"W123456","payment_url":"PRIVATE_URL"});
+        current.result=Some(json!({"status":"queue_complete","order_submitted":true,"queue_jobs":[{"result":known}]}));
+        let view=summary(&current);let attention=&view["result"]["purchase_attention"];
+        assert_eq!(attention["known_order_numbers"],json!(["W123456"]));
+        assert_eq!(attention["unknown_unidentified"],false);assert_eq!(attention["pending_unidentified"],false);
+        assert_eq!(attention["pending_order_numbers"],json!([]));assert!(!view.to_string().contains("PRIVATE_"));
+        current.result.as_mut().unwrap()["queue_jobs"].as_array_mut().unwrap().push(json!({"status":"submission_unknown","order_submitted":true}));
+        let mixed=summary(&current);assert_eq!(mixed["result"]["purchase_attention"]["known_order_numbers"],json!(["W123456"]));
+        assert_eq!(mixed["result"]["purchase_attention"]["unknown_unidentified"],true);
+        for invalid in [json!({"status":"verification_required","order_number":"invalid"}),
+            json!({"status":"verification_required","attempts":[{"order_number":"W123456"}]})] {
+            assert_eq!(purchase_attention(&invalid)["unknown_unidentified"],true);
+        }
     }
 
     #[test]
